@@ -1,0 +1,436 @@
+import { Plugin } from "@opencode/plugin";
+import { z } from "zod";
+import { homedir } from "os";
+import { join } from "path";
+import { createHash } from "crypto";
+import { renameSync } from "fs";
+import {
+  openDatabase,
+  applyPragmas,
+  isCorruption,
+  quoteFtsQuery,
+  type AnyDatabase,
+} from "../lib/sqlite.ts";
+
+/**
+ * memory
+ *
+ * Local-first long-term memory for opencode. No embedding API, no cloud, no
+ * network: fragments live in a local SQLite FTS5 database and are recalled
+ * with BM25. Store text explicitly with `memory_remember`, or let the
+ * `context` hook auto-inject relevant fragments into each request.
+ *
+ * v2-only: `session.hook("context")` did not exist in v1.
+ */
+
+const DB_DIR = join(homedir(), ".opencode-plugins", "memory");
+const DB_PATH = join(DB_DIR, "memory.db");
+const SCOPES = ["global", "project", "session"] as const;
+type Scope = (typeof SCOPES)[number];
+
+type Config = {
+  enabled: boolean;
+  autoRecall: boolean;
+  budgetChars: number;
+  topK: number;
+  minScore: number;
+  scope: Scope;
+  maxEntries: number;
+  log: boolean;
+};
+
+type MemoryRow = {
+  id: number;
+  text: string;
+  scope: string;
+  importance: number;
+  tags: string;
+  created_at: string;
+  last_used_at: string;
+  use_count: number;
+  score?: number;
+};
+
+function normalizeText(text: string): string {
+  return text.trim().replace(/\s+/g, " ").toLowerCase();
+}
+
+function hashText(text: string): string {
+  return createHash("sha1").update(text).digest("hex");
+}
+
+function projectHash(directory: string): string {
+  return createHash("sha1").update(directory).digest("hex").slice(0, 16);
+}
+
+function parseTags(raw: string): string[] {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((t): t is string => typeof t === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function ageOf(iso: string): string {
+  const then = Date.parse(`${iso.replace(" ", "T")}Z`);
+  if (!Number.isFinite(then)) return "?";
+  const secs = Math.max(0, Math.floor((Date.now() - then) / 1000));
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+  return `${Math.floor(secs / 86400)}d`;
+}
+
+function formatRow(row: MemoryRow): string {
+  const tags = parseTags(row.tags);
+  const tagStr = tags.length > 0 ? ` tags=${tags.join(",")}` : "";
+  return `#${row.id} [${row.scope}] imp=${row.importance} age=${ageOf(row.created_at)}${tagStr} ${row.text.replace(/\s+/g, " ").trim()}`;
+}
+
+/** Latest user-authored text in a request, joined from its text parts. */
+function extractLatestUserText(messages: unknown): string {
+  const list = Array.isArray(messages) ? (messages as Array<{ role?: string; content?: unknown }>) : [];
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (!m || m.role !== "user") continue;
+    const parts = Array.isArray(m.content) ? m.content : [];
+    const text = parts
+      .map((p) =>
+        p && typeof p === "object" && (p as { type?: unknown }).type === "text" && typeof (p as { text?: unknown }).text === "string"
+          ? (p as { text: string }).text
+          : "",
+      )
+      .filter(Boolean)
+      .join("\n");
+    if (text.trim()) return text;
+  }
+  return "";
+}
+
+function resolveConfig(options: Record<string, unknown> | undefined): Config {
+  const o = options ?? {};
+  const env = (key: string): string | undefined => process.env[key];
+  const num = (value: unknown, envValue: string | undefined, fallback: number): number => {
+    const raw = typeof value === "number" || typeof value === "string" ? value : envValue;
+    const n = typeof raw === "number" ? raw : Number(raw);
+    return Number.isFinite(n) ? n : fallback;
+  };
+  const bool = (value: unknown, envValue: string | undefined, fallback: boolean): boolean => {
+    if (typeof value === "boolean") return value;
+    if (typeof envValue === "string") return /^(1|true|yes|on)$/i.test(envValue.trim());
+    return fallback;
+  };
+  const rawScope = typeof o.scope === "string" ? o.scope : env("OPENCODE_MEMORY_SCOPE");
+  const scope: Scope = rawScope === "global" || rawScope === "session" || rawScope === "project" ? rawScope : "project";
+  return {
+    enabled: bool(o.enabled, env("OPENCODE_MEMORY_ENABLED"), true),
+    autoRecall: bool(o.autoRecall, env("OPENCODE_MEMORY_AUTO_RECALL"), true),
+    budgetChars: Math.max(0, Math.trunc(num(o.budgetChars, env("OPENCODE_MEMORY_BUDGET_CHARS"), 1200))),
+    topK: Math.max(1, Math.trunc(num(o.topK, env("OPENCODE_MEMORY_TOP_K"), 5))),
+    minScore: num(o.minScore, env("OPENCODE_MEMORY_MIN_SCORE"), 0),
+    scope,
+    maxEntries: Math.max(0, Math.trunc(num(o.maxEntries, env("OPENCODE_MEMORY_MAX_ENTRIES"), 0))),
+    log: bool(o.log, env("OPENCODE_MEMORY_LOG"), false),
+  };
+}
+
+let db: AnyDatabase | null = null;
+
+function initSchema(database: AnyDatabase): void {
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS memories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      text TEXT NOT NULL,
+      hash TEXT NOT NULL,
+      scope TEXT NOT NULL DEFAULT 'project',
+      project TEXT,
+      session_id TEXT,
+      importance INTEGER NOT NULL DEFAULT 5,
+      tags TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      last_used_at TEXT NOT NULL DEFAULT (datetime('now')),
+      use_count INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS memories_hash ON memories(hash);
+    CREATE INDEX IF NOT EXISTS memories_scope ON memories(scope);
+    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+      text, tags, content=memories, content_rowid=id, tokenize='porter'
+    );
+    CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+      INSERT INTO memories_fts(rowid, text, tags) VALUES (new.id, new.text, new.tags);
+    END;
+    CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, text, tags) VALUES ('delete', old.id, old.text, old.tags);
+    END;
+    CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, text, tags) VALUES ('delete', old.id, old.text, old.tags);
+      INSERT INTO memories_fts(rowid, text, tags) VALUES (new.id, new.text, new.tags);
+    END;
+  `);
+  const rows = database.prepare("SELECT count(*) AS n FROM memories").get() as { n: number } | null;
+  if (rows && rows.n > 0) {
+    const fts = database.prepare("SELECT count(*) AS n FROM memories_fts").get() as { n: number } | null;
+    if (fts && fts.n === 0) database.exec("INSERT INTO memories_fts(memories_fts) VALUES ('rebuild')");
+  }
+}
+
+function openFresh(): AnyDatabase {
+  const database = openDatabase(DB_PATH);
+  applyPragmas(database);
+  initSchema(database);
+  return database;
+}
+
+function getDb(): AnyDatabase {
+  if (db) return db;
+  try {
+    db = openFresh();
+  } catch (err) {
+    if (!isCorruption(err)) throw err;
+    // Never delete user data: move the unreadable file aside and start clean.
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    try {
+      renameSync(DB_PATH, `${DB_PATH}.corrupt-${stamp}`);
+    } catch {
+      /* best effort */
+    }
+    db = openFresh();
+  }
+  return db;
+}
+
+function toMatch(query: string, mode: "all" | "any"): string {
+  const quoted = quoteFtsQuery(query);
+  if (!quoted) return "";
+  return mode === "any" ? quoted.split(" ").join(" OR ") : quoted;
+}
+
+function search(database: AnyDatabase, match: string, limit: number, minScore: number, scope: Scope | null): MemoryRow[] {
+  if (!match) return [];
+  const params: unknown[] = [match];
+  const filter = scope ? "AND m.scope = ?" : "";
+  if (scope) params.push(scope);
+  params.push(limit);
+  const rows = database
+    .prepare(
+      `SELECT m.*, -bm25(memories_fts) AS score
+       FROM memories m JOIN memories_fts ON m.id = memories_fts.rowid
+       WHERE memories_fts MATCH ? ${filter}
+       ORDER BY (score + m.importance * 0.05) DESC, m.last_used_at DESC
+       LIMIT ?`,
+    )
+    .all(...params) as MemoryRow[];
+  return rows.filter((row) => typeof row.score !== "number" || row.score >= minScore);
+}
+
+function prune(database: AnyDatabase, cfg: Config): void {
+  if (cfg.maxEntries <= 0) return;
+  const current = database.prepare("SELECT count(*) AS n FROM memories").get() as { n: number } | null;
+  const total = current?.n ?? 0;
+  if (total <= cfg.maxEntries) return;
+  database
+    .prepare(
+      "DELETE FROM memories WHERE id IN (SELECT id FROM memories ORDER BY importance ASC, last_used_at ASC, id ASC LIMIT ?)",
+    )
+    .run(total - cfg.maxEntries);
+}
+
+function remember(
+  database: AnyDatabase,
+  cfg: Config,
+  text: string,
+  tags: string[],
+  scope: Scope,
+  importance: number,
+  project: string,
+  sessionID: string | null,
+): { id: number; created: boolean; useCount: number } {
+  const hash = hashText(normalizeText(text));
+  const proj = scope === "global" ? null : project;
+  const sid = scope === "session" ? sessionID : null;
+  const found = database
+    .prepare("SELECT id, importance, use_count FROM memories WHERE hash = ? AND scope = ? AND project IS ? AND session_id IS ? LIMIT 1")
+    .get(hash, scope, proj, sid) as { id: number; importance: number; use_count: number } | null;
+  if (found) {
+    database
+      .prepare("UPDATE memories SET importance = ?, last_used_at = datetime('now'), use_count = use_count + 1 WHERE id = ?")
+      .run(Math.max(found.importance, importance), found.id);
+    return { id: found.id, created: false, useCount: found.use_count + 1 };
+  }
+  const result = database
+    .prepare("INSERT INTO memories (text, hash, scope, project, session_id, importance, tags) VALUES (?, ?, ?, ?, ?, ?, ?)")
+    .run(text.trim(), hash, scope, proj, sid, importance, JSON.stringify(tags));
+  const id = Number(result.lastInsertRowid);
+  prune(database, cfg);
+  return { id, created: true, useCount: 0 };
+}
+
+const scopeSchema = z.enum(["global", "project", "session"]);
+
+export default Plugin.define({
+  id: "memory",
+  async setup(ctx) {
+    const cfg = resolveConfig(ctx.options);
+    const project = projectHash(ctx.location?.directory ?? "");
+    const database = getDb();
+    const log = (msg: string): void => {
+      if (cfg.log) console.error(`[memory] ${msg}`);
+    };
+    const resolveScope = (value: string | undefined): Scope =>
+      value === "global" || value === "session" || value === "project" ? value : cfg.scope;
+    const resolveImportance = (value: number | undefined): number =>
+      typeof value === "number" && Number.isFinite(value) ? Math.min(10, Math.max(0, Math.trunc(value))) : 5;
+
+    await ctx.tool.transform((editor) => {
+      editor.add({
+        name: "memory_remember",
+        description: "Store a durable memory fragment (local SQLite, deduped by normalized content).",
+        input: z.object({
+          text: z.string().min(1).describe("The memory to store."),
+          tags: z.array(z.string()).optional().describe("Optional labels."),
+          scope: scopeSchema.optional().describe("global | project (default) | session."),
+          importance: z.number().min(0).max(10).optional().describe("0-10; higher ranks first."),
+        }),
+        execute: async (args, toolCtx) => {
+          const scope = resolveScope(args.scope);
+          const importance = resolveImportance(args.importance);
+          const tags = Array.isArray(args.tags) ? args.tags : [];
+          const result = remember(database, cfg, args.text, tags, scope, importance, project, toolCtx.sessionID ?? null);
+          log(result.created ? `remember #${result.id}` : `dedupe #${result.id}`);
+          return {
+            content: result.created
+              ? `Remembered #${result.id} [${scope}] (importance ${importance}).`
+              : `Already remembered as #${result.id} [${scope}] — bumped (use_count ${result.useCount}).`,
+          };
+        },
+      });
+
+      editor.add({
+        name: "memory_recall",
+        description: "Search stored memories with local BM25 full-text search.",
+        input: z.object({
+          query: z.string().min(1).describe("Full-text query."),
+          scope: scopeSchema.optional().describe("Restrict to one scope."),
+          limit: z.number().int().min(1).max(50).optional().describe("Max results (default config topK)."),
+        }),
+        execute: async (args) => {
+          const scope = args.scope ? resolveScope(args.scope) : null;
+          const rows = search(database, toMatch(args.query, "all"), args.limit ?? cfg.topK, cfg.minScore, scope);
+          if (rows.length === 0) return { content: "No memories matched." };
+          return { content: rows.map(formatRow).join("\n") };
+        },
+      });
+
+      editor.add({
+        name: "memory_forget",
+        description: "Delete a memory by id or by full-text query match.",
+        input: z.object({
+          id: z.number().int().positive().optional().describe("Exact memory id."),
+          query: z.string().min(1).optional().describe("Delete every FTS match."),
+        }),
+        execute: async (args) => {
+          if (typeof args.id === "number") {
+            const existing = database.prepare("SELECT id FROM memories WHERE id = ?").get(args.id) as { id: number } | null;
+            if (!existing) return { content: `No memory #${args.id}.` };
+            database.prepare("DELETE FROM memories WHERE id = ?").run(args.id);
+            return { content: `Forgot #${args.id}.` };
+          }
+          if (typeof args.query === "string") {
+            const match = quoteFtsQuery(args.query);
+            if (!match) return { content: "Nothing to forget." };
+            const rows = database
+              .prepare("SELECT m.id FROM memories m JOIN memories_fts ON m.id = memories_fts.rowid WHERE memories_fts MATCH ?")
+              .all(match) as Array<{ id: number }>;
+            if (rows.length === 0) return { content: "No memories matched." };
+            const del = database.prepare("DELETE FROM memories WHERE id = ?");
+            for (const row of rows) del.run(row.id);
+            return { content: `Forgot ${rows.length} memor${rows.length === 1 ? "y" : "ies"}.` };
+          }
+          return { content: "Provide an id or a query." };
+        },
+      });
+
+      editor.add({
+        name: "memory_list",
+        description: "List the most recent memories, newest first.",
+        input: z.object({
+          scope: scopeSchema.optional().describe("Restrict to one scope."),
+          limit: z.number().int().min(1).max(100).optional().describe("Max rows (default 20)."),
+        }),
+        execute: async (args) => {
+          const scope = args.scope ? resolveScope(args.scope) : null;
+          const limit = args.limit ?? 20;
+          const rows = scope
+            ? (database.prepare("SELECT * FROM memories WHERE scope = ? ORDER BY created_at DESC, id DESC LIMIT ?").all(scope, limit) as MemoryRow[])
+            : (database.prepare("SELECT * FROM memories ORDER BY created_at DESC, id DESC LIMIT ?").all(limit) as MemoryRow[]);
+          if (rows.length === 0) return { content: "No memories stored." };
+          return { content: rows.map(formatRow).join("\n") };
+        },
+      });
+
+      editor.add({
+        name: "memory_stats",
+        description: "Show memory totals by scope, the database path, and the active config.",
+        input: z.object({}),
+        execute: async () => {
+          const groups = database.prepare("SELECT scope, count(*) AS n FROM memories GROUP BY scope").all() as Array<{ scope: string; n: number }>;
+          const total = database.prepare("SELECT count(*) AS n FROM memories").get() as { n: number } | null;
+          const byScope = SCOPES.map((s) => `${s}=${groups.find((g) => g.scope === s)?.n ?? 0}`).join(" ");
+          return {
+            content: [
+              `memories: ${total?.n ?? 0} (${byScope})`,
+              `db: ${DB_PATH}`,
+              `config: scope=${cfg.scope} topK=${cfg.topK} budgetChars=${cfg.budgetChars} minScore=${cfg.minScore} autoRecall=${cfg.autoRecall} maxEntries=${cfg.maxEntries === 0 ? "unlimited" : cfg.maxEntries}`,
+            ].join("\n"),
+          };
+        },
+      });
+    });
+
+    const seen = new Map<string, Set<number>>();
+
+    await ctx.session.hook("context", (event) => {
+      try {
+        if (!cfg.enabled || !cfg.autoRecall) return;
+        const query = extractLatestUserText(event.messages);
+        if (!query.trim()) return;
+        const rows = search(database, toMatch(query, "any"), Math.max(cfg.topK * 4, 8), cfg.minScore, null);
+        if (rows.length === 0) return;
+        const key = String(event.sessionID ?? "");
+        const used = seen.get(key) ?? new Set<number>();
+        const header = "Relevant memories (local, may be stale):";
+        let budget = cfg.budgetChars - header.length - 1;
+        const picked: Array<{ id: number; line: string }> = [];
+        for (const row of rows) {
+          if (used.has(row.id)) continue;
+          if (picked.length >= cfg.topK) break;
+          let line = formatRow(row);
+          const cost = line.length + (picked.length > 0 ? 1 : 0);
+          if (cost <= budget) {
+            budget -= cost;
+          } else if (picked.length === 0 && budget > 0) {
+            line = line.slice(0, budget);
+            budget = 0;
+          } else {
+            break;
+          }
+          picked.push({ id: row.id, line });
+        }
+        if (picked.length === 0) return;
+        for (const p of picked) used.add(p.id);
+        seen.set(key, used);
+        const text = `${header}\n${picked.map((p) => p.line).join("\n")}`;
+        (event.messages as unknown as Array<{ role: string; content: Array<{ type: string; text: string }> }>).push({
+          role: "system",
+          content: [{ type: "text", text }],
+        });
+        log(`auto-recall injected ${picked.length} memory(ies)`);
+      } catch (err) {
+        if (cfg.log) console.error(`[memory] auto-recall failed: ${String(err)}`);
+      }
+    });
+  },
+});
+
+

@@ -1,0 +1,10 @@
+node_modules/
+*.db
+*.db-journal
+backups/
+*.log
+.DS_Store
+.env
+
+docs/
+packages/

@@ -1,0 +1,13 @@
+{
+  "name": "opencode-sessions",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "opencode plugin: spawn, brief, await, read, and cancel fresh child sessions without blocking the server event loop.",
+  "scripts": {
+    "sync": "node sync.mjs",
+    "pull": "node sync.mjs pull",
+    "test": "node --test unit.test.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}

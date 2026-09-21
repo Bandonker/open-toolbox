@@ -1,0 +1,20 @@
+{
+  "name": "open-toolbox",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local plugin pack for opencode Desktop v2.",
+  "type": "module",
+  "dependencies": {
+    "@opencode/plugin": "^2.0.11",
+    "zod": "4.1.8"
+  },
+  "devDependencies": {
+    "typescript": "5.8.2"
+  },
+  "scripts": {
+    "test": "node --test opencode-sessions/unit.test.mjs && node tests/verify-plugins.mjs && node tests/verify-session-export.mjs && node tests/verify-memory.mjs && node tests/verify-secret-shield.mjs && node tests/verify-usage-stats.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "build:packages": "node scripts/build-packages.mjs",
+    "pack:check": "node scripts/build-packages.mjs --pack-check"
+  }
+}

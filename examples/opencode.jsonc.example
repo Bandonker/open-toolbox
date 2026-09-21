@@ -1,0 +1,28 @@
+{
+  // Minimal opencode.jsonc using the open-toolbox local plugins.
+  // Copy to $HOME/.config/opencode/opencode.jsonc (or merge into yours).
+  "$schema": "https://opencode.ai/config.json",
+
+  // Zero config is required: files in <config>/plugins/ load automatically with
+  // defaults. The loader rejects a bare .ts path ("configured plugin path must
+  // be a directory"), and local plugins take no options — tune them with env
+  // vars instead.
+  //
+  // This array is for npm packages (and directory-based plugin packages): a
+  // bare package name, or an object with "package" + "options". A name starting
+  // with "-" removes that plugin.
+  "plugins": [
+    // "@bandonker/opencode-context-pruner",
+    // { "package": "@bandonker/opencode-tool-audit", "options": { "retentionDays": 90 } },
+    // { "package": "-some-plugin" }
+  ],
+
+  "mcp": {
+    // Example local MCP server:
+    // "my-tools": {
+    //   "type": "local",
+    //   "command": ["node", "C:\\path\\to\\server\\index.js"],
+    //   "enabled": true
+    // }
+  }
+}
