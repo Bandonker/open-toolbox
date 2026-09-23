@@ -309,6 +309,66 @@ function fmtInt(n: number): string {
   return String(Math.round(Number.isFinite(n) ? n : 0));
 }
 
+// Compact dashboard display for large counts: exact below 1000, otherwise
+// k/m/b suffixes (1400 -> "1.4k", 1000000000 -> "1b"). Text-tool output keeps
+// using fmtInt so CLI results stay exact.
+function fmtCompact(n: number): string {
+  const v = Math.round(Number.isFinite(n) ? n : 0);
+  if (Math.abs(v) < 1000) return String(v);
+  const units = ["k", "m", "b"];
+  let u = -1;
+  let x = v;
+  while (Math.abs(x) >= 1000 && u < units.length - 1) {
+    x /= 1000;
+    u++;
+  }
+  const short = (y: number): string => (Math.abs(y) >= 100 ? String(Math.round(y)) : String(Math.round(y * 10) / 10));
+  let s = short(x);
+  if (parseFloat(s) >= 1000 && u < units.length - 1) {
+    x /= 1000;
+    u++;
+    s = short(x);
+  }
+  return `${s}${units[u]}`;
+}
+
+// Short dashboard display for USD: trims noise ($0.001000 -> "$.001",
+// $0.025000 -> "$.025", $0 -> "$0"). Text-tool output keeps fmtUsd.
+function fmtShortUsd(n: number): string {
+  const v = Number.isFinite(n) ? n : 0;
+  if (v === 0) return "$0";
+  const s = v
+    .toFixed(6)
+    .replace(/(\.\d*?)0+$/, "$1")
+    .replace(/\.$/, "")
+    .replace(/^(-?)0\./, "$1.");
+  return `$${s}`;
+}
+
+function fmtShortUsdOrDash(n: number | null): string {
+  return n === null ? "—" : fmtShortUsd(n);
+}
+
+// A table cell that shows a shortened display value but keeps the exact
+// value in a title tooltip for auditability.
+type Cell = string | { text: string; title: string };
+
+function exactCell(display: string, exact: string): Cell {
+  return display === exact ? display : { text: display, title: exact };
+}
+
+function compactCell(n: number): Cell {
+  return exactCell(fmtCompact(n), fmtInt(n));
+}
+
+function usdCell(n: number): Cell {
+  return exactCell(fmtShortUsd(n), fmtUsd(n));
+}
+
+function usdOrDashCell(n: number | null): Cell {
+  return n === null ? "—" : usdCell(n);
+}
+
 function escapeHtml(value: unknown): string {
   return String(value ?? "")
     .replace(/&/g, "&amp;")
@@ -999,9 +1059,14 @@ function heatmapGrid(
       cells.push({ day: key, value, inRange });
     }
     const first = shiftDays(startSunday, col * 7);
+    // Month labels sit in a single 12px column but render ~18px wide, so
+    // labels in adjacent columns overlap. Skip a label that would collide
+    // with the previously emitted one.
     if (first.getMonth() !== lastMonth) {
       lastMonth = first.getMonth();
-      months.push({ col, label: MONTHS[first.getMonth()] ?? "" });
+      if (months.length === 0 || col - months[months.length - 1]!.col >= 2) {
+        months.push({ col, label: MONTHS[first.getMonth()] ?? "" });
+      }
     }
     columns.push(cells);
   }
@@ -1036,7 +1101,7 @@ function heatmapText(database: AnyDatabase, weeks: number, metric: HeatMetric, i
 const HEAT_COLORS = ["hm-l0", "hm-l1", "hm-l2", "hm-l3", "hm-l4"];
 
 function heatCellLabel(value: number, metric: HeatMetric): string {
-  return metric === "cost" ? fmtUsd(value) : fmtInt(value);
+  return metric === "cost" ? fmtShortUsd(value) : fmtCompact(value);
 }
 
 function buildHeatmapHtml(grid: HeatGrid): string {
@@ -1093,7 +1158,7 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean): string {
       const y = padT + plotH * (1 - f);
       return (
         `<line x1="${padL}" y1="${y.toFixed(1)}" x2="${w - padR}" y2="${y.toFixed(1)}" class="gl"/>` +
-        `<text x="${padL - 8}" y="${(y + 3).toFixed(1)}" class="axis" text-anchor="end">${escapeHtml(fmtInt(max * f))}</text>`
+        `<text x="${padL - 8}" y="${(y + 3).toFixed(1)}" class="axis" text-anchor="end">${escapeHtml(fmtCompact(max * f))}</text>`
       );
     })
     .join("");
@@ -1130,16 +1195,17 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean): string {
   ].join("");
 }
 
-function tableHtml(headers: string[], rows: string[][]): string {
-  const head = headers.map((x, i) => `<th${i > 0 ? ' class="num"' : ""}>${escapeHtml(x)}</th>`).join("");
+function tableHtml(headers: string[], rows: Cell[][]): string {
+  const cell = (c: Cell, tag: "th" | "td", num: boolean): string => {
+    const cls = num ? ' class="num"' : "";
+    return typeof c === "string"
+      ? `<${tag}${cls}>${escapeHtml(c)}</${tag}>`
+      : `<${tag}${cls} title="${escapeHtml(c.title)}">${escapeHtml(c.text)}</${tag}>`;
+  };
+  const head = headers.map((x, i) => cell(x, "th", i > 0)).join("");
   const body =
     rows.length > 0
-      ? rows
-          .map(
-            (r) =>
-              `<tr>${r.map((c, i) => `<td${i > 0 ? ' class="num"' : ""}>${escapeHtml(c)}</td>`).join("")}</tr>`,
-          )
-          .join("")
+      ? rows.map((r) => `<tr>${r.map((c, i) => cell(c, "td", i > 0)).join("")}</tr>`).join("")
       : `<tr><td colspan="${headers.length}" class="muted">No data yet</td></tr>`;
   return `<div class="tbl-wrap"><table class="tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
@@ -1149,7 +1215,7 @@ type AppInfo = { name?: string; version?: string; channel?: string };
 function lifetimeSummaryLine(database: AnyDatabase): string {
   const life = lifetimeTotals(database);
   const tools = lifetimeTools(database);
-  return `${fmtInt(tokenTotal(life))} tokens / ${fmtUsd(life.cost)} / ${fmtInt(tools.calls)} tool calls`;
+  return `${fmtCompact(tokenTotal(life))} tokens / ${fmtShortUsd(life.cost)} / ${fmtCompact(tools.calls)} tool calls`;
 }
 
 function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo): string {
@@ -1170,9 +1236,9 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo): s
     const avg = calls > 0 ? num(r.total_ms) / calls : 0;
     return [
       String(r.tool),
-      fmtInt(calls),
-      fmtInt(num(r.succeeded)),
-      fmtInt(num(r.failed)),
+      compactCell(calls),
+      compactCell(num(r.succeeded)),
+      compactCell(num(r.failed)),
       `${Math.round(avg)}ms`,
       `${fmtInt(num(r.max_ms))}ms`,
     ];
@@ -1197,10 +1263,10 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo): s
       provider,
       rate ? fmtRate(rate.input) : "—",
       rate ? fmtRate(rate.output) : "—",
-      fmtInt(tokenTotal(t)),
-      fmtUsd(t.cost),
-      fmtUsdOrDash(t.costComputed),
-      fmtInt(num(r.events)),
+      compactCell(tokenTotal(t)),
+      usdCell(t.cost),
+      usdOrDashCell(t.costComputed),
+      compactCell(num(r.events)),
     ];
   });
 
@@ -1215,10 +1281,10 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo): s
     const t = totalsOf(r);
     return [
       String(r.source),
-      fmtInt(num(r.count)),
-      fmtInt(tokenTotal(t)),
-      fmtUsd(t.cost),
-      fmtUsdOrDash(t.costComputed),
+      compactCell(num(r.count)),
+      compactCell(tokenTotal(t)),
+      usdCell(t.cost),
+      usdOrDashCell(t.costComputed),
     ];
   });
 
@@ -1228,13 +1294,13 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo): s
   const generated = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
 
   const cards: Array<[string, string, string, string]> = [
-    ["Total tokens", fmtInt(tokenTotal(life)), "c1", "in + out + cache"],
-    ["Cost (reported)", fmtUsd(life.cost), "c2", "USD billed by the provider"],
-    ["Cost (list price)", fmtUsdOrDash(life.costComputed), "c2", "API-equivalent USD"],
-    ["Sessions", fmtInt(sessions), "c3", "tracked"],
-    ["Tool calls", fmtInt(tools.calls), "c4", `${fmtInt(tools.ok)} ok · ${fmtInt(tools.fail)} failed`],
+    ["Total tokens", fmtCompact(tokenTotal(life)), "c1", "in + out + cache"],
+    ["Cost (reported)", fmtShortUsd(life.cost), "c2", "USD billed by the provider"],
+    ["Cost (list price)", fmtShortUsdOrDash(life.costComputed), "c2", "API-equivalent USD"],
+    ["Sessions", fmtCompact(sessions), "c3", "tracked"],
+    ["Tool calls", fmtCompact(tools.calls), "c4", `${fmtCompact(tools.ok)} ok · ${fmtCompact(tools.fail)} failed`],
     ["Success rate", `${rate.toFixed(1)}%`, "c5", "completed calls"],
-    ["Background", fmtInt(bg.total), "c6", `${fmtUsd(bg.cost)} title + compaction`],
+    ["Background", fmtCompact(bg.total), "c6", `${fmtShortUsd(bg.cost)} title + compaction`],
   ];
   const cardsHtml = cards
     .map(
@@ -1267,7 +1333,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo): s
     ".meta{color:var(--ink-3);font-size:var(--step--1);line-height:1.4;margin:0;text-transform:uppercase;letter-spacing:.08em}",
     ".kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(11rem,100%),1fr));gap:0;margin:0 0 var(--space-xl);border-top:2px solid var(--ink);border-bottom:1px solid var(--ink);background:var(--surface)}",
     ".kpi{position:relative;background:transparent;border:0;border-left:1px solid var(--line);border-radius:0;padding:var(--space-xs) var(--space-s) var(--space-s);overflow:visible}",
-    ".kpi:first-child{border-left:0}",
+    ".kpi:first-child{border-left:0;grid-column:1/-1}",
     ".kpi::before{content:'';position:absolute;inset:0 0 auto 0;height:2px;background:var(--ink)}",
     ".kpi.c2::before{background:var(--accent)}",
     ".kpi.c3::before{background:var(--accent)}.kpi.c4::before{background:var(--ink)}",
@@ -1354,7 +1420,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo): s
     `<section class="panel bg-panel">`,
     `<!-- background -->`,
     `<div class="panel-head"><h2>Background usage</h2><span class="sub">title + compaction</span></div>`,
-    `<p class="sub">Hidden spend recorded outside the main session counters: <b>${escapeHtml(fmtInt(bg.total))}</b> tokens · <b>${escapeHtml(fmtUsd(bg.cost))}</b>.</p>`,
+    `<p class="sub">Hidden spend recorded outside the main session counters: <b>${escapeHtml(fmtCompact(bg.total))}</b> tokens · <b>${escapeHtml(fmtShortUsd(bg.cost))}</b>.</p>`,
     tableHtml(["source", "events", "tokens", "cost", "cost (list)"], sourceRows),
     `</section>`,
     `<p class="sub">List-price cost is computed from the provider's published per-million-token rates. ` +

@@ -350,12 +350,12 @@ check(
   /<td class="num">acme<\/td>/.test(html) && html.includes('<td class="num">$10</td>'),
 );
 check(
-  "dashboard shows exact list-price cost for priced models",
-  html.includes("$0.006000") && html.includes("$0.025000"),
+  "dashboard shows shortened list-price costs with exact values on hover",
+  html.includes("$.006") && html.includes("$.025") && html.includes('title="$0.006000"') && html.includes('title="$0.025000"'),
 );
 check(
   "unpriced model renders an em dash, not $0",
-  /local\/unpriced<\/td><td class="num">local<\/td><td class="num">—<\/td><td class="num">—<\/td><td class="num">15<\/td><td class="num">\$0\.000000<\/td><td class="num">—<\/td><td class="num">1<\/td>/.test(
+  /local\/unpriced<\/td><td class="num">local<\/td><td class="num">—<\/td><td class="num">—<\/td><td class="num">15<\/td><td class="num" title="\$0\.000000">\$0<\/td><td class="num">—<\/td><td class="num">1<\/td>/.test(
     html,
   ),
 );
@@ -487,7 +487,7 @@ await byName4.stats_dashboard.execute({}, toolCtx);
 const html4 = readFileSync(dashPath, "utf8");
 check(
   "price override prices an otherwise-unknown model",
-  /local\/override-model<\/td><td class="num">local<\/td><td class="num">\$1<\/td><td class="num">\$0<\/td><td class="num">1000<\/td><td class="num">\$0\.000000<\/td><td class="num">\$0\.001000<\/td>/.test(
+  /local\/override-model<\/td><td class="num">local<\/td><td class="num">\$1<\/td><td class="num">\$0<\/td><td class="num" title="1000">1k<\/td><td class="num" title="\$0\.000000">\$0<\/td><td class="num" title="\$0\.001000">\$\.001<\/td>/.test(
     html4,
   ),
   (html4.match(/local\/override-model<\/td>[\s\S]{0,180}/) || [""])[0].replace(/\s+/g, " ").slice(0, 170),
@@ -544,10 +544,34 @@ await byName5.stats_dashboard.execute({}, toolCtx);
 const html5 = readFileSync(dashPath, "utf8");
 check(
   "models.dev object-shaped cost (flat cache_read/write) is priced",
-  /acme\/objmodel<\/td>[\s\S]{0,220}\$0\.003500/.test(html5),
+  /acme\/objmodel<\/td>[\s\S]{0,260}title="\$0\.003500">\$\.0035</.test(html5),
   (html5.match(/acme\/objmodel<\/td>[\s\S]{0,180}/) || [""])[0].replace(/\s+/g, " ").slice(0, 170),
 );
 if (typeof cleanup5 === "function") await cleanup5();
+
+// --- compact display for huge counts ----------------------------------------
+stream.push({
+  type: "session.model.selected",
+  data: { sessionID: "ses_mega", model: { providerID: "acme", id: "megamodel" } },
+});
+stream.push({ type: "session.created", data: { sessionID: "ses_mega" } });
+stream.push({
+  type: "session.usage.updated",
+  data: {
+    sessionID: "ses_mega",
+    model: { providerID: "acme", id: "megamodel" },
+    cost: 0.5,
+    tokens: { input: 1500000000, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+  },
+});
+await tick();
+await byName.stats_dashboard.execute({}, toolCtx);
+const html6 = readFileSync(dashPath, "utf8");
+check(
+  "dashboard compacts billion-token counts but keeps the exact value on hover",
+  /acme\/megamodel<\/td>[\s\S]{0,160}title="1500000000">1\.5b</.test(html6) && html6.includes('title="$0.500000">$.5<'),
+  (html6.match(/megamodel[\s\S]{0,300}/) || ["NO MEGAMODEL ROW"])[0].replace(/\s+/g, " ").slice(0, 280),
+);
 
 // --- command (must be model-free) -------------------------------------------
 const dashBefore = readFileSync(dashPath, "utf8").length;
