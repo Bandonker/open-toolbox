@@ -114,6 +114,19 @@ function initSchema(database: AnyDatabase): void {
     "CREATE INDEX IF NOT EXISTS idx_chunks_project ON code_chunks(project_id)"
   );
 
+  // I3: per-file fingerprints so re-indexing can skip unchanged files
+  // instead of rebuilding the whole project every run.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS indexed_files (
+      project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      rel_path TEXT NOT NULL,
+      mtime_ms INTEGER NOT NULL,
+      size_bytes INTEGER NOT NULL,
+      chunk_count INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (project_id, rel_path)
+    )
+  `);
+
   const ftsExists = database
     .query("SELECT name FROM sqlite_master WHERE type='table' AND name='code_chunks_fts'")
     .get() as { name: string } | null;
@@ -374,47 +387,90 @@ function chunkFile(absPath: string, rootPath: string, fs: FsLike = { statSync, r
   return chunks;
 }
 
-function indexProject(rootPath: string): { files: number; chunks: number; skipped: number } {
+function indexProject(rootPath: string): {
+  files: number; chunks: number; skipped: number;
+  updated: number; unchanged: number; removed: number;
+} {
   const database = getDb();
   const resolvedPath = normalizeRoot(rootPath);
   const projectName = resolvedPath.split(/[\\/]/).pop() || "unknown";
 
-  const deleteStmt = database.query(
-    "DELETE FROM code_chunks WHERE project_id = (SELECT id FROM projects WHERE root_path = ?)"
-  );
-  const deleteProject = database.query(
-    "DELETE FROM projects WHERE root_path = ?"
-  );
-
+  // I3: incremental re-index. The project row is reused across runs and each
+  // file carries an (mtime, size) fingerprint in `indexed_files`. Unchanged
+  // files are skipped; only new/changed files are re-chunked; files missing
+  // from disk are dropped. FTS triggers stay enabled so per-row deltas keep
+  // the FTS index in sync — no full rebuild.
   database.exec("BEGIN TRANSACTION");
   try {
-    deleteStmt.run(resolvedPath);
-    deleteProject.run(resolvedPath);
+    let project = database
+      .query("SELECT id FROM projects WHERE root_path = ?")
+      .get(resolvedPath) as { id: number } | null;
+    if (!project) {
+      database
+        .query("INSERT INTO projects (root_path, name) VALUES (?, ?)")
+        .run(resolvedPath, projectName);
+      project = {
+        id: Number(
+          (database.query("SELECT last_insert_rowid() as id").get() as { id: number }).id
+        ),
+      };
+    }
+    const projectId = project.id;
 
-    // Disable FTS triggers during bulk insert for performance
-    database.exec("DROP TRIGGER IF EXISTS chunks_ai");
-    database.exec("DROP TRIGGER IF EXISTS chunks_ad");
-    database.exec("DROP TRIGGER IF EXISTS chunks_au");
-
-    const insertProject = database.query(
-      "INSERT INTO projects (root_path, name) VALUES (?, ?)"
-    );
-    insertProject.run(resolvedPath, projectName);
-    const projectId = Number(
-      (database.query("SELECT last_insert_rowid() as id").get() as { id: number }).id
-    );
+    const prevRows = database
+      .query("SELECT rel_path, mtime_ms, size_bytes FROM indexed_files WHERE project_id = ?")
+      .all(projectId) as Array<{ rel_path: string; mtime_ms: number; size_bytes: number }>;
+    const prev = new Map(prevRows.map((r) => [r.rel_path, r]));
+    const seen = new Set<string>();
 
     const insertChunk = database.query(`
       INSERT INTO code_chunks (project_id, file_path, rel_path, chunk_index, start_line, end_line, content)
       VALUES (?, ?, ?, ?, ?, ?, ?)
     `);
+    const deleteFileChunks = database.query(
+      "DELETE FROM code_chunks WHERE project_id = ? AND rel_path = ?"
+    );
+    const upsertFile = database.query(`
+      INSERT INTO indexed_files (project_id, rel_path, mtime_ms, size_bytes, chunk_count)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(project_id, rel_path) DO UPDATE SET
+        mtime_ms = excluded.mtime_ms,
+        size_bytes = excluded.size_bytes,
+        chunk_count = excluded.chunk_count
+    `);
 
-    let fileCount = 0;
-    let chunkCount = 0;
     let skipped = 0;
+    let updated = 0;
+    let unchanged = 0;
+    let removed = 0;
 
     for (const filePath of walkDir(resolvedPath)) {
-      // CI-1: one bad file must not abort the whole re-index.
+      // Stat first: the (mtime, size) fingerprint decides skip vs re-chunk.
+      let fingerprint: { mtimeMs: number; size: number; relPath: string } | null = null;
+      try {
+        const stat = statSync(filePath);
+        if (!stat.isFile()) {
+          skipped++;
+          continue;
+        }
+        fingerprint = {
+          mtimeMs: Math.floor(stat.mtimeMs),
+          size: stat.size,
+          relPath: relative(resolvedPath, filePath).split(sep).join("/"),
+        };
+      } catch {
+        // CI-1: file vanished or is unreadable between walkDir and stat — skip it.
+        skipped++;
+        continue;
+      }
+      seen.add(fingerprint.relPath);
+      const old = prev.get(fingerprint.relPath);
+      if (old && old.mtime_ms === fingerprint.mtimeMs && old.size_bytes === fingerprint.size) {
+        unchanged++;
+        continue;
+      }
+
+      // New or changed file: re-chunk it (CI-1: one bad file never aborts the run).
       let chunks: Chunk[];
       try {
         chunks = chunkFile(filePath, resolvedPath);
@@ -422,10 +478,8 @@ function indexProject(rootPath: string): { files: number; chunks: number; skippe
         skipped++;
         continue;
       }
-      if (chunks.length === 0) continue;
-      fileCount++;
-
       try {
+        deleteFileChunks.run(projectId, fingerprint.relPath);
         for (const ch of chunks) {
           insertChunk.run(
             projectId,
@@ -436,15 +490,33 @@ function indexProject(rootPath: string): { files: number; chunks: number; skippe
             ch.endLine,
             ch.content
           );
-          chunkCount++;
         }
+        upsertFile.run(projectId, fingerprint.relPath, fingerprint.mtimeMs, fingerprint.size, chunks.length);
+        updated++;
       } catch {
         // A single file's rows failed (e.g. transient write error) —
         // leave it out of the new index rather than failing everything.
-        fileCount--;
         skipped++;
       }
     }
+
+    // Files tracked in the DB but gone from disk leave the index.
+    for (const relPath of prev.keys()) {
+      if (seen.has(relPath)) continue;
+      deleteFileChunks.run(projectId, relPath);
+      database
+        .query("DELETE FROM indexed_files WHERE project_id = ? AND rel_path = ?")
+        .run(projectId, relPath);
+      removed++;
+    }
+
+    const totals = database
+      .query(
+        "SELECT COUNT(CASE WHEN chunk_count > 0 THEN 1 END) AS files, COALESCE(SUM(chunk_count), 0) AS chunks FROM indexed_files WHERE project_id = ?"
+      )
+      .get(projectId) as { files: number; chunks: number };
+    const fileCount = Number(totals.files);
+    const chunkCount = Number(totals.chunks);
 
     database.query(`
       UPDATE projects SET file_count = ?, chunk_count = ?, last_indexed_at = datetime('now')
@@ -453,47 +525,9 @@ function indexProject(rootPath: string): { files: number; chunks: number; skippe
 
     database.exec("COMMIT");
 
-    // Rebuild FTS index and recreate triggers
-    try {
-      database.exec("INSERT INTO code_chunks_fts(code_chunks_fts) VALUES('rebuild')");
-    } catch {}
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON code_chunks BEGIN
-        INSERT INTO code_chunks_fts(rowid, content) VALUES (new.id, new.content);
-      END
-    `);
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON code_chunks BEGIN
-        INSERT INTO code_chunks_fts(code_chunks_fts, rowid, content) VALUES ('delete', old.id, old.content);
-      END
-    `);
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON code_chunks BEGIN
-        INSERT INTO code_chunks_fts(code_chunks_fts, rowid, content) VALUES ('delete', old.id, old.content);
-        INSERT INTO code_chunks_fts(rowid, content) VALUES (new.id, new.content);
-      END
-    `);
-
-    return { files: fileCount, chunks: chunkCount, skipped };
+    return { files: fileCount, chunks: chunkCount, skipped, updated, unchanged, removed };
   } catch (err) {
     try { database.exec("ROLLBACK"); } catch {}
-    // Always restore triggers even on failure
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON code_chunks BEGIN
-        INSERT INTO code_chunks_fts(rowid, content) VALUES (new.id, new.content);
-      END
-    `);
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON code_chunks BEGIN
-        INSERT INTO code_chunks_fts(code_chunks_fts, rowid, content) VALUES ('delete', old.id, old.content);
-      END
-    `);
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON code_chunks BEGIN
-        INSERT INTO code_chunks_fts(code_chunks_fts, rowid, content) VALUES ('delete', old.id, old.content);
-        INSERT INTO code_chunks_fts(rowid, content) VALUES (new.id, new.content);
-      END
-    `);
     throw err;
   }
 }
@@ -508,7 +542,7 @@ export default Plugin.define({
       editor.add({
         name: "codebase_index",
         description:
-          "Scan and index a codebase directory for full-text search. Reads source files, splits them into chunks, and builds an FTS5 index. Run this before using codebase_search. Re-runs replace the existing index for that path.",
+          "Scan and index a codebase directory for full-text search. Reads source files, splits them into chunks, and builds an FTS5 index. Run this before using codebase_search. Re-runs are incremental: unchanged files are skipped, changed files are re-chunked, deleted files are dropped.",
         input: z.object({
           path: z.string().optional().describe("Root path of the codebase to index (default: current project directory)"),
         }),
@@ -526,6 +560,9 @@ export default Plugin.define({
               files: result.files,
               chunks: result.chunks,
               skipped: result.skipped,
+              updated: result.updated,
+              unchanged: result.unchanged,
+              removed: result.removed,
             });
           });
           return { content: out };
@@ -717,6 +754,11 @@ export default Plugin.define({
             if (!project) {
               return JSON.stringify({ deleted: false, error: "not found", path: resolved });
             }
+            // PRAGMA foreign_keys is never enabled (see lib/sqlite.ts), so
+            // ON DELETE CASCADE on code_chunks/indexed_files is inert —
+            // delete the rows explicitly or re-indexing resurrects orphans.
+            database.query("DELETE FROM code_chunks WHERE project_id = ?").run(project.id);
+            database.query("DELETE FROM indexed_files WHERE project_id = ?").run(project.id);
             database.query("DELETE FROM projects WHERE id = ?").run(project.id);
             return JSON.stringify({ deleted: true, path: resolved, name: project.name });
           });
