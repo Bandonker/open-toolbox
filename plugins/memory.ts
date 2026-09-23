@@ -11,6 +11,7 @@ import {
   quoteFtsQuery,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
+import { redactSecrets } from "../lib/redact.ts";
 
 /**
  * memory
@@ -36,6 +37,7 @@ type Config = {
   minScore: number;
   scope: Scope;
   maxEntries: number;
+  recallAll: boolean;
   log: boolean;
 };
 
@@ -43,6 +45,8 @@ type MemoryRow = {
   id: number;
   text: string;
   scope: string;
+  project?: string | null;
+  session_id?: string | null;
   importance: number;
   tags: string;
   created_at: string;
@@ -131,8 +135,28 @@ function resolveConfig(options: Record<string, unknown> | undefined): Config {
     minScore: num(o.minScore, env("OPENCODE_MEMORY_MIN_SCORE"), 0),
     scope,
     maxEntries: Math.max(0, Math.trunc(num(o.maxEntries, env("OPENCODE_MEMORY_MAX_ENTRIES"), 0))),
+    recallAll: bool(o.recallAll, env("OPENCODE_MEMORY_RECALL_ALL"), false),
     log: bool(o.log, env("OPENCODE_MEMORY_LOG"), false),
   };
+}
+
+/**
+ * M1: scope isolation is enforced at read time. A memory is visible when:
+ * global — always; project — only within the same project; session — only
+ * within the same session. Widening requires an explicit opt-in
+ * (`options.recallAll` / env or the tool's `all: true`).
+ */
+function visible(
+  row: MemoryRow,
+  project: string,
+  sessionID: string | null,
+  all: boolean,
+): boolean {
+  if (all) return true;
+  if (row.scope === "global") return true;
+  if (row.scope === "project") return !row.project || row.project === project;
+  if (row.scope === "session") return !!sessionID && row.session_id === sessionID;
+  return false;
 }
 
 let db: AnyDatabase | null = null;
@@ -268,6 +292,12 @@ function remember(
 
 const scopeSchema = z.enum(["global", "project", "session"]);
 
+/** P5: redact obvious secrets before they hit the pack's own store (opt-out via env). */
+const STORE_REDACT = process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+function scrubStore(text: string): string {
+  return STORE_REDACT ? redactSecrets(text) : text;
+}
+
 export default Plugin.define({
   id: "memory",
   async setup(ctx) {
@@ -296,7 +326,7 @@ export default Plugin.define({
           const scope = resolveScope(args.scope);
           const importance = resolveImportance(args.importance);
           const tags = Array.isArray(args.tags) ? args.tags : [];
-          const result = remember(database, cfg, args.text, tags, scope, importance, project, toolCtx.sessionID ?? null);
+          const result = remember(database, cfg, scrubStore(args.text), tags, scope, importance, project, toolCtx.sessionID ?? null);
           log(result.created ? `remember #${result.id}` : `dedupe #${result.id}`);
           return {
             content: result.created
@@ -308,15 +338,21 @@ export default Plugin.define({
 
       editor.add({
         name: "memory_recall",
-        description: "Search stored memories with local BM25 full-text search.",
+        description: "Search stored memories with local BM25 full-text search. Isolated by default: only global, this project's, and this session's memories are returned.",
         input: z.object({
           query: z.string().min(1).describe("Full-text query."),
           scope: scopeSchema.optional().describe("Restrict to one scope."),
           limit: z.number().int().min(1).max(50).optional().describe("Max results (default config topK)."),
+          all: z.boolean().optional().describe("Widen isolation: include memories from other projects/sessions (default false)."),
         }),
-        execute: async (args) => {
+        execute: async (args, toolCtx) => {
           const scope = args.scope ? resolveScope(args.scope) : null;
-          const rows = search(database, toMatch(args.query, "all"), args.limit ?? cfg.topK, cfg.minScore, scope);
+          const limit = args.limit ?? cfg.topK;
+          const all = args.all === true || cfg.recallAll;
+          const sessionID = toolCtx?.sessionID ?? null;
+          const rows = search(database, toMatch(args.query, "all"), Math.max(limit * 3, limit), cfg.minScore, scope)
+            .filter((row) => visible(row, project, sessionID, all))
+            .slice(0, limit);
           if (rows.length === 0) return { content: "No memories matched." };
           return { content: rows.map(formatRow).join("\n") };
         },
@@ -395,7 +431,10 @@ export default Plugin.define({
         if (!cfg.enabled || !cfg.autoRecall) return;
         const query = extractLatestUserText(event.messages);
         if (!query.trim()) return;
-        const rows = search(database, toMatch(query, "any"), Math.max(cfg.topK * 4, 8), cfg.minScore, null);
+        const recallSessionID = typeof event.sessionID === "string" ? event.sessionID : null;
+        const rows = search(database, toMatch(query, "any"), Math.max(cfg.topK * 4, 8), cfg.minScore, null).filter(
+          (row) => visible(row, project, recallSessionID, cfg.recallAll),
+        );
         if (rows.length === 0) return;
         const key = String(event.sessionID ?? "");
         const used = seen.get(key) ?? new Set<number>();

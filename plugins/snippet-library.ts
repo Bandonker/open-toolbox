@@ -1,22 +1,29 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
-import { mkdirSync, existsSync, copyFileSync } from "fs";
+import { mkdirSync, existsSync, copyFileSync, rmSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import {
   openDatabase,
   applyPragmas,
   maybeBackupDb,
-  latestBackup,
+  latestValidBackup,
   isCorruption,
+  parseStringArray,
   quoteFtsQuery,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
+import { redactSecrets } from "../lib/redact.ts";
 
 const DB_DIR = join(homedir(), ".opencode-plugins", "snippet-library");
 const DB_PATH = join(DB_DIR, "snippet-library.db");
 const BACKUP_DIR = join(DB_DIR, "backups");
 const MAX_BACKUPS = 5;
+/** P5: redact obvious secrets before they hit the pack's own store (opt-out via env). */
+const STORE_REDACT = process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+function scrubStore(text: string): string {
+  return STORE_REDACT ? redactSecrets(text) : text;
+}
 
 let db: AnyDatabase | null = null;
 let lastBackupTime = 0;
@@ -45,7 +52,6 @@ function initSchema(database: AnyDatabase): void {
       language TEXT NOT NULL DEFAULT '',
       description TEXT NOT NULL DEFAULT '',
       tags TEXT NOT NULL DEFAULT '[]',
-      project_path TEXT,
       created_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     )
@@ -96,8 +102,18 @@ function backup(): void {
 }
 
 function tryRestore(): AnyDatabase | null {
-  const latest = latestBackup(BACKUP_DIR);
+  const latest = latestValidBackup(BACKUP_DIR);
   if (!latest) return null;
+  // N1: close the failing handle first (an open handle blocks the copy on
+  // Windows) and drop stale -wal/-shm so they cannot be replayed on top of
+  // the restored snapshot.
+  if (db) {
+    try { db.close(); } catch { /* ignore */ }
+    db = null;
+  }
+  for (const suffix of ["-wal", "-shm"]) {
+    try { rmSync(DB_PATH + suffix, { force: true }); } catch { /* ignore */ }
+  }
   copyFileSync(latest, DB_PATH);
   const restored = openDatabase(DB_PATH);
   applyPragmas(restored);
@@ -112,6 +128,7 @@ function withRetry<T>(fn: () => T, isWrite = false): T {
     return result;
   } catch (err) {
     if (isCorruption(err)) {
+      try { db?.close(); } catch { /* ignore */ }
       db = null;
       db = tryRestore();
       if (db) {
@@ -131,13 +148,12 @@ interface SnippetRow {
   language: string;
   description: string;
   tags: string;
-  project_path: string | null;
   created_at: string;
   updated_at: string;
 }
 
 function formatSnippet(row: SnippetRow, full: boolean = false): string {
-  const tags = JSON.parse(row.tags) as string[];
+  const tags = parseStringArray(row.tags);
   const parts: string[] = [];
   let header = `**#${row.id}** ${row.title}`;
   if (row.language) header += ` (${row.language})`;
@@ -186,7 +202,11 @@ export default Plugin.define({
             const tags = JSON.stringify(args.tags || []);
             const result = database.prepare(
               "INSERT INTO snippets (title, code, language, description, tags) VALUES (?, ?, ?, ?, ?)"
-            ).run(args.title, args.code, args.language || "", args.description || "", tags) as { lastInsertRowid: number | bigint };
+              // P5: title/description are free text; `code` is deliberately
+              // left raw — redacting code artifacts would corrupt the very
+              // snippets the user asked to store (secret-shield's redact/block
+              // mode still covers them when enabled).
+            ).run(scrubStore(args.title), args.code, args.language || "", args.description ? scrubStore(args.description) : "", tags) as { lastInsertRowid: number | bigint };
             return `Saved snippet #${result.lastInsertRowid}: "${args.title}"`;
           }, true);
           return { content: out };
@@ -210,16 +230,20 @@ export default Plugin.define({
           const out = withRetry(() => {
             const database = getDb();
             const limit = Math.min(Math.max(args.limit || 10, 1), 50);
+            const q = quoteFtsQuery(args.query);
+            if (q === null) return "No snippets found matching query.";
             let sql = `SELECT s.* FROM snippets s JOIN snippets_fts f ON s.id = f.rowid WHERE snippets_fts MATCH ?`;
-            const params: unknown[] = [quoteFtsQuery(args.query)];
+            const params: unknown[] = [q];
             if (args.language) {
               sql += " AND s.language = ?";
               params.push(args.language);
             }
             if (args.tags && args.tags.length > 0) {
               for (const tag of args.tags) {
-                sql += " AND s.tags LIKE ?";
-                params.push(`%"${tag}"%`);
+                // N2: exact tag match against the JSON array — substring LIKE
+                // produced false positives (e.g. "api" matching "api-v2").
+                sql += " AND EXISTS (SELECT 1 FROM json_each(s.tags) WHERE value = ?)";
+                params.push(tag);
               }
             }
             sql += " ORDER BY rank LIMIT ?";
@@ -256,8 +280,10 @@ export default Plugin.define({
             }
             if (args.tags && args.tags.length > 0) {
               for (const tag of args.tags) {
-                sql += " AND tags LIKE ?";
-                params.push(`%"${tag}"%`);
+                // N2: exact tag match against the JSON array — substring LIKE
+                // produced false positives (e.g. "api" matching "api-v2").
+                sql += " AND EXISTS (SELECT 1 FROM json_each(snippets.tags) WHERE value = ?)";
+                params.push(tag);
               }
             }
 
@@ -312,5 +338,14 @@ export default Plugin.define({
         },
       });
     });
+
+    return () => {
+      try {
+        db?.close();
+      } catch {
+        /* ignore */
+      }
+      db = null;
+    };
   },
 });

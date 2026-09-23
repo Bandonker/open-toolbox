@@ -392,6 +392,33 @@ function initSchema(database: AnyDatabase): void {
       /* column already exists on migrated databases */
     }
   }
+
+  // U2: a lifetime rollup that is never pruned. `daily` is subject to
+  // retention, which made the "lifetime" hero cards disagree with the
+  // never-pruned model/tool tables. Written in lockstep with `daily`
+  // below; existing rows are copied once.
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS lifetime (
+      day TEXT PRIMARY KEY,
+      input INTEGER NOT NULL DEFAULT 0,
+      output INTEGER NOT NULL DEFAULT 0,
+      reasoning INTEGER NOT NULL DEFAULT 0,
+      cache_read INTEGER NOT NULL DEFAULT 0,
+      cache_write INTEGER NOT NULL DEFAULT 0,
+      cost REAL NOT NULL DEFAULT 0,
+      cost_computed REAL,
+      tool_calls INTEGER NOT NULL DEFAULT 0,
+      tool_ok INTEGER NOT NULL DEFAULT 0,
+      tool_fail INTEGER NOT NULL DEFAULT 0,
+      bg_input INTEGER NOT NULL DEFAULT 0,
+      bg_output INTEGER NOT NULL DEFAULT 0,
+      bg_reasoning INTEGER NOT NULL DEFAULT 0,
+      bg_cache_read INTEGER NOT NULL DEFAULT 0,
+      bg_cache_write INTEGER NOT NULL DEFAULT 0,
+      bg_cost REAL NOT NULL DEFAULT 0
+    );
+    INSERT OR IGNORE INTO lifetime SELECT * FROM daily;
+  `);
 }
 
 function getDb(cfg: Config): AnyDatabase {
@@ -414,7 +441,18 @@ function prune(cfg: Config, force: boolean): void {
     const database = db;
     if (!database) return;
     database.prepare("DELETE FROM daily WHERE day < ?").run(cutoff);
-    database.prepare("DELETE FROM session_state WHERE updated_at != '' AND updated_at < ?").run(cutoff);
+    // U1: never prune session_state rows that hold cumulative usage — a
+    // resumed session would otherwise re-add its entire lifetime as one
+    // delta (double counting everything). Only rows with no recorded
+    // usage are safe to drop; lifetime rollups are never pruned (U2).
+    database
+      .prepare(
+        `DELETE FROM session_state
+          WHERE updated_at != '' AND updated_at < ?
+            AND input = 0 AND output = 0 AND reasoning = 0
+            AND cache_read = 0 AND cache_write = 0 AND cost = 0`,
+      )
+      .run(cutoff);
   } catch {
     /* pruning is best-effort */
   }
@@ -480,20 +518,23 @@ function addDailyUsage(
   cost: number,
   costComputed: number | null,
 ): void {
-  database
-    .prepare(
-      `INSERT INTO daily(day, input, output, reasoning, cache_read, cache_write, cost, cost_computed)
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(day) DO UPDATE SET
-         input = input + excluded.input,
-         output = output + excluded.output,
-         reasoning = reasoning + excluded.reasoning,
-         cache_read = cache_read + excluded.cache_read,
-         cache_write = cache_write + excluded.cache_write,
-         cost = cost + excluded.cost,
-         cost_computed = CASE WHEN excluded.cost_computed IS NULL THEN cost_computed ELSE COALESCE(cost_computed, 0) + excluded.cost_computed END`,
-    )
-    .run(day, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost, costComputed);
+  // U2: mirror every daily increment into the never-pruned lifetime rollup.
+  for (const table of ["daily", "lifetime"] as const) {
+    database
+      .prepare(
+        `INSERT INTO ${table}(day, input, output, reasoning, cache_read, cache_write, cost, cost_computed)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(day) DO UPDATE SET
+           input = input + excluded.input,
+           output = output + excluded.output,
+           reasoning = reasoning + excluded.reasoning,
+           cache_read = cache_read + excluded.cache_read,
+           cache_write = cache_write + excluded.cache_write,
+           cost = cost + excluded.cost,
+           cost_computed = CASE WHEN excluded.cost_computed IS NULL THEN cost_computed ELSE COALESCE(cost_computed, 0) + excluded.cost_computed END`,
+      )
+      .run(day, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost, costComputed);
+  }
 }
 
 function addModelUsage(
@@ -536,26 +577,39 @@ function addBackgroundUsage(database: AnyDatabase, day: string, source: string, 
          cache_write = cache_write + excluded.cache_write`,
     )
     .run(source, cost, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite);
-  database
-    .prepare(
-      `INSERT INTO daily(day, bg_input, bg_output, bg_reasoning, bg_cache_read, bg_cache_write, bg_cost)
-       VALUES(?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(day) DO UPDATE SET
-         bg_input = bg_input + excluded.bg_input,
-         bg_output = bg_output + excluded.bg_output,
-         bg_reasoning = bg_reasoning + excluded.bg_reasoning,
-         bg_cache_read = bg_cache_read + excluded.bg_cache_read,
-         bg_cache_write = bg_cache_write + excluded.bg_cache_write,
-         bg_cost = bg_cost + excluded.bg_cost`,
-    )
-    .run(day, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost);
+  // U2: mirror the background (title/compaction) usage into the lifetime rollup too.
+  for (const table of ["daily", "lifetime"] as const) {
+    database
+      .prepare(
+        `INSERT INTO ${table}(day, bg_input, bg_output, bg_reasoning, bg_cache_read, bg_cache_write, bg_cost)
+         VALUES(?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(day) DO UPDATE SET
+           bg_input = bg_input + excluded.bg_input,
+           bg_output = bg_output + excluded.bg_output,
+           bg_reasoning = bg_reasoning + excluded.bg_reasoning,
+           bg_cache_read = bg_cache_read + excluded.bg_cache_read,
+           bg_cache_write = bg_cache_write + excluded.bg_cache_write,
+           bg_cost = bg_cost + excluded.bg_cost`,
+      )
+      .run(day, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost);
+  }
 }
 
-function recordUsageUpdated(database: AnyDatabase, sessionID: string, tokensRaw: unknown, costRaw: unknown): void {
+function recordUsageUpdated(
+  database: AnyDatabase,
+  sessionID: string,
+  tokensRaw: unknown,
+  costRaw: unknown,
+  modelRaw?: unknown,
+): void {
   const current = readTokens(tokensRaw);
   const cost = readCost(costRaw);
   const last = loadSession(database, sessionID);
-  const model = last?.model ?? "unknown";
+  // U6: prefer the model carried on the usage event when present — the
+  // `session_state.model` written by the http.request hook can race the
+  // event pump; without this the delta can land on the wrong model.
+  const eventModel = modelKey(modelRaw);
+  const model = eventModel !== "unknown" ? eventModel : last?.model ?? "unknown";
   const prev = last ?? {
     input: 0,
     output: 0,
@@ -581,26 +635,40 @@ function recordUsageUpdated(database: AnyDatabase, sessionID: string, tokensRaw:
     delta.cacheRead > 0 ||
     delta.cacheWrite > 0 ||
     deltaCost > 0;
-  if (changed) {
-    addDailyUsage(database, day, delta, deltaCost, deltaComputed);
-    addModelUsage(database, model, delta, deltaCost, 1, deltaComputed);
+  // U3: the rollups and the baseline write must be atomic — a mid-sequence
+  // failure would double-count the delta against session_state on the next
+  // event. U4: the upsert below already creates the row, so the separate
+  // ensureSession INSERT was redundant.
+  database.exec("BEGIN TRANSACTION");
+  try {
+    if (changed) {
+      addDailyUsage(database, day, delta, deltaCost, deltaComputed);
+      addModelUsage(database, model, delta, deltaCost, 1, deltaComputed);
+    }
+    database
+      .prepare(
+        `INSERT INTO session_state(session_id, input, output, reasoning, cache_read, cache_write, cost, updated_at)
+         VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id) DO UPDATE SET
+           input = excluded.input,
+           output = excluded.output,
+           reasoning = excluded.reasoning,
+           cache_read = excluded.cache_read,
+           cache_write = excluded.cache_write,
+           cost = excluded.cost,
+           updated_at = excluded.updated_at`,
+      )
+      .run(sessionID, current.input, current.output, current.reasoning, current.cacheRead, current.cacheWrite, cost, day);
+    database.exec("COMMIT");
+  } catch (err) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    throw err;
   }
   dirty = true;
-  ensureSession(database, sessionID, null);
-  database
-    .prepare(
-      `INSERT INTO session_state(session_id, input, output, reasoning, cache_read, cache_write, cost, updated_at)
-       VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(session_id) DO UPDATE SET
-         input = excluded.input,
-         output = excluded.output,
-         reasoning = excluded.reasoning,
-         cache_read = excluded.cache_read,
-         cache_write = excluded.cache_write,
-         cost = excluded.cost,
-         updated_at = excluded.updated_at`,
-    )
-    .run(sessionID, current.input, current.output, current.reasoning, current.cacheRead, current.cacheWrite, cost, day);
 }
 
 function recordUsageRecorded(database: AnyDatabase, sessionID: string, source: string, tokensRaw: unknown, costRaw: unknown): void {
@@ -636,28 +704,43 @@ function rememberModel(sessionID: string, model: string): void {
 
 function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durationMs: number): void {
   const ms = Math.max(0, Math.round(durationMs));
-  database
-    .prepare(
-      `INSERT INTO tool_totals(tool, calls, succeeded, failed, total_ms, max_ms)
-       VALUES(?, 1, ?, ?, ?, ?)
-       ON CONFLICT(tool) DO UPDATE SET
-         calls = calls + 1,
-         succeeded = succeeded + excluded.succeeded,
-         failed = failed + excluded.failed,
-         total_ms = total_ms + excluded.total_ms,
-         max_ms = MAX(max_ms, excluded.max_ms)`,
-    )
-    .run(tool, ok ? 1 : 0, ok ? 0 : 1, ms, ms);
-  database
-    .prepare(
-      `INSERT INTO daily(day, tool_calls, tool_ok, tool_fail)
-       VALUES(?, 1, ?, ?)
-       ON CONFLICT(day) DO UPDATE SET
-         tool_calls = tool_calls + 1,
-         tool_ok = tool_ok + excluded.tool_ok,
-         tool_fail = tool_fail + excluded.tool_fail`,
-    )
-    .run(dayKey(), ok ? 1 : 0, ok ? 0 : 1);
+  // U3: both rollups are written atomically; U2: the daily increment is
+  // mirrored into the never-pruned lifetime rollup.
+  database.exec("BEGIN TRANSACTION");
+  try {
+    database
+      .prepare(
+        `INSERT INTO tool_totals(tool, calls, succeeded, failed, total_ms, max_ms)
+         VALUES(?, 1, ?, ?, ?, ?)
+         ON CONFLICT(tool) DO UPDATE SET
+           calls = calls + 1,
+           succeeded = succeeded + excluded.succeeded,
+           failed = failed + excluded.failed,
+           total_ms = total_ms + excluded.total_ms,
+           max_ms = MAX(max_ms, excluded.max_ms)`,
+      )
+      .run(tool, ok ? 1 : 0, ok ? 0 : 1, ms, ms);
+    for (const table of ["daily", "lifetime"] as const) {
+      database
+        .prepare(
+          `INSERT INTO ${table}(day, tool_calls, tool_ok, tool_fail)
+           VALUES(?, 1, ?, ?)
+           ON CONFLICT(day) DO UPDATE SET
+             tool_calls = tool_calls + 1,
+             tool_ok = tool_ok + excluded.tool_ok,
+             tool_fail = tool_fail + excluded.tool_fail`,
+        )
+        .run(dayKey(), ok ? 1 : 0, ok ? 0 : 1);
+    }
+    database.exec("COMMIT");
+  } catch (err) {
+    try {
+      database.exec("ROLLBACK");
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
   dirty = true;
 }
 
@@ -738,7 +821,7 @@ function lifetimeTotals(database: AnyDatabase): UsageTotals {
       `SELECT SUM(input) input, SUM(output) output, SUM(reasoning) reasoning,
               SUM(cache_read) cache_read, SUM(cache_write) cache_write, SUM(cost) cost,
               SUM(cost_computed) cost_computed
-       FROM daily`,
+       FROM lifetime`,
     )
     .get() as Record<string, unknown> | null;
   return totalsOf(r);
@@ -746,7 +829,7 @@ function lifetimeTotals(database: AnyDatabase): UsageTotals {
 
 function lifetimeTools(database: AnyDatabase): { calls: number; ok: number; fail: number } {
   const r = database
-    .prepare("SELECT SUM(tool_calls) calls, SUM(tool_ok) ok, SUM(tool_fail) fail FROM daily")
+    .prepare("SELECT SUM(tool_calls) calls, SUM(tool_ok) ok, SUM(tool_fail) fail FROM lifetime")
     .get() as Record<string, unknown> | null;
   return { calls: num(r?.calls), ok: num(r?.ok), fail: num(r?.fail) };
 }
@@ -1058,7 +1141,7 @@ function tableHtml(headers: string[], rows: string[][]): string {
           )
           .join("")
       : `<tr><td colspan="${headers.length}" class="muted">No data yet</td></tr>`;
-  return `<table class="tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+  return `<div class="tbl-wrap"><table class="tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
 type AppInfo = { name?: string; version?: string; channel?: string };
@@ -1161,63 +1244,74 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo): s
     .join("");
 
   const css = [
-    ":root{--bg:#f4f6fb;--panel:#fff;--border:#e4e8f0;--text:#1c2230;--muted:#68718a;--grid:#e9edf5;",
-    "--accent:#6366f1;--accent2:#8b5cf6;--ok:#16a34a;--warn:#d97706;",
-    "--hm0:#edf0f7;--hm1:#c7d2fe;--hm2:#a5b4fc;--hm3:#818cf8;--hm4:#6366f1;",
-    "--shadow:0 1px 2px rgba(16,24,40,.05),0 6px 20px -8px rgba(16,24,40,.18);--radius:16px}",
-    "@media (prefers-color-scheme:dark){:root{--bg:#080b12;--panel:#111725;--border:#212b3d;--text:#e7ecf5;--muted:#8d99ad;--grid:#1b2434;",
-    "--accent:#818cf8;--accent2:#a78bfa;--ok:#4ade80;--warn:#fbbf24;",
-    "--hm0:#1a2231;--hm1:#312e81;--hm2:#4338ca;--hm3:#6366f1;--hm4:#a5b4fc;",
-    "--shadow:0 1px 2px rgba(0,0,0,.5),0 12px 32px -12px rgba(0,0,0,.7)}}",
+    ":root{--font-display:Georgia,'Iowan Old Style','Times New Roman',serif;--font-text:ui-monospace,'SF Mono','Cascadia Code',Menlo,Consolas,monospace;",
+    "--step--1:0.75rem;--step-0:1rem;--step-1:1.333rem;--step-2:1.777rem;--step-3:2.369rem;--step-4:3.157rem;--step-5:4.209rem;",
+    "--space-3xs:0.25rem;--space-2xs:0.5rem;--space-xs:0.75rem;--space-s:1rem;--space-m:1.5rem;--space-l:2rem;--space-xl:3rem;--space-2xl:4.5rem;--space-3xl:7rem;",
+    "--base:#f4f1ea;--surface:#fdfcf7;--surface-2:#ece5d3;--line:#d9d1c1;--ink:#161310;--ink-2:#575046;--ink-3:#7a7368;",
+    "--accent:#a92c1a;--accent-deep:#7e1f12;--ok:#1e6b3a;",
+    "--hm0:#e5ddcb;--hm1:#d8b9a5;--hm2:#d08a6d;--hm3:#c15535;--hm4:#9e2a16;",
+    "--radius:0;--shadow:none}",
+    "@media (prefers-color-scheme:dark){:root{--base:#14110e;--surface:#1d1a15;--surface-2:#2a251d;--line:#38312a;--ink:#ece5d8;--ink-2:#b8ae9f;--ink-3:#8f8577;",
+    "--accent:#e2603f;--accent-deep:#f08663;--ok:#5fce8a;",
+    "--hm0:#26211b;--hm1:#4a2a20;--hm2:#7a3420;--hm3:#b04a2a;--hm4:#e2603f;",
+    "--radius:0;--shadow:none}}",
     "*{box-sizing:border-box}",
     "html,body{margin:0}",
-    "body{background:var(--bg);color:var(--text);font:15px/1.55 ui-sans-serif,-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;-webkit-font-smoothing:antialiased}",
-    ".wrap{max-width:1080px;margin:0 auto;padding:40px 22px 56px}",
-    ".hero{display:flex;flex-wrap:wrap;align-items:center;justify-content:space-between;gap:10px;margin-bottom:24px}",
-    ".brand{display:flex;align-items:center;gap:12px}",
-    ".brand .dot{width:14px;height:14px;border-radius:50%;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 0 0 4px rgba(99,102,241,.18)}",
-    "h1{font-size:24px;margin:0;letter-spacing:-.02em}",
-    ".meta{color:var(--muted);font-size:12.5px;margin:0}",
-    ".kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:20px}",
-    ".kpi{position:relative;background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:16px 16px 14px;box-shadow:var(--shadow);overflow:hidden}",
-    ".kpi::before{content:'';position:absolute;inset:0 0 auto 0;height:3px;background:var(--accent)}",
-    ".kpi .k{display:block;font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted)}",
-    ".kpi .v{display:block;font-size:23px;font-weight:700;letter-spacing:-.02em;font-variant-numeric:tabular-nums;margin-top:2px}",
-    ".kpi .s{display:block;font-size:11.5px;color:var(--muted);margin-top:2px}",
-    ".kpi.c2::before{background:linear-gradient(90deg,var(--accent),var(--accent2))}",
-    ".kpi.c3::before{background:#0ea5e9}.kpi.c4::before{background:#14b8a6}",
-    ".kpi.c5::before{background:var(--ok)}.kpi.c6::before{background:var(--warn)}",
-    ".panel{background:var(--panel);border:1px solid var(--border);border-radius:var(--radius);padding:20px;box-shadow:var(--shadow);margin-bottom:18px}",
-    ".panel-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:14px}",
-    ".panel-head h2{font-size:15px;margin:0;letter-spacing:-.01em}",
-    ".sub{color:var(--muted);font-size:12px}",
-    ".muted{color:var(--muted)}",
-    ".grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}",
-    "@media (max-width:760px){.grid2{grid-template-columns:1fr}.wrap{padding:24px 14px 40px}}",
-    ".hm-wrap{display:inline-block;max-width:100%;overflow-x:auto}",
-    ".hm-months{display:grid;gap:3px;margin-left:30px;height:14px;font-size:10px;color:var(--muted);align-items:end}",
+    "body{background:var(--base);color:var(--ink);font:400 var(--step-0)/1.55 var(--font-text);-webkit-font-smoothing:antialiased;font-variant-numeric:tabular-nums}",
+    ".wrap{max-width:76rem;margin:0 auto;padding:var(--space-m) var(--space-m) var(--space-2xl);counter-reset:section}",
+    ".hero{border-top:4px solid var(--ink);padding-top:var(--space-xs);padding-bottom:var(--space-s);margin-bottom:var(--space-m);display:flex;flex-wrap:wrap;align-items:flex-end;justify-content:space-between;gap:var(--space-2xs) var(--space-m);border-bottom:3px double var(--ink)}",
+    ".brand{display:flex;align-items:baseline;gap:var(--space-xs)}",
+    ".brand .dot{width:12px;height:12px;background:var(--ink);align-self:center}",
+    ".brand .dot::after{content:'';display:block;width:12px;height:4px;background:var(--accent);margin-top:12px}",
+    "h1{font-family:var(--font-display);font-weight:400;font-size:var(--step-3);line-height:1;margin:0;letter-spacing:-0.02em;text-wrap:balance}",
+    ".meta{color:var(--ink-3);font-size:var(--step--1);line-height:1.4;margin:0;text-transform:uppercase;letter-spacing:.08em}",
+    ".kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(11rem,100%),1fr));gap:0;margin:0 0 var(--space-xl);border-top:2px solid var(--ink);border-bottom:1px solid var(--ink);background:var(--surface)}",
+    ".kpi{position:relative;background:transparent;border:0;border-left:1px solid var(--line);border-radius:0;padding:var(--space-xs) var(--space-s) var(--space-s);overflow:visible}",
+    ".kpi:first-child{border-left:0}",
+    ".kpi::before{content:'';position:absolute;inset:0 0 auto 0;height:2px;background:var(--ink)}",
+    ".kpi.c2::before{background:var(--accent)}",
+    ".kpi.c3::before{background:var(--accent)}.kpi.c4::before{background:var(--ink)}",
+    ".kpi.c5::before{background:var(--ok)}.kpi.c6::before{background:var(--accent)}",
+    ".kpi .k{display:block;font-size:var(--step--1);text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3);line-height:1.4}",
+    ".kpi .v{display:block;font-family:var(--font-text);font-size:var(--step-1);font-weight:700;letter-spacing:-0.01em;font-variant-numeric:tabular-nums lining-nums;margin-top:var(--space-3xs);line-height:1.1}",
+    ".kpi:first-child .v{font-family:var(--font-display);font-weight:400;font-size:var(--step-4);letter-spacing:-0.02em;line-height:.95}",
+    ".kpi.c2 .v,.kpi.c3 .v{color:var(--accent)}",
+    ".kpi .s{display:block;font-size:var(--step--1);color:var(--ink-3);margin-top:var(--space-3xs);line-height:1.4}",
+    ".panel{counter-increment:section;background:transparent;border:0;border-top:2px solid var(--ink);border-radius:0;padding:var(--space-s) 0 var(--space-l);margin-bottom:var(--space-xl)}",
+    ".panel-head{display:flex;align-items:baseline;justify-content:space-between;gap:var(--space-xs);margin-bottom:var(--space-s);border-bottom:1px solid var(--line);padding-bottom:var(--space-2xs)}",
+    ".panel-head h2{font-family:var(--font-text);font-size:var(--step--1);font-weight:700;margin:0;letter-spacing:.1em;text-transform:uppercase}",
+    ".panel-head h2::before{content:'0' counter(section) ' — ';color:var(--accent);font-weight:400}",
+    ".sub{color:var(--ink-3);font-size:var(--step--1)}",
+    ".muted{color:var(--ink-3)}",
+    ".grid2{display:grid;grid-template-columns:5fr 7fr;gap:var(--space-xl)}",
+    "@media (max-width:60em){.grid2{grid-template-columns:1fr}.wrap{padding:var(--space-s) var(--space-s) var(--space-xl)}.kpi:first-child .v{font-size:var(--step-3)}}",
+    ".hm-wrap{display:inline-block;max-width:100%;overflow-x:auto;padding-bottom:var(--space-2xs)}",
+    ".hm-months{display:grid;gap:3px;margin-left:30px;height:14px;font-size:10px;color:var(--ink-3);align-items:end;text-transform:uppercase;letter-spacing:.06em}",
     ".hm-months span{white-space:nowrap}",
     ".hm-body{display:flex;gap:6px;margin-top:4px}",
-    ".hm-days{display:grid;grid-template-rows:repeat(7,12px);gap:3px;width:24px;font-size:10px;color:var(--muted);text-align:right;line-height:12px}",
+    ".hm-days{display:grid;grid-template-rows:repeat(7,12px);gap:3px;width:24px;font-size:10px;color:var(--ink-3);text-align:right;line-height:12px}",
     ".hm-grid{display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,12px);gap:3px}",
-    ".hm-cell{display:block;width:12px;height:12px;border-radius:3px}",
-    ".hm-out{background:var(--hm0);opacity:.4}",
+    ".hm-cell{display:block;width:12px;height:12px;border-radius:0;border:1px solid var(--line)}",
+    ".hm-out{background:transparent;opacity:1;border:1px dashed var(--line)}",
     ".hm-l0{background:var(--hm0)}.hm-l1{background:var(--hm1)}.hm-l2{background:var(--hm2)}.hm-l3{background:var(--hm3)}.hm-l4{background:var(--hm4)}",
-    ".hm-legend{display:flex;align-items:center;gap:5px;margin-top:14px;font-size:11.5px;color:var(--muted)}",
-    ".hm-legend i{width:12px;height:12px;border-radius:3px;display:inline-block}",
-    ".hm-max{margin-left:auto}",
+    ".hm-legend{display:flex;align-items:center;gap:5px;margin-top:var(--space-s);font-size:11.5px;color:var(--ink-3)}",
+    ".hm-legend i{width:12px;height:12px;border-radius:0;display:inline-block;border:1px solid var(--line)}",
+    ".hm-max{margin-left:auto;font-variant-numeric:tabular-nums}",
     ".bars{display:block;width:100%;height:auto;overflow:visible}",
-    ".bar{fill:var(--accent);opacity:.9}.bar:hover{opacity:1}",
-    ".gl{stroke:var(--grid);stroke-width:1}",
-    ".axis{fill:var(--muted);font-size:10.5px;font-variant-numeric:tabular-nums}",
-    ".axis-line{stroke:var(--border);stroke-width:1}",
-    ".tbl{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums}",
-    ".tbl th,.tbl td{padding:8px 10px;border-bottom:1px solid var(--grid);text-align:left}",
-    ".tbl th{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);font-weight:600}",
-    ".tbl td.num,.tbl th.num{text-align:right}",
+    ".bar{fill:var(--ink);opacity:1}.bar:hover{fill:var(--accent)}.bar:last-of-type{fill:var(--accent)}",
+    ".gl{stroke:var(--line);stroke-width:1}",
+    ".axis{fill:var(--ink-3);font-size:10.5px;font-family:var(--font-text);font-variant-numeric:tabular-nums}",
+    ".axis-line{stroke:var(--ink);stroke-width:1}",
+    ".tbl-wrap{overflow-x:auto;overscroll-behavior-x:contain}",
+    ".tbl{width:100%;border-collapse:collapse;font-size:13px;font-variant-numeric:tabular-nums lining-nums}",
+    ".tbl th,.tbl td{padding:var(--space-2xs) var(--space-xs);border-bottom:1px solid var(--line);text-align:left;vertical-align:baseline}",
+    ".tbl thead th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-3);font-weight:700;border-bottom:1px solid var(--ink)}",
+    ".tbl td.num,.tbl th.num{text-align:right;white-space:nowrap}",
     ".tbl tbody tr:last-child td{border-bottom:0}",
-    ".bg-panel{border-left:3px solid var(--warn)}",
-    "footer{color:var(--muted);font-size:12px;text-align:center;padding:10px 0 0}",
+    ".bg-panel{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--surface);padding:var(--space-s) var(--space-m);border-top:2px solid var(--ink)}",
+    "p.sub{max-width:68ch}",
+    ":focus-visible{outline:2px solid var(--accent);outline-offset:2px}",
+    "footer{color:var(--ink-3);font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;text-align:left;border-top:3px double var(--ink);padding:var(--space-xs) 0 0}",
   ].join("\n");
 
   return [
@@ -1370,6 +1464,12 @@ export default Plugin.define({
         try {
           const key = String(event.id ?? "");
           if (!key) return;
+          // U5: sweep orphaned entries (execute.after never arrived) so the
+          // map cannot grow without bound in long-lived servers.
+          const cutoff = Date.now() - 600_000;
+          for (const [k, v] of pending) {
+            if (v.startedMs < cutoff) pending.delete(k);
+          }
           pending.set(key, { tool: String(event.tool ?? "unknown"), startedMs: Date.now() });
         } catch (err) {
           log(`execute.before failed: ${String(err)}`);
@@ -1403,7 +1503,11 @@ export default Plugin.define({
           try {
             switch (ev.type) {
               case "session.usage.updated":
-                if (sessionID) recordUsageUpdated(database(), sessionID, data.tokens, data.cost);
+                // U6: pass the event's model along so attribution doesn't
+                // depend on the racy session_state.model fallback.
+                if (sessionID) {
+                  recordUsageUpdated(database(), sessionID, data.tokens, data.cost, data.model);
+                }
                 break;
               case "session.usage.recorded":
                 if (sessionID) {

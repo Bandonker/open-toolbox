@@ -1,22 +1,30 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
-import { mkdirSync, existsSync, copyFileSync } from "fs";
+import { mkdirSync, existsSync, copyFileSync, rmSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import {
   openDatabase,
   applyPragmas,
   maybeBackupDb,
-  latestBackup,
+  latestValidBackup,
   isCorruption,
+  parseStringArray,
   quoteFtsQuery,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
+import { redactSecrets } from "../lib/redact.ts";
 
 const DB_DIR = join(homedir(), ".opencode-plugins", "decision-log");
 const DB_PATH = join(DB_DIR, "decision-log.db");
 const BACKUP_DIR = join(DB_DIR, "backups");
 const MAX_BACKUPS = 5;
+const DECISION_STATUSES = ["proposed", "accepted", "deprecated", "superseded"] as const;
+/** P5: redact obvious secrets before they hit the pack's own store (opt-out via env). */
+const STORE_REDACT = process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+function scrubStore(text: string): string {
+  return STORE_REDACT ? redactSecrets(text) : text;
+}
 
 let db: AnyDatabase | null = null;
 let lastBackupTime = 0;
@@ -58,7 +66,8 @@ function initSchema(database: AnyDatabase): void {
     .query("SELECT name FROM sqlite_master WHERE type='table' AND name='decisions_fts'")
     .get() as { name: string } | null;
 
-  if (!row) {
+  const createdFts = !row;
+  if (createdFts) {
     database.exec(`
       CREATE VIRTUAL TABLE decisions_fts USING fts5(
         title,
@@ -71,35 +80,48 @@ function initSchema(database: AnyDatabase): void {
         tokenize='porter'
       )
     `);
+  }
 
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS decisions_ai AFTER INSERT ON decisions BEGIN
-        INSERT INTO decisions_fts(rowid, title, context, decision, consequences, tags)
-        VALUES (new.id, new.title, COALESCE(new.context, ''), new.decision, COALESCE(new.consequences, ''), new.tags);
-      END
-    `);
+  // D1: triggers are ensured on every open, not only when the FTS table was
+  // just created — a dropped/desynced trigger must not silently stop making
+  // new decisions searchable.
+  const hadTriggers = !!database
+    .query("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='decisions_ai'")
+    .get();
 
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS decisions_ad AFTER DELETE ON decisions BEGIN
-        INSERT INTO decisions_fts(decisions_fts, rowid, title, context, decision, consequences, tags)
-        VALUES ('delete', old.id, old.title, COALESCE(old.context, ''), old.decision, COALESCE(old.consequences, ''), old.tags);
-      END
-    `);
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS decisions_ai AFTER INSERT ON decisions BEGIN
+      INSERT INTO decisions_fts(rowid, title, context, decision, consequences, tags)
+      VALUES (new.id, new.title, COALESCE(new.context, ''), new.decision, COALESCE(new.consequences, ''), new.tags);
+    END
+  `);
 
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS decisions_au AFTER UPDATE ON decisions BEGIN
-        INSERT INTO decisions_fts(decisions_fts, rowid, title, context, decision, consequences, tags)
-        VALUES ('delete', old.id, old.title, COALESCE(old.context, ''), old.decision, COALESCE(old.consequences, ''), old.tags);
-        INSERT INTO decisions_fts(rowid, title, context, decision, consequences, tags)
-        VALUES (new.id, new.title, COALESCE(new.context, ''), new.decision, COALESCE(new.consequences, ''), new.tags);
-      END
-    `);
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS decisions_ad AFTER DELETE ON decisions BEGIN
+      INSERT INTO decisions_fts(decisions_fts, rowid, title, context, decision, consequences, tags)
+      VALUES ('delete', old.id, old.title, COALESCE(old.context, ''), old.decision, COALESCE(old.consequences, ''), old.tags);
+    END
+  `);
 
-    // Backfill existing rows
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS decisions_au AFTER UPDATE ON decisions BEGIN
+      INSERT INTO decisions_fts(decisions_fts, rowid, title, context, decision, consequences, tags)
+      VALUES ('delete', old.id, old.title, COALESCE(old.context, ''), old.decision, COALESCE(old.consequences, ''), old.tags);
+      INSERT INTO decisions_fts(rowid, title, context, decision, consequences, tags)
+      VALUES (new.id, new.title, COALESCE(new.context, ''), new.decision, COALESCE(new.consequences, ''), new.tags);
+    END
+  `);
+
+  if (createdFts) {
+    // Backfill existing rows into the freshly created (empty) index.
     database.exec(`
       INSERT INTO decisions_fts(rowid, title, context, decision, consequences, tags)
       SELECT id, title, COALESCE(context, ''), decision, COALESCE(consequences, ''), tags FROM decisions
     `);
+  } else if (!hadTriggers) {
+    // The index existed but the sync triggers were missing: rebuild it so
+    // past and future rows are consistent again.
+    database.exec(`INSERT INTO decisions_fts(decisions_fts) VALUES('rebuild')`);
   }
 }
 
@@ -114,8 +136,18 @@ function backup(): void {
 }
 
 function tryRestore(): AnyDatabase | null {
-  const latest = latestBackup(BACKUP_DIR);
+  const latest = latestValidBackup(BACKUP_DIR);
   if (!latest) return null;
+  // D2: close the failing handle first (an open handle blocks the copy on
+  // Windows) and drop stale -wal/-shm so they cannot be replayed on top of
+  // the restored snapshot.
+  if (db) {
+    try { db.close(); } catch { /* ignore */ }
+    db = null;
+  }
+  for (const suffix of ["-wal", "-shm"]) {
+    try { rmSync(DB_PATH + suffix, { force: true }); } catch { /* ignore */ }
+  }
   copyFileSync(latest, DB_PATH);
   const restored = openDatabase(DB_PATH);
   applyPragmas(restored);
@@ -130,6 +162,7 @@ function withRetry<T>(fn: () => T, isWrite = false): T {
     return result;
   } catch (err) {
     if (isCorruption(err)) {
+      try { db?.close(); } catch { /* ignore */ }
       db = null;
       db = tryRestore();
       if (db) {
@@ -158,7 +191,7 @@ interface DecisionRow {
 }
 
 function formatDecision(row: DecisionRow): string {
-  const tags = JSON.parse(row.tags) as string[];
+  const tags = parseStringArray(row.tags);
   const lines: string[] = [];
   lines.push(`**#${row.id} — ${row.title}**`);
   lines.push(`Status: ${row.status}`);
@@ -185,7 +218,7 @@ export default Plugin.define({
           decision: z.string().describe("What was decided"),
           context: z.string().optional().describe("Why this question came up — the situation or problem"),
           consequences: z.string().optional().describe("Expected effects, tradeoffs, or implications"),
-          status: z.string().optional().describe("Decision status: proposed, accepted (default), deprecated, superseded"),
+          status: z.enum(DECISION_STATUSES).optional().describe("Decision status: proposed, accepted (default), deprecated, superseded"),
           tags: z.array(z.string()).optional().describe("Categorization tags"),
           project: z.string().optional().describe("Project this decision applies to"),
         }),
@@ -203,10 +236,10 @@ export default Plugin.define({
             );
             const result = stmt.run(
               toolCtx.sessionID || null,
-              args.title,
-              args.context || null,
-              args.decision,
-              args.consequences || null,
+              scrubStore(args.title),
+              args.context ? scrubStore(args.context) : null,
+              scrubStore(args.decision),
+              args.consequences ? scrubStore(args.consequences) : null,
               status,
               tags,
               args.project || null
@@ -240,7 +273,7 @@ export default Plugin.define({
         description:
           "Search decisions using full-text search. Scoped to current session by default. Matches against title, context, decision, consequences, and tags.",
         input: z.object({
-          query: z.string().describe("Search query (supports FTS5 syntax)"),
+          query: z.string().describe("Search query (words are matched literally; FTS5 operators are not interpreted)"),
           all_sessions: z.boolean().optional().describe("Search across all sessions (default: false, current session only)"),
           limit: z.number().optional().describe("Max results (default: 10)"),
         }),
@@ -248,11 +281,13 @@ export default Plugin.define({
           const args = input as { query: string; all_sessions?: boolean; limit?: number };
           const out = withRetry(() => {
             const database = getDb();
+            const q = quoteFtsQuery(args.query);
+            if (q === null) return "No decisions found. (empty query)";
             const limit = Math.min(Math.max(args.limit ?? 10, 1), 50);
             let sql = `SELECT d.* FROM decisions d
                  JOIN decisions_fts f ON d.id = f.rowid
                  WHERE decisions_fts MATCH ?`;
-            const params: unknown[] = [quoteFtsQuery(args.query)];
+            const params: unknown[] = [q];
 
             if (!args.all_sessions && toolCtx.sessionID) {
               sql += " AND d.session_id = ?";
@@ -308,8 +343,10 @@ export default Plugin.define({
             }
             if (args.tags && args.tags.length > 0) {
               for (const tag of args.tags) {
-                where += " AND tags LIKE ?";
-                params.push(`%"${tag}"%`);
+                // D3: exact tag match against the JSON array — substring LIKE
+                // matching produced false positives (e.g. "api" matching "api-v2").
+                where += " AND EXISTS (SELECT 1 FROM json_each(decisions.tags) WHERE value = ?)";
+                params.push(tag);
               }
             }
 
@@ -337,7 +374,7 @@ export default Plugin.define({
           context: z.string().optional().describe("Updated context"),
           decision: z.string().optional().describe("Updated decision text"),
           consequences: z.string().optional().describe("Updated consequences"),
-          status: z.string().optional().describe("New status: proposed, accepted, deprecated, superseded"),
+          status: z.enum(DECISION_STATUSES).optional().describe("New status: proposed, accepted, deprecated, superseded"),
           superseded_by: z.number().optional().describe("ID of the decision that supersedes this one"),
           tags: z.array(z.string()).optional().describe("Replace tags"),
           project: z.string().optional().describe("Update project"),
@@ -356,10 +393,10 @@ export default Plugin.define({
             const updates: string[] = [];
             const params: unknown[] = [];
 
-            if (args.title !== undefined) { updates.push("title = ?"); params.push(args.title); }
-            if (args.context !== undefined) { updates.push("context = ?"); params.push(args.context); }
-            if (args.decision !== undefined) { updates.push("decision = ?"); params.push(args.decision); }
-            if (args.consequences !== undefined) { updates.push("consequences = ?"); params.push(args.consequences); }
+            if (args.title !== undefined) { updates.push("title = ?"); params.push(scrubStore(args.title)); }
+            if (args.context !== undefined) { updates.push("context = ?"); params.push(scrubStore(args.context)); }
+            if (args.decision !== undefined) { updates.push("decision = ?"); params.push(scrubStore(args.decision)); }
+            if (args.consequences !== undefined) { updates.push("consequences = ?"); params.push(scrubStore(args.consequences)); }
             if (args.status !== undefined) { updates.push("status = ?"); params.push(args.status); }
             if (args.superseded_by !== undefined) { updates.push("superseded_by = ?"); params.push(args.superseded_by); }
             if (args.tags !== undefined) { updates.push("tags = ?"); params.push(JSON.stringify(args.tags)); }
@@ -379,5 +416,14 @@ export default Plugin.define({
         },
       });
     });
+
+    return () => {
+      try {
+        db?.close();
+      } catch {
+        /* ignore */
+      }
+      db = null;
+    };
   },
 });

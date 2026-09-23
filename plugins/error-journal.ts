@@ -1,22 +1,29 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
-import { mkdirSync, existsSync, copyFileSync } from "fs";
+import { mkdirSync, existsSync, copyFileSync, rmSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import {
   openDatabase,
   applyPragmas,
   maybeBackupDb,
-  latestBackup,
+  latestValidBackup,
   isCorruption,
+  parseStringArray,
   quoteFtsQuery,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
+import { redactSecrets } from "../lib/redact.ts";
 
 const DB_DIR = join(homedir(), ".opencode-plugins", "error-journal");
 const DB_PATH = join(DB_DIR, "error-journal.db");
 const BACKUP_DIR = join(DB_DIR, "backups");
 const MAX_BACKUPS = 5;
+/** P5: redact obvious secrets before they hit the pack's own store (opt-out via env). */
+const STORE_REDACT = process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+function scrubStore(text: string): string {
+  return STORE_REDACT ? redactSecrets(text) : text;
+}
 
 let db: AnyDatabase | null = null;
 let lastBackupTime = 0;
@@ -56,7 +63,8 @@ function initSchema(database: AnyDatabase): void {
     .query("SELECT name FROM sqlite_master WHERE type='table' AND name='errors_fts'")
     .get() as { name: string } | null;
 
-  if (!row) {
+  const createdFts = !row;
+  if (createdFts) {
     database.exec(`
       CREATE VIRTUAL TABLE errors_fts USING fts5(
         error_text,
@@ -68,35 +76,48 @@ function initSchema(database: AnyDatabase): void {
         tokenize='porter'
       )
     `);
+  }
 
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS errors_ai AFTER INSERT ON errors BEGIN
-        INSERT INTO errors_fts(rowid, error_text, context, resolution, tags)
-        VALUES (new.id, new.error_text, COALESCE(new.context, ''), COALESCE(new.resolution, ''), new.tags);
-      END
-    `);
+  // E1: triggers are ensured on every open, not only when the FTS table was
+  // just created — a dropped/desynced trigger must not silently stop making
+  // new errors searchable.
+  const hadTriggers = !!database
+    .query("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='errors_ai'")
+    .get();
 
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS errors_ad AFTER DELETE ON errors BEGIN
-        INSERT INTO errors_fts(errors_fts, rowid, error_text, context, resolution, tags)
-        VALUES ('delete', old.id, old.error_text, COALESCE(old.context, ''), COALESCE(old.resolution, ''), old.tags);
-      END
-    `);
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS errors_ai AFTER INSERT ON errors BEGIN
+      INSERT INTO errors_fts(rowid, error_text, context, resolution, tags)
+      VALUES (new.id, new.error_text, COALESCE(new.context, ''), COALESCE(new.resolution, ''), new.tags);
+    END
+  `);
 
-    database.exec(`
-      CREATE TRIGGER IF NOT EXISTS errors_au AFTER UPDATE ON errors BEGIN
-        INSERT INTO errors_fts(errors_fts, rowid, error_text, context, resolution, tags)
-        VALUES ('delete', old.id, old.error_text, COALESCE(old.context, ''), COALESCE(old.resolution, ''), old.tags);
-        INSERT INTO errors_fts(rowid, error_text, context, resolution, tags)
-        VALUES (new.id, new.error_text, COALESCE(new.context, ''), COALESCE(new.resolution, ''), new.tags);
-      END
-    `);
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS errors_ad AFTER DELETE ON errors BEGIN
+      INSERT INTO errors_fts(errors_fts, rowid, error_text, context, resolution, tags)
+      VALUES ('delete', old.id, old.error_text, COALESCE(old.context, ''), COALESCE(old.resolution, ''), old.tags);
+    END
+  `);
 
-    // Backfill any existing rows
+  database.exec(`
+    CREATE TRIGGER IF NOT EXISTS errors_au AFTER UPDATE ON errors BEGIN
+      INSERT INTO errors_fts(errors_fts, rowid, error_text, context, resolution, tags)
+      VALUES ('delete', old.id, old.error_text, COALESCE(old.context, ''), COALESCE(old.resolution, ''), old.tags);
+      INSERT INTO errors_fts(rowid, error_text, context, resolution, tags)
+      VALUES (new.id, new.error_text, COALESCE(new.context, ''), COALESCE(new.resolution, ''), new.tags);
+    END
+  `);
+
+  if (createdFts) {
+    // Backfill any existing rows into the freshly created (empty) index.
     database.exec(`
       INSERT INTO errors_fts(rowid, error_text, context, resolution, tags)
       SELECT id, error_text, COALESCE(context, ''), COALESCE(resolution, ''), tags FROM errors
     `);
+  } else if (!hadTriggers) {
+    // The index existed but the sync triggers were missing: rebuild it so
+    // past and future rows are consistent again.
+    database.exec(`INSERT INTO errors_fts(errors_fts) VALUES('rebuild')`);
   }
 }
 
@@ -111,8 +132,18 @@ function backup(): void {
 }
 
 function tryRestore(): AnyDatabase | null {
-  const latest = latestBackup(BACKUP_DIR);
+  const latest = latestValidBackup(BACKUP_DIR);
   if (!latest) return null;
+  // E2: close the failing handle first (an open handle blocks the copy on
+  // Windows) and drop stale -wal/-shm so they cannot be replayed on top of
+  // the restored snapshot.
+  if (db) {
+    try { db.close(); } catch { /* ignore */ }
+    db = null;
+  }
+  for (const suffix of ["-wal", "-shm"]) {
+    try { rmSync(DB_PATH + suffix, { force: true }); } catch { /* ignore */ }
+  }
   copyFileSync(latest, DB_PATH);
   const restored = openDatabase(DB_PATH);
   applyPragmas(restored);
@@ -127,6 +158,7 @@ function withRetry<T>(fn: () => T, isWrite = false): T {
     return result;
   } catch (err) {
     if (isCorruption(err)) {
+      try { db?.close(); } catch { /* ignore */ }
       db = null;
       db = tryRestore();
       if (db) {
@@ -151,7 +183,7 @@ interface ErrorRow {
 }
 
 function formatError(row: ErrorRow): string {
-  const tags = JSON.parse(row.tags) as string[];
+  const tags = parseStringArray(row.tags);
   let out = `**#${row.id}** — ${row.created_at}`;
   if (row.resolved_at) out += ` (resolved ${row.resolved_at})`;
   out += "\n";
@@ -188,8 +220,8 @@ export default Plugin.define({
               "INSERT INTO errors (error_text, context, tags, project) VALUES (?, ?, ?, ?)"
             );
             const result = stmt.run(
-              args.error_text,
-              args.context || null,
+              scrubStore(args.error_text),
+              args.context ? scrubStore(args.context) : null,
               tagsJson,
               args.project || null
             ) as { lastInsertRowid: number | bigint };
@@ -217,7 +249,7 @@ export default Plugin.define({
             if (!row) return `Error #${args.id} not found`;
             database
               .prepare("UPDATE errors SET resolution = ?, resolved_at = datetime('now') WHERE id = ?")
-              .run(args.resolution, args.id);
+              .run(scrubStore(args.resolution), args.id);
             return `Resolved error #${args.id}`;
           }, true);
           return { content: out };
@@ -236,6 +268,8 @@ export default Plugin.define({
           const args = input as { query: string; limit?: number };
           const out = withRetry(() => {
             const database = getDb();
+            const q = quoteFtsQuery(args.query);
+            if (q === null) return "No errors found. (empty query)";
             const limit = Math.min(Math.max(args.limit || 10, 1), 50);
             const rows = database
               .query(
@@ -245,7 +279,7 @@ export default Plugin.define({
                  ORDER BY rank
                  LIMIT ?`
               )
-              .all(quoteFtsQuery(args.query), limit) as ErrorRow[];
+              .all(q, limit) as ErrorRow[];
             if (rows.length === 0) return "No matching errors found.";
             return rows.map(formatError).join("\n---\n\n");
           });
@@ -283,8 +317,10 @@ export default Plugin.define({
             }
             if (args.tags && args.tags.length > 0) {
               for (const tag of args.tags) {
-                conditions.push("tags LIKE ?");
-                params.push(`%${JSON.stringify(tag).slice(1, -1)}%`);
+                // E3: exact tag match against the JSON array — substring LIKE
+                // produced false positives (e.g. "api" matching "api-v2").
+                conditions.push("EXISTS (SELECT 1 FROM json_each(errors.tags) WHERE value = ?)");
+                params.push(tag);
               }
             }
 
@@ -323,5 +359,14 @@ export default Plugin.define({
         },
       });
     });
+
+    return () => {
+      try {
+        db?.close();
+      } catch {
+        /* ignore */
+      }
+      db = null;
+    };
   },
 });

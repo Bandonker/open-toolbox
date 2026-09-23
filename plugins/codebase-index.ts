@@ -15,6 +15,7 @@ import {
   openDatabase,
   applyPragmas,
   isCorruption,
+  latestValidBackup,
   quoteFtsQuery,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
@@ -54,6 +55,20 @@ const SKIP_FILES = new Set([
 const CHUNK_SIZE = 50;
 const CHUNK_OVERLAP = 10;
 const MAX_FILE_SIZE = 512_000;
+
+/**
+ * I1: canonical root-path form so index and lookup always agree — trailing
+ * separators trimmed, backslashes normalized to `/`, and on Windows the path
+ * lowercased (drive letters + case-insensitive filesystem). Previously a
+ * trailing backslash or different casing silently missed the index.
+ */
+function normalizeRoot(p: string): string {
+  let out = p.trim().replace(/[\\/]+$/, "").replace(/\\/g, "/");
+  if (process.platform === "win32" && /^[A-Za-z]:/.test(out)) {
+    out = out.toLowerCase();
+  }
+  return out;
+}
 
 let db: AnyDatabase | null = null;
 let lastBackupTime = 0;
@@ -108,7 +123,7 @@ function initSchema(database: AnyDatabase): void {
         content,
         content=code_chunks,
         content_rowid=id,
-        tokenize='porter'
+        tokenize='trigram'
       )
     `);
 
@@ -131,9 +146,75 @@ function initSchema(database: AnyDatabase): void {
       END
     `);
   }
+
+  ensureFtsIndex(database);
 }
 
-// --- Backup & recovery ---
+/**
+ * P7 + trigger lifecycle (D1-analog): the FTS index uses the `trigram`
+ * tokenizer (porter stemming never matches camelCase/snake_case substrings
+ * that matter in code); legacy porter/unicode61 indexes are migrated once —
+ * the rebuild is automatic. The sync triggers are (re)ensured on every open
+ * so a dropped trigger can't silently stop indexing.
+ */
+function ensureFtsIndex(database: AnyDatabase): void {
+  const triggers = [
+    `CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON code_chunks BEGIN
+       INSERT INTO code_chunks_fts(rowid, content) VALUES (new.id, new.content);
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON code_chunks BEGIN
+       INSERT INTO code_chunks_fts(code_chunks_fts, rowid, content) VALUES ('delete', old.id, old.content);
+     END`,
+    `CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON code_chunks BEGIN
+       INSERT INTO code_chunks_fts(code_chunks_fts, rowid, content) VALUES ('delete', old.id, old.content);
+       INSERT INTO code_chunks_fts(rowid, content) VALUES (new.id, new.content);
+     END`,
+  ];
+  try {
+    for (const t of triggers) database.exec(t);
+  } catch {
+    /* fts table missing — nothing to sync */
+  }
+
+  // Read the tokenizer setting; tolerate both known _config schemas and
+  // bail out (leaving the index untouched) if neither is readable.
+  let tokenize = "";
+  try {
+    const row = database
+      .query("SELECT v FROM code_chunks_fts_config WHERE k = 'tokenize'")
+      .get() as { v?: unknown } | null;
+    tokenize = row ? String(row.v ?? "") : "";
+  } catch {
+    try {
+      const row = database
+        .query("SELECT val AS v FROM code_chunks_fts_config WHERE colname = 'tokenize'")
+        .get() as { v?: unknown } | null;
+      tokenize = row ? String(row.v ?? "") : "";
+    } catch {
+      return;
+    }
+  }
+  if (tokenize.includes("trigram")) return;
+
+  try {
+    database.exec("DROP TRIGGER IF EXISTS chunks_ai");
+    database.exec("DROP TRIGGER IF EXISTS chunks_ad");
+    database.exec("DROP TRIGGER IF EXISTS chunks_au");
+    database.exec("DROP TABLE IF EXISTS code_chunks_fts");
+    database.exec(`
+      CREATE VIRTUAL TABLE code_chunks_fts USING fts5(
+        content,
+        content=code_chunks,
+        content_rowid=id,
+        tokenize='trigram'
+      )
+    `);
+    for (const t of triggers) database.exec(t);
+    database.exec("INSERT INTO code_chunks_fts(code_chunks_fts) VALUES('rebuild')");
+  } catch {
+    /* migration is best effort — the index keeps working either way */
+  }
+}
 
 function backupDb(): void {
   const now = Date.now();
@@ -157,12 +238,8 @@ function backupDb(): void {
 }
 
 function getLatestBackup(): string | null {
-  if (!existsSync(BACKUP_DIR)) return null;
-  const files = readdirSync(BACKUP_DIR)
-    .filter((f: string) => f.endsWith(".db"))
-    .sort()
-    .reverse();
-  return files.length > 0 ? join(BACKUP_DIR, files[0]) : null;
+  // I5/EN53: newest backup that passes an integrity check (previously the newest, blindly).
+  return latestValidBackup(BACKUP_DIR);
 }
 
 function tryRestore(): boolean {
@@ -255,7 +332,7 @@ function chunkFile(absPath: string, rootPath: string): Chunk[] {
   const lines = content.split("\n");
   if (lines.length === 0) return [];
 
-  const relPath = relative(rootPath, absPath);
+  const relPath = relative(rootPath, absPath).split(sep).join("/");
   const chunks: Chunk[] = [];
   const step = CHUNK_SIZE - CHUNK_OVERLAP;
 
@@ -277,8 +354,8 @@ function chunkFile(absPath: string, rootPath: string): Chunk[] {
 
 function indexProject(rootPath: string): { files: number; chunks: number } {
   const database = getDb();
-  const resolvedPath = rootPath.replace(/\/$/, "");
-  const projectName = resolvedPath.split(sep).pop() || "unknown";
+  const resolvedPath = normalizeRoot(rootPath);
+  const projectName = resolvedPath.split(/[\\/]/).pop() || "unknown";
 
   const deleteStmt = database.query(
     "DELETE FROM code_chunks WHERE project_id = (SELECT id FROM projects WHERE root_path = ?)"
@@ -408,7 +485,7 @@ export default Plugin.define({
             const result = indexProject(rootPath);
             return JSON.stringify({
               indexed: true,
-              path: rootPath.replace(/\/$/, ""),
+              path: normalizeRoot(rootPath),
               files: result.files,
               chunks: result.chunks,
             });
@@ -432,7 +509,7 @@ export default Plugin.define({
             query: string; path?: string; filter?: string; limit?: number;
           };
           const out = readDb(() => {
-          const targetPath = (args.path || defaultDirectory || "").replace(/\/$/, "");
+          const targetPath = normalizeRoot(args.path || defaultDirectory || "");
           if (targetPath && targetPath.length > 0) {
             const isIndexed = readDb(() => {
               const database = getDb();
@@ -447,8 +524,15 @@ export default Plugin.define({
           }
           return readDb(() => {
             const database = getDb();
-            // Quote each word individually to handle special chars (hyphens) while allowing multi-word AND matching
             const ftsQuery = quoteFtsQuery(args.query);
+            // I2/S4: an empty/whitespace query must not reach MATCH — an
+            // empty MATCH string throws an FTS5 syntax error.
+            if (ftsQuery === null) return "No results (empty query).";
+            // P7/trigram: terms shorter than 3 chars cannot match a trigram
+            // index — tell the caller instead of returning an engine error.
+            if (args.query.trim().split(/\s+/).some((t) => t.length < 3)) {
+              return "No results — use search terms of at least 3 characters.";
+            }
             const limit = Math.min(Math.max(args.limit ?? 15, 1), 50);
             const params: unknown[] = [ftsQuery];
 
@@ -490,16 +574,17 @@ export default Plugin.define({
           rank: number;
         }>;
 
+        // I1: JSON-pair keys — a `:` separator broke on Windows drive
+        // letters (C:\...), mangling every grouped path.
         const grouped: Record<string, typeof rows> = {};
         for (const r of rows) {
-          const key = `${r.root_path}:${r.rel_path}`;
+          const key = JSON.stringify([r.root_path, r.rel_path]);
           if (!grouped[key]) grouped[key] = [];
           grouped[key].push(r);
         }
 
         const parts = Object.entries(grouped).flatMap(([key, chunks]) => {
-          const [root, ...rest] = key.split(":");
-          const filePath = rest.join(":");
+          const [, filePath] = JSON.parse(key) as [string, string];
           const header = `## \`${filePath}\` (${chunks[0].project})`;
           const items = chunks.map(
             (c) =>
@@ -533,7 +618,7 @@ export default Plugin.define({
             const database = getDb();
 
             if (args.path) {
-              const resolved = args.path.replace(/\/$/, "");
+              const resolved = normalizeRoot(args.path);
               const row = database
                 .query("SELECT * FROM projects WHERE root_path = ?")
                 .get(resolved) as Record<string, unknown> | null;
@@ -588,7 +673,7 @@ export default Plugin.define({
           const args = input as { path: string };
           const out = writeDb(() => {
             const database = getDb();
-            const resolved = args.path.replace(/\/$/, "");
+            const resolved = normalizeRoot(args.path);
             const project = database
               .query("SELECT id, name FROM projects WHERE root_path = ?")
               .get(resolved) as { id: number; name: string } | null;

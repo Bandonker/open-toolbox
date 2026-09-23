@@ -1,5 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
+import { statSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import {
@@ -22,7 +23,7 @@ import {
 
 const DEFAULT_DIR = join(homedir(), ".opencode-plugins", "tool-audit");
 const DB_NAME = "tool-audit.db";
-const AUDIT_TOOLS = ["trace_query", "trace_stats", "trace_export"];
+const AUDIT_TOOLS = ["trace_query", "trace_stats", "trace_export", "trace_sessions"];
 
 type Config = {
   dir: string;
@@ -38,6 +39,8 @@ type Pending = {
   sessionID: string;
   agent: string;
   messageID: string;
+  /** Event id — stored as call_id so redelivered events can't double-record (T2). */
+  callId: string;
   input: unknown;
   startedMs: number;
 };
@@ -90,6 +93,35 @@ function resolveConfig(options: Record<string, unknown> | undefined): Config {
   };
 }
 
+/** Length of a value without serializing unbounded outputs (T11 helper). */
+function safeLen(value: unknown, cap: number): number {
+  if (typeof value === "string") return value.length;
+  if (value === null || value === undefined) return 0;
+  if (typeof value !== "object") return String(value).length;
+  try {
+    let n = 0;
+    const visit = (node: unknown, depth: number): boolean => {
+      if (n > cap || depth > 6) return false;
+      if (typeof node === "string") {
+        n += node.length;
+        return n <= cap;
+      }
+      if (Array.isArray(node)) {
+        for (const item of node) if (!visit(item, depth + 1)) return false;
+        return true;
+      }
+      if (node && typeof node === "object") {
+        for (const v of Object.values(node)) if (!visit(v, depth + 1)) return false;
+      }
+      return true;
+    };
+    visit(value, 0);
+    return n;
+  } catch {
+    return cap;
+  }
+}
+
 /** Redact obvious secrets before anything touches disk. */
 function redact(text: string): string {
   let out = text;
@@ -113,8 +145,11 @@ function serializeInput(input: unknown, cfg: Config): string {
   let text: string;
   try {
     text = JSON.stringify(input, (_key, value) => {
-      if (typeof value === "string" && value.length > 500) {
-        return value.slice(0, 500) + `…(+${value.length - 500})`;
+      if (typeof value === "string") {
+        // T4: redact BEFORE any slicing — a secret split by a cap could
+        // otherwise leak its prefix.
+        const safe = cfg.redact ? redact(value) : value;
+        return safe.length > 500 ? safe.slice(0, 500) + `…(+${safe.length - 500})` : safe;
       }
       return value;
     });
@@ -162,6 +197,12 @@ function initSchema(database: AnyDatabase): void {
     "CREATE INDEX IF NOT EXISTS idx_calls_session ON calls(session_id, started_ms)",
   );
   database.exec("CREATE INDEX IF NOT EXISTS idx_calls_tool ON calls(tool)");
+  // T5: unfiltered time-range scans previously full-scanned the table.
+  database.exec("CREATE INDEX IF NOT EXISTS idx_calls_started ON calls(started_ms)");
+  // T2: idempotency — a redelivered execute.after must not double-record.
+  database.exec(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_calls_callid ON calls(call_id) WHERE call_id IS NOT NULL",
+  );
 
   const row = database
     .query("SELECT name FROM sqlite_master WHERE type='table' AND name='calls_fts'")
@@ -236,22 +277,25 @@ function fmtTime(iso: unknown): string {
 type Filters = { sessionId?: string; tool?: string; status?: string; since?: number };
 
 function whereClause(f: Filters): { sql: string; params: unknown[] } {
+  // T1: columns are qualified with `c.` because every consumer aliases
+  // `calls c` — the FTS branch joins calls_fts (which has its own `tool`
+  // column), and unqualified `tool = ?` was ambiguous at runtime.
   const parts: string[] = [];
   const params: unknown[] = [];
   if (f.since !== undefined) {
-    parts.push("started_ms >= ?");
+    parts.push("c.started_ms >= ?");
     params.push(f.since);
   }
   if (f.sessionId) {
-    parts.push("session_id = ?");
+    parts.push("c.session_id = ?");
     params.push(f.sessionId);
   }
   if (f.tool) {
-    parts.push("tool = ?");
+    parts.push("c.tool = ?");
     params.push(f.tool);
   }
   if (f.status) {
-    parts.push("status = ?");
+    parts.push("c.status = ?");
     params.push(f.status);
   }
   return { sql: parts.length ? ` AND ${parts.join(" AND ")}` : "", params };
@@ -279,9 +323,26 @@ function formatRow(r: CallRow): string {
     fmtDuration(r.duration_ms),
   ];
   if (r.session_id) bits.push(r.session_id.slice(0, 12));
-  if (r.error) bits.push(`error: ${r.error}`);
+  // T10: errors are unbounded in the DB — keep the line readable.
+  if (r.error) bits.push(`error: ${r.error.slice(0, 200)}`);
   const head = bits.join(" | ");
   return r.input ? `${head}\n    ${r.input}` : head;
+}
+
+/** T9 helpers: on-disk size of the audit store. */
+function dbSizeOf(cfg: Config): number | null {
+  try {
+    return statSync(join(cfg.dir, DB_NAME)).size;
+  } catch {
+    return null;
+  }
+}
+
+function fmtSize(bytes: number | null): string {
+  if (bytes === null) return "?";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export default Plugin.define({
@@ -297,11 +358,22 @@ export default Plugin.define({
       }
     }
 
+    // T3: keep pruning on a schedule — previously it only ran at startup,
+    // so long-lived servers never enforced retention.
+    const pruneTimer = setInterval(() => {
+      try {
+        if (cfg.enabled) prune(getDb(cfg), cfg);
+      } catch {
+        /* best effort */
+      }
+    }, 3_600_000);
+    pruneTimer.unref?.();
+
     const record = (entry: Pending, status: string, error: string | undefined, outputChars: number | undefined, endedMs: number): void => {
       try {
         getDb(cfg)
           .prepare(
-            `INSERT INTO calls
+            `INSERT OR IGNORE INTO calls
                (session_id, agent, message_id, call_id, tool, input, status, error, output_chars, started_at, ended_at, started_ms, duration_ms)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           )
@@ -309,7 +381,9 @@ export default Plugin.define({
             entry.sessionID || null,
             entry.agent || null,
             entry.messageID || null,
-            null,
+            // T2/T7: record the event id so a redelivered execute.after is
+            // ignored by the partial unique index; empty ids stay NULL.
+            entry.callId || null,
             entry.tool,
             serializeInput(entry.input, cfg),
             status,
@@ -326,18 +400,29 @@ export default Plugin.define({
     };
 
     const outputChars = (result: unknown): number | undefined => {
+      // T11: never JSON.stringify unbounded outputs on the hook path.
+      const MAX_OUTPUT_SCAN = 1_000_000;
       try {
         const r = result as { content?: unknown; output?: unknown };
         const content = r?.content;
         if (typeof content === "string") return content.length;
         if (Array.isArray(content)) {
-          return content.reduce(
-            (n, part) =>
-              n + (typeof (part as { text?: string })?.text === "string" ? (part as { text: string }).text.length : 0),
-            0,
-          );
+          let n = 0;
+          for (const part of content) {
+            const text = (part as { text?: unknown })?.text;
+            if (typeof text !== "string") continue;
+            n += text.length;
+            if (n > MAX_OUTPUT_SCAN) return n;
+          }
+          return n;
         }
-        if (r?.output !== undefined) return JSON.stringify(r.output).length;
+        if (typeof r?.output === "string") return r.output.length;
+        if (r?.output !== undefined) {
+          // Object outputs still need a size — serialize only small ones;
+          // above the cap, record the cap instead of stringifying megabytes.
+          const probe = safeLen(r.output, MAX_OUTPUT_SCAN);
+          return probe > MAX_OUTPUT_SCAN ? MAX_OUTPUT_SCAN : probe;
+        }
         return undefined;
       } catch {
         return undefined;
@@ -350,11 +435,15 @@ export default Plugin.define({
       registrations.push(
         await ctx.tool.hook("execute.before", (event) => {
           if (cfg.ignoreTools.has(event.tool)) return;
-          pending.set(String(event.id), {
+          // T7: normalize the event id — "undefined" must never become a
+          // call_id (it would collide across every id-less event).
+          const callId = String(event.id ?? "");
+          pending.set(callId, {
             tool: event.tool,
             sessionID: String(event.sessionID ?? ""),
             agent: String(event.agent ?? ""),
             messageID: String(event.messageID ?? ""),
+            callId,
             input: event.input,
             startedMs: Date.now(),
           });
@@ -364,12 +453,13 @@ export default Plugin.define({
       registrations.push(
         await ctx.tool.hook("execute.after", (event) => {
           if (cfg.ignoreTools.has(event.tool)) return;
-          const key = String(event.id);
+          const key = String(event.id ?? "");
           const entry: Pending = pending.get(key) ?? {
             tool: event.tool,
             sessionID: String(event.sessionID ?? ""),
             agent: String(event.agent ?? ""),
             messageID: String(event.messageID ?? ""),
+            callId: key,
             input: event.input,
             startedMs: Date.now(),
           };
@@ -421,7 +511,11 @@ export default Plugin.define({
             const where = whereClause(filters);
 
             let rows: CallRow[];
-            if (args.query) {
+            // S4/T1: an empty/whitespace query must not reach MATCH ("" throws
+            // an FTS5 syntax error); filters work standalone now because all
+            // whereClause columns are qualified with the `c.` alias.
+            const q = args.query && args.query.trim() ? quoteFtsQuery(args.query) : null;
+            if (q) {
               rows = database
                 .query(
                   `SELECT c.* FROM calls_fts f
@@ -429,11 +523,11 @@ export default Plugin.define({
                    WHERE calls_fts MATCH ?${where.sql}
                    ORDER BY c.started_ms DESC LIMIT ?`,
                 )
-                .all(quoteFtsQuery(args.query), ...where.params, limit) as CallRow[];
+                .all(q, ...where.params, limit) as CallRow[];
             } else {
               rows = database
                 .query(
-                  `SELECT * FROM calls WHERE 1=1${where.sql} ORDER BY started_ms DESC LIMIT ?`,
+                  `SELECT * FROM calls c WHERE 1=1${where.sql} ORDER BY c.started_ms DESC LIMIT ?`,
                 )
                 .all(...where.params, limit) as CallRow[];
             }
@@ -473,7 +567,7 @@ export default Plugin.define({
                         COUNT(DISTINCT tool) AS tools,
                         MIN(started_ms) AS first_ms,
                         MAX(started_ms) AS last_ms
-                 FROM calls WHERE 1=1${where.sql}`,
+                 FROM calls c WHERE 1=1${where.sql}`,
               )
               .get(...where.params) as {
               calls: number;
@@ -493,7 +587,7 @@ export default Plugin.define({
                         SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
                         AVG(duration_ms) AS avg_ms,
                         MAX(duration_ms) AS max_ms
-                 FROM calls WHERE 1=1${where.sql}
+                 FROM calls c WHERE 1=1${where.sql}
                  GROUP BY tool ORDER BY calls DESC LIMIT 15`,
               )
               .all(...where.params) as Array<{
@@ -507,7 +601,7 @@ export default Plugin.define({
             const slowest = database
               .query(
                 `SELECT tool, status, duration_ms, session_id, started_at, error
-                 FROM calls WHERE 1=1${where.sql}
+                 FROM calls c WHERE 1=1${where.sql}
                  ORDER BY duration_ms DESC LIMIT 5`,
               )
               .all(...where.params) as Array<{
@@ -524,6 +618,8 @@ export default Plugin.define({
               totals.first_ms && totals.last_ms
                 ? `window: ${fmtTime(new Date(totals.first_ms).toISOString())} -> ${fmtTime(new Date(totals.last_ms).toISOString())}`
                 : "",
+              // T9: show where the data lives and how big the store is.
+              `store: ${join(cfg.dir, DB_NAME)} | rows: ${totals.calls} | size: ${fmtSize(dbSizeOf(cfg))} | oldest: ${totals.first_ms ? fmtTime(new Date(totals.first_ms).toISOString()) : "n/a"}`,
               "",
               "per tool (calls | errors | avg | max):",
               ...perTool.map(
@@ -541,6 +637,49 @@ export default Plugin.define({
             return { content: lines.join("\n") };
           } catch (err) {
             return { content: `trace_stats failed: ${String(err)}` };
+          }
+        },
+      });
+
+      editor.add({
+        name: "trace_sessions",
+        description:
+          "Per-session rollup of the audit log: tool calls, errors, distinct tools and last activity per session id.",
+        input: z.object({
+          since: z.string().optional().describe('Time window: "30m", "24h", "7d" or an ISO date'),
+          limit: z.number().optional().describe("Max sessions (default 20, max 100)"),
+        }),
+        execute: async (input) => {
+          const args = input as { since?: string; limit?: number };
+          try {
+            const database = getDb(cfg);
+            const where = whereClause({ since: parseSince(args.since) });
+            const limit = Math.min(Math.max(Math.trunc(args.limit ?? 20), 1), 100);
+            const rows = database
+              .query(
+                `SELECT session_id,
+                        COUNT(*) AS calls,
+                        SUM(CASE WHEN status = 'error' THEN 1 ELSE 0 END) AS errors,
+                        COUNT(DISTINCT tool) AS tools,
+                        MAX(started_ms) AS last_ms
+                 FROM calls c WHERE 1=1${where.sql}
+                 GROUP BY session_id ORDER BY last_ms DESC LIMIT ?`,
+              )
+              .all(...where.params, limit) as Array<{
+              session_id: string | null;
+              calls: number;
+              errors: number | null;
+              tools: number;
+              last_ms: number;
+            }>;
+            if (rows.length === 0) return { content: "No tool calls recorded yet." };
+            const lines = rows.map(
+              (r) =>
+                `- ${r.session_id ?? "(unknown)"}: calls=${r.calls} errors=${r.errors ?? 0} tools=${r.tools} last=${fmtTime(new Date(r.last_ms).toISOString())}`,
+            );
+            return { content: `${rows.length} session(s):\n${lines.join("\n")}` };
+          } catch (err) {
+            return { content: `trace_sessions failed: ${String(err)}` };
           }
         },
       });
@@ -576,7 +715,7 @@ export default Plugin.define({
             });
             const limit = Math.min(Math.max(Math.trunc(args.limit ?? 200), 1), 1000);
             const rows = database
-              .query(`SELECT * FROM calls WHERE 1=1${where.sql} ORDER BY started_ms ASC LIMIT ?`)
+              .query(`SELECT * FROM calls c WHERE 1=1${where.sql} ORDER BY c.started_ms ASC LIMIT ?`)
               .all(...where.params, limit) as CallRow[];
 
             if (rows.length === 0) return { content: "No tool calls matched." };
@@ -591,8 +730,9 @@ export default Plugin.define({
                   r.status ?? "",
                   r.duration_ms ?? "",
                   (r.session_id ?? "").slice(0, 12),
-                  (r.error ?? "").replace(/\|/g, "\\|").slice(0, 120),
-                  (r.input ?? "").replace(/\|/g, "\\|").slice(0, 200),
+                  // T6: newlines in stored values must not break the table.
+                  (r.error ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ").slice(0, 120),
+                  (r.input ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ").slice(0, 200),
                 ].join(" | "),
               );
               return { content: [head, ...body.map((b) => `| ${b} |`)].join("\n") };
@@ -626,6 +766,7 @@ export default Plugin.define({
     );
 
     return async () => {
+      clearInterval(pruneTimer);
       for (const registration of registrations) {
         try {
           await registration.dispose();

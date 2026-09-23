@@ -3,8 +3,8 @@
 **A pack of local plugins for [opencode](https://opencode.ai) Desktop v2** — session
 orchestration and handoff, decision/error journals, a snippet library, codebase
 search, a tool-call flight recorder, slash commands, context pruning and prompt
-slimming, transcript export, local-first memory, secret redaction, and a lifetime
-usage dashboard.
+slimming, transcript export, local-first memory, autonomous goal loops, secret
+redaction, and a lifetime usage dashboard.
 
 [![ci](https://github.com/Bandonker/open-toolbox/actions/workflows/ci.yml/badge.svg)](https://github.com/Bandonker/open-toolbox/actions/workflows/ci.yml)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -78,9 +78,10 @@ cd .opencode && npm install
 | **codebase-index** | 4 | Index a codebase directory and run BM25-ranked full-text search over it. |
 | **tool-audit** | 3 | Flight recorder for every tool call: tool, args, status, duration and error land in a local SQLite DB, searchable with `trace_query`, summarised with `trace_stats`, exportable with `trace_export`. Secrets in arguments are redacted before they touch disk. |
 | **command-pack** | — | Registers 7 slash commands so the pack is one keystroke away (see [Commands](#commands)). |
-| **context-pruner** | 1 | Trims stale tool output out of the context sent to the model on every request (`session.hook("context")`), saving tokens without touching the transcript on disk. `context_pruner_stats` shows what it trimmed. |
+| **context-pruner** | 1 | Token-accurate context compiler: trims stale tool output out of the request only (`session.hook("context")`), plans changes once per epoch so the prompt-cache prefix stays stable, dedupes and purges stale output, and never touches the transcript on disk. `context_pruner_stats` shows what it trimmed; `context_report` shows budget, epoch, cache hit ratio and active decisions; `context_pruner_recall` returns a pruned output on demand so it need not be re-run. |
 | **session-export** | 2 | Dump a session transcript to markdown / json / jsonl / text with a model + message/tool/token/cost header, role and tool filters, optional reasoning, per-part truncation, secret redaction with home-path rewriting, and safe non-overwriting filenames. `session_export` writes a file (or returns it inline); `session_export_info` reports config and the last export. |
 | **memory** | 5 | Local-first long-term memory in SQLite FTS5 — `memory_remember`, `memory_recall`, `memory_forget`, `memory_list`, `memory_stats`. No embedding API, no cloud, no network. Relevant memories are auto-injected into each request (`session.hook("context")`) within a hard character budget, deduped per session. DB at `~/.opencode-plugins/memory/memory.db`. |
+| **goal** | 3 | Set an objective for a session and keep working until it is actually reached. `/goal <objective>` (add `- ` lines for success criteria) starts the loop; the goal is re-injected into every request (`session.hook("context")`) so it survives long turns, and when a turn ends the model is auto-continued (`session.prompt`) with the remaining budget. The loop stops only on `goal_complete` (with evidence) or `goal_blocked`, a user interrupt (which pauses), a detected stall (turns that run no tools and repeat themselves), a failure streak, or the iteration/time budget. Goal state is persisted per session, so it survives a plugin reload. Tools: `goal_complete`, `goal_blocked`, `goal_progress`. |
 | **secret-shield** | 4 | v2-native secret detector and redactor. Scrubs the **outbound HTTP body** (session-title, compaction and generate calls), the prompt, tool arguments/results and child-process env; `observe`/`redact`/`block` modes, 69 high-precision rules plus a Shannon-entropy fallback, allowlist precedence, and a hashed JSONL audit that never stores the value. Tools: `secret_shield_scan`, `secret_shield_stats`, `secret_shield_shape`, `secret_shield_keys`. |
 | **strip-skills-catalog** | — | Strips the `<available_skills>` catalog from the system prompt to save tokens. The `skill` tool still works on demand — agents can call it by name. |
 | **usage-stats** | 5 | Lifetime token / dollar / tool accounting in local SQLite. Cumulative `session.usage.updated` totals are delta-attributed to the session's current model; `title`/`compaction` spend is tracked separately as background. `stats_summary`, `stats_tools`, `stats_tokens`, `stats_heatmap` and `/stats` expose the numbers; `stats_dashboard` writes a self-contained HTML dashboard (heatmap + bar chart + tables) to `~/.opencode-plugins/usage-stats/dashboard.html`. |
@@ -90,7 +91,7 @@ cd .opencode && npm install
 
 ## Commands
 
-`command-pack` adds these to your command palette (`usage-stats` adds `/stats`):
+`command-pack` adds these to your command palette (`usage-stats` adds `/stats`, `goal` adds `/goal`):
 
 | Command | Does |
 | :-- | :-- |
@@ -102,6 +103,7 @@ cd .opencode && npm install
 | `/trace` | Inspect the tool-call audit log |
 | `/toolbox` | Show which pack tools are installed in this session |
 | `/stats` | Refresh and open the usage dashboard — runs server-side, so it costs **zero model tokens** |
+| `/goal` | Set an objective the agent keeps working toward until it is reached (`/goal status`, `pause`, `resume`, `done`, `clear` manage it) |
 
 Each command injects a short instruction into the current session, so the agent
 does the work with its normal tools. If a command's tool isn't installed, the
@@ -153,8 +155,26 @@ Values are read when the plugin loads, so restart opencode after changing them.
 
 ### context-pruner options
 
-`context-pruner` trims *stale* tool output from the outgoing request only — the
-session transcript on disk is unchanged, and a pruned tool can simply be re-run.
+`context-pruner` is a *context compiler*: it trims stale tool output from the
+outgoing request only. The session transcript on disk is unchanged, and a pruned
+tool can simply be re-run.
+
+It measures tokens (calibrated against provider usage), plans prune changes once
+per **epoch**, and reuses those decisions verbatim so the prompt-cache prefix
+stays stable between replans. By default it also keeps the outgoing request near
+a **steady ceiling** well below the model window (`steadyTargetRatio`, default
+`0.06`), so stale closed topics are summarised before the window ever fills; set
+`proactiveSummarize: false` or `steadyTargetRatio: 0` for window-only behaviour.
+Without a resolvable window it falls back to the positional rules below.
+
+On top of that it removes output that is *provably* superseded (a newer read or
+write of the same file), and over the target it summarises the largest stale
+units — tool output and, since prose is on by default, assistant/user text — with
+the session model automatically, so savings land even when the model ignores
+nudges. It reads optional config from
+`.opencode/context-pruner.jsonc` (project) then
+`~/.config/opencode/context-pruner.jsonc` (global), and can also read a DCP
+`dcp.jsonc` for migration.
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -165,6 +185,46 @@ session transcript on disk is unchanged, and a pruned tool can simply be re-run.
 | `keepErrors` | `OPENCODE_CONTEXT_PRUNER_KEEP_ERRORS` | `true` | Never prune error results |
 | `ignoreTools` | `OPENCODE_CONTEXT_PRUNER_IGNORE` | `context_pruner_stats` | Comma-separated tools to never prune |
 | `log` | `OPENCODE_CONTEXT_PRUNER_LOG` | `false` | Log each prune to stderr |
+| `budgetRatio` | `OPENCODE_CONTEXT_PRUNER_BUDGET_RATIO` | `0.9` | Fraction of the model window treated as input budget |
+| `targetRatio` | `OPENCODE_CONTEXT_PRUNER_TARGET_RATIO` | `0.85` | Fraction of the budget to prune down to |
+| `maxOutputReserve` | `OPENCODE_CONTEXT_PRUNER_MAX_OUTPUT_RESERVE` | `8192` | Tokens reserved for the model's output |
+| `keepRecentTurns` | `OPENCODE_CONTEXT_PRUNER_KEEP_RECENT_TURNS` | `2` | Recent turns left untouched |
+| `minReplanTokens` | `OPENCODE_CONTEXT_PRUNER_MIN_REPLAN_TOKENS` | `2000` | New tokens saved needed to justify a replan |
+| `dedupe` | `OPENCODE_CONTEXT_PRUNER_DEDUPE` | `true` | Stub duplicate tool output |
+| `purgeErrors` | `OPENCODE_CONTEXT_PRUNER_PURGE_ERRORS` | `true` | Stub stale errors (only when `keepErrors` is `false`) |
+| `charsPerToken` | `OPENCODE_CONTEXT_PRUNER_CHARS_PER_TOKEN` | `3.6` | Seed estimator before calibration |
+| `protectedTools` | `OPENCODE_CONTEXT_PRUNER_PROTECTED_TOOLS` | `task,skill,compress,context_report` | Tools never pruned |
+| `protectedPatterns` | `OPENCODE_CONTEXT_PRUNER_PROTECTED_PATTERNS` | (none) | Regexes of tools never pruned |
+| `notify` | `OPENCODE_CONTEXT_PRUNER_NOTIFY` | `true` | One-line stderr summary when pruning |
+| `superseded` | `OPENCODE_CONTEXT_PRUNER_SUPERSEDED` | `true` | Prune output superseded by a newer read/write of the same file |
+| `autoSummarize` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS` | `true` | Summarise automatically when the token target is exceeded |
+| `autoSummarizeMaxCalls` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX` | `0` | Max automatic summariser calls per session (`0` = unlimited) |
+| `autoSummarizeMinTokens` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MIN` | `4000` | Minimum tokens a range must hold to be auto-summarised |
+| `proactiveSummarize` | `OPENCODE_CONTEXT_PRUNER_PROACTIVE` | `true` | Keep the request near the steady ceiling even when the window is wide |
+| `steadyTargetRatio` | `OPENCODE_CONTEXT_PRUNER_STEADY_RATIO` | `0.06` | Steady ceiling as a fraction of the window (`0` disables) |
+| `steadyTargetMinTokens` | `OPENCODE_CONTEXT_PRUNER_STEADY_MIN` | `1500` | Floor for the steady ceiling |
+| `compressText` | `OPENCODE_CONTEXT_PRUNER_COMPRESS_TEXT` | `true` | Let the summariser cover assistant/user prose, not just tool output |
+| `compactionCheckpoint` | `OPENCODE_CONTEXT_PRUNER_COMPACTION` | `true` | Replace native compaction with a deterministic checkpoint |
+| `retryOnOverflow` | `OPENCODE_CONTEXT_PRUNER_RETRY` | `true` | Recover from context-limit errors by trimming harder and retrying |
+| `titleShortCircuit` | `OPENCODE_CONTEXT_PRUNER_TITLE` | `false` | Skip model title generation using the first user line |
+| `cacheAware` | `OPENCODE_CONTEXT_PRUNER_CACHE_AWARE` | `true` | Defer voluntary replans until the cache rewrite premium amortises |
+| `cacheAmortize` | `OPENCODE_CONTEXT_PRUNER_CACHE_AMORTIZE` | `4` | Requests over which a cache rewrite must pay back |
+| `recall` | `OPENCODE_CONTEXT_PRUNER_RECALL` | `true` | Keep pruned output locally so it can be recalled instead of re-run |
+| `recallKeep` | `OPENCODE_CONTEXT_PRUNER_RECALL_KEEP` | `50` | Most pruned outputs kept per session |
+| `recallMaxChars` | `OPENCODE_CONTEXT_PRUNER_RECALL_MAX_CHARS` | `200000` | Max characters returned by a single recall |
+| `compressEnabled` | `OPENCODE_CONTEXT_PRUNER_COMPRESS` | `true` | Enable the model-callable `compress` tool |
+| `compressMaxSourceChars` | `OPENCODE_CONTEXT_PRUNER_COMPRESS_MAX_CHARS` | `24000` | Max characters sent to the summariser per call |
+| `protectTags` | `OPENCODE_CONTEXT_PRUNER_PROTECT_TAGS` | `true` | Preserve `<protect>` blocks during summarisation |
+| `protectUserMessages` | `OPENCODE_CONTEXT_PRUNER_PROTECT_USER` | `false` | Never summarise user messages |
+| `summaryBuffer` | `OPENCODE_CONTEXT_PRUNER_SUMMARY_BUFFER` | `true` | Let summary tokens extend the effective budget |
+| `minContextLimit` | `OPENCODE_CONTEXT_PRUNER_MIN_CONTEXT_LIMIT` | (none) | Token count or percent at which nudges start |
+| `maxContextLimit` | `OPENCODE_CONTEXT_PRUNER_MAX_CONTEXT_LIMIT` | (none) | Token count or percent treated as the hard window |
+| `nudgeEnabled` | `OPENCODE_CONTEXT_PRUNER_NUDGE` | `true` | Tell the model to compress when context grows |
+| `nudgeFrequency` | `OPENCODE_CONTEXT_PRUNER_NUDGE_FREQUENCY` | `5` | Requests between nudges |
+| `nudgeForce` | `OPENCODE_CONTEXT_PRUNER_NUDGE_FORCE` | `soft` | `soft` or `strong` nudge wording |
+| `iterationNudgeThreshold` | `OPENCODE_CONTEXT_PRUNER_ITERATION_NUDGE` | `15` | Tool results after which a nudge is sent |
+| `protectedFilePatterns` | `OPENCODE_CONTEXT_PRUNER_PROTECTED_FILES` | (none) | Globs of file paths never pruned |
+| `debug` | `OPENCODE_CONTEXT_PRUNER_DEBUG` | `false` | Write a debug log under `~/.config/opencode/logs/context-pruner` |
 
 ### session-export options
 
@@ -190,6 +250,32 @@ session transcript on disk is unchanged, and a pruned tool can simply be re-run.
 | `scope` | `OPENCODE_MEMORY_SCOPE` | `project` | Default scope: `global` \| `project` \| `session` |
 | `maxEntries` | `OPENCODE_MEMORY_MAX_ENTRIES` | `0` | Prune least-important rows beyond this (`0` = unlimited) |
 | `log` | `OPENCODE_MEMORY_LOG` | `false` | Log activity to stderr |
+
+### goal options
+
+| Option | Env var | Default | Meaning |
+| :-- | :-- | :-- | :-- |
+| `enabled` | `OPENCODE_GOAL_ENABLED` | `true` | Turn the goal loop off without uninstalling |
+| `maxIterations` | `OPENCODE_GOAL_MAX_ITERATIONS` | `30` | Max continuation turns per goal |
+| `maxMinutes` | `OPENCODE_GOAL_MAX_MINUTES` | `180` | Wall-clock budget per goal (minutes) |
+| `stallLimit` | `OPENCODE_GOAL_STALL_LIMIT` | `3` | Turns with no tool use and an unchanged reply before stopping as stalled |
+| `maxFailures` | `OPENCODE_GOAL_MAX_FAILURES` | `3` | Consecutive execution errors before stopping |
+| `requireEvidence` | `OPENCODE_GOAL_REQUIRE_EVIDENCE` | `true` | Require evidence in `goal_complete` |
+| `maxInjectChars` | `OPENCODE_GOAL_MAX_INJECT_CHARS` | `1600` | Character cap on the injected goal reminder |
+| `notify` | `OPENCODE_GOAL_NOTIFY` | `true` | Post loop start/stop notes into the session |
+| `log` | `OPENCODE_GOAL_LOG` | `false` | Log loop activity to stderr |
+
+**The loop.** `/goal Ship the login fix` stores the objective and starts a normal
+turn. Follow it with `- ` lines to list success criteria. The objective is
+re-injected into every request, so it survives long turns and compaction; when a
+turn ends (`session.idle`/`session.execution.succeeded`) the plugin queues a
+continuation prompt carrying the objective and the remaining budget. It stops
+when the model calls `goal_complete` (which requires concrete evidence unless
+`requireEvidence` is off) or `goal_blocked`, when you interrupt a turn (the goal
+**pauses** rather than fighting you), when `stallLimit` turns run no tools and the
+reply is unchanged, after `maxFailures` consecutive execution errors, or when the
+iteration/time budget is exhausted. Goal state is persisted per session, so a
+paused or budget-stopped goal can be resumed with `/goal resume`.
 
 ### secret-shield options
 
@@ -269,6 +355,7 @@ since some plugins import helpers that live outside it:
 │   ├── memory.ts
 │   ├── secret-shield.ts
 │   ├── usage-stats.ts
+│   ├── goal.ts
 │   └── strip-skills-catalog.ts
 ├── lib/
 │   └── sqlite.ts          # used by the SQLite-backed plugins

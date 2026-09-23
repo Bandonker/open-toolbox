@@ -53,33 +53,27 @@ function wrapNodeDb(db: any): AnyDatabase {
 }
 
 function wrapNodeStmt(db: any, sql: string): any {
+  // S2: cache the prepared statement — re-preparing on every call made
+  // bulk inserts noticeably slower under node:sqlite than under bun:sqlite.
+  let prepared: any = null;
+  const stmt = () => (prepared ??= db.prepare(sql));
   const upper = sql.trim().toUpperCase();
   if (upper.startsWith("SELECT") || upper.startsWith("PRAGMA") || upper.startsWith("WITH")) {
     return {
       get(...params: unknown[]) {
-        return db.prepare(sql).get(...params) ?? null;
+        return stmt().get(...params) ?? null;
       },
       all(...params: unknown[]) {
-        return db.prepare(sql).all(...params) as unknown[];
+        return stmt().all(...params) as unknown[];
       },
       run() {
         throw new Error("run() called on a read query: " + sql.slice(0, 80));
       },
     };
   }
-  if (/LAST_INSERT_ROWID\(\)/i.test(sql)) {
-    return {
-      get() {
-        return db.prepare("SELECT last_insert_rowid() as id").get() as unknown;
-      },
-      all() {
-        return [db.prepare("SELECT last_insert_rowid() as id").get()] as unknown[];
-      },
-      run() {
-        throw new Error("run() called on last_insert_rowid query");
-      },
-    };
-  }
+  // S3: the unreachable LAST_INSERT_ROWID() branch was removed; write
+  // statements now pass through the native run() result so UPDATE/DELETE
+  // report real `changes` and INSERTs report their real lastInsertRowid.
   return {
     get(...params: unknown[]) {
       throw new Error("get() called on a write statement: " + sql.slice(0, 80));
@@ -88,13 +82,11 @@ function wrapNodeStmt(db: any, sql: string): any {
       throw new Error("all() called on a write statement: " + sql.slice(0, 80));
     },
     run(...params: unknown[]) {
-      db.prepare(sql).run(...params);
-      let lastInsertRowid: number | bigint = 0;
-      try {
-        const row = db.prepare("SELECT last_insert_rowid() as id").get() as { id: number };
-        lastInsertRowid = row.id;
-      } catch {}
-      return { lastInsertRowid, changes: 0 };
+      const result = stmt().run(...params) ?? {};
+      return {
+        changes: Number(result.changes ?? 0),
+        lastInsertRowid: result.lastInsertRowid ?? 0,
+      };
     },
   };
 }
@@ -116,6 +108,11 @@ export function applyPragmas(db: AnyDatabase): void {
     "PRAGMA synchronous=NORMAL",
     "PRAGMA cache_size=-8000",
     "PRAGMA temp_store=MEMORY",
+    // CR-2: wait on locked pages instead of failing fast. Concurrent
+    // sessions (and the backup checkpoint path) hit SQLITE_BUSY under
+    // load; a 5s timeout lets short writers drain without surfacing
+    // raw lock errors to tools.
+    "PRAGMA busy_timeout=5000",
   ]) {
     try {
       db.exec(p);
@@ -137,6 +134,24 @@ export function maybeBackupDb(opts: BackupOptions): void {
   const throttle = opts.throttleMs ?? 300000;
   if (now - opts.lastBackupTime() < throttle) return;
   if (!existsSync(opts.dbPath)) return;
+  // S1: WAL checkpoint before copying — commits still living in the -wal
+  // file would otherwise be silently missing from the backup, and the
+  // tryRestore() paths would then restore stale data. TRUNCATE empties the
+  // -wal so the single-file copy is complete. Best effort: fall back to
+  // copying whatever is on disk if checkpointing fails.
+  let ck: AnyDatabase | null = null;
+  try {
+    ck = openDatabase(opts.dbPath);
+    ck.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  } catch {
+    /* best effort */
+  } finally {
+    try {
+      ck?.close();
+    } catch {
+      /* ignore */
+    }
+  }
   mkdirSync(opts.backupDir, { recursive: true });
   const ts = new Date().toISOString().replace(/[:.]/g, "-");
   const { join } = require("node:path");
@@ -170,10 +185,73 @@ export function isCorruption(err: unknown): boolean {
   return /corrupt|malformed|disk image|not a database/i.test(msg);
 }
 
-export function quoteFtsQuery(query: string): string {
-  return query
-    .split(/\s+/)
-    .filter(Boolean)
-    .map((w) => `"${w.replace(/"/g, '""')}"`)
-    .join(" ");
+/** CR-2: detect lock contention so callers can back off and retry. */
+export function isBusy(err: unknown): boolean {
+  const msg = String(err);
+  return /SQLITE_BUSY|database is locked|database table is locked/i.test(msg);
+}
+
+/**
+ * CR-1: parse a JSON string-array cell defensively. A single corrupt row
+ * must not throw out of a whole-tool read — returns [] instead.
+ */
+export function parseStringArray(raw: unknown): string[] {
+  if (typeof raw !== "string" || raw.length === 0) return [];
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.filter((t): t is string => typeof t === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Quote a user query as a safe FTS5 MATCH expression. Every token is quoted,
+ * so FTS5 operators in user text cannot change query semantics (tool
+ * descriptions that claim "FTS5 syntax" are corrected accordingly).
+ *
+ * S4: returns null for empty/whitespace-only input — callers must treat null
+ * as "no results" instead of passing "" to MATCH, which throws
+ * `fts5: syntax error near ""`.
+ */
+export function quoteFtsQuery(query: string): string | null {
+  const tokens = query.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return null;
+  return tokens.map((w) => `"${w.replace(/"/g, '""')}"`).join(" ");
+}
+
+
+/**
+ * EN53/J1: check a SQLite file before trusting it. Restore paths used to copy the newest
+ * backup blindly, so a corrupt backup could be restored silently and the store stayed broken.
+ * Restores are rare, so a full integrity_check is affordable here.
+ */
+export function integrityOk(path: string): boolean {
+  if (!existsSync(path)) return false;
+  let probe: AnyDatabase | null = null;
+  try {
+    probe = openDatabase(path);
+    const row = probe.query("PRAGMA integrity_check").get() as { integrity_check?: unknown } | null;
+    const value = row?.integrity_check;
+    return typeof value === "string" && value.toLowerCase() === "ok";
+  } catch {
+    return false;
+  } finally {
+    try {
+      probe?.close();
+    } catch {
+      /* ignore */
+    }
+  }
+}
+
+/** EN53/J1: newest backup that passes `PRAGMA integrity_check`, or null when none is valid. */
+export function latestValidBackup(backupDir: string): string | null {
+  const { join } = require("node:path");
+  const files = listBackups(backupDir);
+  for (let i = files.length - 1; i >= 0; i--) {
+    const candidate = join(backupDir, files[i]);
+    if (integrityOk(candidate)) return candidate;
+  }
+  return null;
 }

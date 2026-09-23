@@ -157,7 +157,7 @@ check("text format renders plain", txt.includes("SESSION EXPORT") && txt.include
 
 const withR = (await by.session_export.execute({ inline: true, format: "json", includeReasoning: true }, toolCtx)).content;
 check("includeReasoning includes reasoning", withR.includes("Private reasoning"));
-check("reasoning secret is redacted", !withR.includes("ghp_") && withR.includes("[redacted github token]"));
+check("reasoning secret is redacted", !withR.includes("ghp_") && /\[redacted/.test(withR));
 
 const rolesOnly = (await by.session_export.execute({ inline: true, format: "json", roles: ["user"] }, toolCtx)).content;
 check("roles allowlist filters messages", JSON.parse(rolesOnly).messages.length === 1 && JSON.parse(rolesOnly).messages[0].role === "user");
@@ -181,7 +181,7 @@ check("maxCharsPerPart truncates with a marker", trunc.includes("[truncated"));
 // ----------------------------------------------------------- redaction
 
 const redacted = (await by.session_export.execute({ inline: true, format: "markdown" }, toolCtx)).content;
-check("redacts sk- token", !redacted.includes(TOKEN) && redacted.includes("[redacted api key]"));
+check("redacts sk- token", !redacted.includes(TOKEN) && /\[redacted/.test(redacted));
 check("rewrites home dir to ~", !redacted.includes(FAKE_HOME) && redacted.includes("~\\project\\api.ts"));
 check("rewrites home dir in tool input", !redacted.includes("verify-user"));
 

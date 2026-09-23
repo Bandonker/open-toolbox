@@ -3,6 +3,7 @@ import { z } from "zod";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
 import { dirname, extname, join } from "path";
+import { redactSecrets } from "../lib/redact.ts";
 
 /**
  * session-export
@@ -189,17 +190,6 @@ function resolveConfig(options: Record<string, unknown> | undefined): ExportConf
 
 // ------------------------------------------------------------ redaction
 
-const SECRET_PATTERNS: Array<[RegExp, string]> = [
-  [/-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, "[redacted private key]"],
-  [/\bAKIA[0-9A-Z]{16}\b/g, "[redacted aws key]"],
-  [/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "[redacted github token]"],
-  [/\bsk-[A-Za-z0-9_-]{16,}\b/g, "[redacted api key]"],
-  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[redacted jwt]"],
-];
-
-const GENERIC_SECRET =
-  /(\b(?:api[_-]?key|apikey|access[_-]?key|secret|token|password|passwd|client[_-]?secret|auth)\b\s*[:=]\s*)(["']?)([^\s"',;\n]{12,})/gi;
-
 function rewriteHome(text: string): string {
   try {
     const home = homedir();
@@ -216,13 +206,13 @@ function rewriteHome(text: string): string {
   }
 }
 
-/** Scrub secret patterns and rewrite the home directory to `~`. */
+/** Scrub secrets and rewrite the home directory to `~`. */
 function sanitize(text: string, cfg: ExportConfig): string {
   if (!cfg.redact || !text) return text;
-  let out = text;
-  for (const [pattern, replacement] of SECRET_PATTERNS) out = out.replace(pattern, replacement);
-  out = out.replace(GENERIC_SECRET, (_match, prefix: string, quote: string) => `${prefix}${quote}[redacted]`);
-  return rewriteHome(out);
+  // X1/H4: scrub with the same detection core secret-shield uses
+  // (lib/redact) — the old private pattern list was much weaker, and
+  // exports are the leakiest surface in a leak-prevention pack.
+  return rewriteHome(redactSecrets(text));
 }
 
 function clamp(text: string, max: number): string {
@@ -611,7 +601,8 @@ export default Plugin.define({
           const path = resolveDestPath(dest, format, sessionID, date);
           try {
             mkdirSync(dirname(path), { recursive: true });
-            writeFileSync(path, rendered, "utf8");
+            // X2: transcripts are sensitive — owner-readable/writable only.
+            writeFileSync(path, rendered, { encoding: "utf8", mode: 0o600 });
           } catch (err) {
             return { content: `session_export could not write ${path}: ${String(err)}` };
           }

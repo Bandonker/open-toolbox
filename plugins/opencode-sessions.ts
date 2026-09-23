@@ -391,10 +391,25 @@ export default Plugin.define({
       pruneTracked();
     };
 
-    const handleInterrupted = async (t: Tracked): Promise<void> => {
+    const handleInterrupted = async (t: Tracked, reason: string): Promise<void> => {
+      // O1: reason-aware. A `superseded` interrupt (the user steered or
+      // another prompt replaced this turn) does NOT mean the session is
+      // dead — settling it as cancelled here made the real completion
+      // unobservable. Only genuinely terminal reasons settle the session.
+      if (reason === "superseded") {
+        log("info", `child ${t.childID} turn superseded (session stays ${t.state})`);
+        touch(t);
+        return;
+      }
       if (isTerminal(t.state)) return;
-      t.state = "cancelled";
-      t.errorText = t.errorText ?? "Session was interrupted.";
+      if (reason === "inactivity") {
+        t.state = "timeout";
+        t.errorText = "Session went inactive and was interrupted.";
+      } else {
+        t.state = "cancelled";
+        t.errorText =
+          t.errorText ?? `Session was interrupted${reason ? ` (${reason})` : ""}.`;
+      }
       t.idleAt = Date.now();
       touch(t);
       try {
@@ -804,7 +819,33 @@ export default Plugin.define({
             if (type === "session.execution.interrupted") {
               if (!sessionID) continue;
               const t = tracked.get(sessionID);
-              if (t) await handleInterrupted(t);
+              if (t) {
+                // O1: branch on the interrupt reason (user/shutdown cancel,
+                // superseded stays running, inactivity ≈ timeout).
+                const d = data as { reason?: unknown };
+                await handleInterrupted(t, typeof d.reason === "string" ? d.reason : "");
+              }
+              continue;
+            }
+            if (type === "session.deleted") {
+              // O3: settle waiters with a clear status and stop tracking a
+              // session the server has deleted.
+              const info = data as { info?: { id?: unknown } };
+              const deletedID =
+                sessionID ??
+                (typeof info?.info?.id === "string" ? info.info.id : undefined);
+              if (!deletedID) continue;
+              const t = tracked.get(deletedID);
+              if (!t) continue;
+              if (!isTerminal(t.state)) {
+                t.state = "cancelled";
+                t.errorText = "Session was deleted before it finished.";
+                t.idleAt = Date.now();
+              }
+              touch(t);
+              settleWaiters(t);
+              tracked.delete(deletedID);
+              log("info", `dropped deleted session ${deletedID}`);
               continue;
             }
             if (type === "permission.asked") {
@@ -817,11 +858,15 @@ export default Plugin.define({
               if (!d.sessionID) continue;
               const t = tracked.get(d.sessionID);
               if (!t) continue;
+              // O4: a stale permission.asked for an already-terminal session
+              // must not be answered or announced.
+              if (isTerminal(t.state)) continue;
               const label =
                 d.message ?? (d.action ? `permission: ${d.action}` : "permission");
               t.pendingPermission = label;
               t.pendingPermissionId = d.id;
               touch(t);
+              let approved = false;
               if (cfg.autoApprovePermissions !== "never" && d.id) {
                 try {
                   await ctx.permission.reply({
@@ -831,6 +876,7 @@ export default Plugin.define({
                   });
                   t.pendingPermission = undefined;
                   t.pendingPermissionId = undefined;
+                  approved = true;
                   log("info", `auto-approved permission for child ${t.childID}`, {
                     response: cfg.autoApprovePermissions,
                   });
@@ -840,7 +886,10 @@ export default Plugin.define({
                   });
                 }
               }
-              if (cfg.autoInjectParent && cfg.injectPermissionNotices) {
+              // O2: only announce a waiting permission when one is still
+              // pending — a successful auto-approve must not tell the parent
+              // the child is blocked.
+              if (!approved && cfg.autoInjectParent && cfg.injectPermissionNotices) {
                 await postToParent(
                   t,
                   `${cfg.titlePrefix}:${t.shortId}] child ${t.childID} is waiting on a permission prompt: "${label}"${
