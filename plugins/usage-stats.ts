@@ -48,20 +48,39 @@ type Config = {
   log: boolean;
 };
 
-let db: AnyDatabase | null = null;
-let lastPruneMs = 0;
+/**
+ * Per-setup mutable state (US-1). This used to live in module-level
+ * `let`/`const` bindings, so two concurrent setups shared one sqlite
+ * handle (opened for whichever dir came first) plus one pricing map,
+ * one in-flight map, and one model-attribution map. Each `setup()`
+ * now creates its own `UsageState` and threads it through the helpers.
+ */
+interface UsageState {
+  db: AnyDatabase | null;
+  lastPruneMs: number;
+  /** Latest provider/model price list keyed by `providerID/modelID`. */
+  pricing: PricingMap;
+  /** User-supplied price overrides (win over `pricing`), e.g. for local models. */
+  priceOverrides: PricingMap;
+  /** Set by every record; the refresh timer regenerates the dashboard while true. */
+  dirty: boolean;
+  /** Last model we attributed per session, so http.request doesn't rewrite every call. */
+  sessionModels: Map<string, string>;
+  /** In-flight tool calls keyed by call id, for duration measurement. */
+  pending: Map<string, { tool: string; startedMs: number }>;
+}
 
-/** Latest provider/model price list keyed by `providerID/modelID`. */
-let pricing: PricingMap = new Map();
-/** User-supplied price overrides (win over `pricing`), e.g. for local models. */
-let priceOverrides: PricingMap = new Map();
-/** Set by every record; the refresh timer regenerates the dashboard while true. */
-let dirty = false;
-/** Last model we attributed per session, so http.request doesn't rewrite every call. */
-const sessionModels = new Map<string, string>();
-
-/** In-flight tool calls keyed by call id, for duration measurement. */
-const pending = new Map<string, { tool: string; startedMs: number }>();
+function createState(): UsageState {
+  return {
+    db: null,
+    lastPruneMs: 0,
+    pricing: new Map(),
+    priceOverrides: new Map(),
+    dirty: false,
+    sessionModels: new Map(),
+    pending: new Map(),
+  };
+}
 
 function envStr(name: string): string | undefined {
   const v = process.env[name];
@@ -185,10 +204,10 @@ function selectRate(entries: PriceEntry[], inputTokens: number): PriceEntry | nu
  * List-price cost in USD for one usage delta, or null when the model price is unknown.
  * Reasoning tokens are billed at the output rate.
  */
-function computedCost(model: string, t: Tokens): number | null {
+function computedCost(model: string, t: Tokens, state: UsageState): number | null {
   const key = baseModelKey(model);
   // User overrides win over the provider's published rates (e.g. local models).
-  const entries = priceOverrides.get(key) ?? pricing.get(key);
+  const entries = state.priceOverrides.get(key) ?? state.pricing.get(key);
   if (!entries || entries.length === 0) return null;
   const rate = selectRate(entries, t.input);
   if (!rate) return null;
@@ -272,7 +291,11 @@ function parseModelList(raw: unknown): Array<Record<string, unknown>> {
 }
 
 /** Fetch `ctx.model.list()` and rebuild the price map. Failures keep the previous map. */
-async function refreshPricing(ctx: { model?: unknown }, log: (message: string) => void): Promise<void> {
+async function refreshPricing(
+  ctx: { model?: unknown },
+  log: (message: string) => void,
+  state: UsageState,
+): Promise<void> {
   try {
     const api = (ctx as { model?: { list?: (input?: unknown) => unknown } }).model;
     if (!api || typeof api.list !== "function") return;
@@ -286,7 +309,7 @@ async function refreshPricing(ctx: { model?: unknown }, log: (message: string) =
       if (entries.length === 0) continue;
       next.set(`${providerID}/${modelID}`, entries);
     }
-    pricing = next;
+    state.pricing = next;
     log(`pricing loaded for ${next.size} model(s)`);
   } catch (err) {
     log(`pricing refresh failed: ${String(err)}`);
@@ -456,7 +479,10 @@ function initSchema(database: AnyDatabase): void {
   // U2: a lifetime rollup that is never pruned. `daily` is subject to
   // retention, which made the "lifetime" hero cards disagree with the
   // never-pruned model/tool tables. Written in lockstep with `daily`
-  // below; existing rows are copied once.
+  // below; rows still inside the retention window are reconciled from
+  // `daily` on every open so a divergent lifetime row can never pin a
+  // hero card to a stale value. Days already pruned from `daily` are
+  // preserved untouched.
   database.exec(`
     CREATE TABLE IF NOT EXISTS lifetime (
       day TEXT PRIMARY KEY,
@@ -477,28 +503,45 @@ function initSchema(database: AnyDatabase): void {
       bg_cache_write INTEGER NOT NULL DEFAULT 0,
       bg_cost REAL NOT NULL DEFAULT 0
     );
-    INSERT OR IGNORE INTO lifetime SELECT * FROM daily;
+    INSERT INTO lifetime SELECT * FROM daily
+    ON CONFLICT(day) DO UPDATE SET
+      input=excluded.input,
+      output=excluded.output,
+      reasoning=excluded.reasoning,
+      cache_read=excluded.cache_read,
+      cache_write=excluded.cache_write,
+      cost=excluded.cost,
+      cost_computed=excluded.cost_computed,
+      tool_calls=excluded.tool_calls,
+      tool_ok=excluded.tool_ok,
+      tool_fail=excluded.tool_fail,
+      bg_input=excluded.bg_input,
+      bg_output=excluded.bg_output,
+      bg_reasoning=excluded.bg_reasoning,
+      bg_cache_read=excluded.bg_cache_read,
+      bg_cache_write=excluded.bg_cache_write,
+      bg_cost=excluded.bg_cost;
   `);
 }
 
-function getDb(cfg: Config): AnyDatabase {
-  if (!db) {
-    db = openDatabase(join(cfg.dir, DB_NAME));
-    applyPragmas(db);
-    initSchema(db);
-    prune(cfg, true);
+function getDb(state: UsageState, cfg: Config): AnyDatabase {
+  if (!state.db) {
+    state.db = openDatabase(join(cfg.dir, DB_NAME));
+    applyPragmas(state.db);
+    initSchema(state.db);
+    prune(state, cfg, true);
   }
-  return db;
+  return state.db;
 }
 
-function prune(cfg: Config, force: boolean): void {
+function prune(state: UsageState, cfg: Config, force: boolean): void {
   if (cfg.retentionDays <= 0) return;
   const now = Date.now();
-  if (!force && now - lastPruneMs < 3_600_000) return;
-  lastPruneMs = now;
+  if (!force && now - state.lastPruneMs < 3_600_000) return;
+  state.lastPruneMs = now;
   try {
     const cutoff = dayKey(shiftDays(new Date(), -cfg.retentionDays));
-    const database = db;
+    const database = state.db;
     if (!database) return;
     database.prepare("DELETE FROM daily WHERE day < ?").run(cutoff);
     // U1: never prune session_state rows that hold cumulative usage — a
@@ -660,7 +703,8 @@ function recordUsageUpdated(
   sessionID: string,
   tokensRaw: unknown,
   costRaw: unknown,
-  modelRaw?: unknown,
+  modelRaw: unknown,
+  state: UsageState,
 ): void {
   const current = readTokens(tokensRaw);
   const cost = readCost(costRaw);
@@ -686,7 +730,7 @@ function recordUsageUpdated(
     cacheWrite: Math.max(0, current.cacheWrite - prev.cache_write),
   };
   const deltaCost = Math.max(0, cost - prev.cost);
-  const deltaComputed = computedCost(model, delta);
+  const deltaComputed = computedCost(model, delta, state);
   const day = dayKey();
   const changed =
     delta.input > 0 ||
@@ -728,23 +772,23 @@ function recordUsageUpdated(
     }
     throw err;
   }
-  dirty = true;
+  state.dirty = true;
 }
 
-function recordUsageRecorded(database: AnyDatabase, sessionID: string, source: string, tokensRaw: unknown, costRaw: unknown): void {
+function recordUsageRecorded(database: AnyDatabase, sessionID: string, source: string, tokensRaw: unknown, costRaw: unknown, state: UsageState): void {
   ensureSession(database, sessionID, null);
   addBackgroundUsage(database, dayKey(), source || "unknown", readTokens(tokensRaw), readCost(costRaw));
-  dirty = true;
+  state.dirty = true;
 }
 
-function recordModelSelected(database: AnyDatabase, sessionID: string, model: string): void {
+function recordModelSelected(database: AnyDatabase, sessionID: string, model: string, state: UsageState): void {
   ensureSession(database, sessionID, model);
-  dirty = true;
+  state.dirty = true;
 }
 
-function recordSessionCreated(database: AnyDatabase, sessionID: string): void {
+function recordSessionCreated(database: AnyDatabase, sessionID: string, state: UsageState): void {
   ensureSession(database, sessionID, null);
-  dirty = true;
+  state.dirty = true;
 }
 
 /**
@@ -752,17 +796,17 @@ function recordSessionCreated(database: AnyDatabase, sessionID: string): void {
  * on switches (not for the initial model), so we also call this from the
  * `http.request` hook, which carries the model on every request.
  */
-function rememberModel(sessionID: string, model: string): void {
-  if (!sessionID || !model || sessionModels.get(sessionID) === model) return;
-  sessionModels.set(sessionID, model);
+function rememberModel(state: UsageState, sessionID: string, model: string): void {
+  if (!sessionID || !model || state.sessionModels.get(sessionID) === model) return;
+  state.sessionModels.set(sessionID, model);
   try {
-    if (db) recordModelSelected(db, sessionID, model);
+    if (state.db) recordModelSelected(state.db, sessionID, model, state);
   } catch {
     /* db unavailable */
   }
 }
 
-function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durationMs: number): void {
+function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durationMs: number, state: UsageState): void {
   const ms = Math.max(0, Math.round(durationMs));
   // U3: both rollups are written atomically; U2: the daily increment is
   // mirrored into the never-pruned lifetime rollup.
@@ -801,7 +845,7 @@ function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durati
     }
     throw err;
   }
-  dirty = true;
+  state.dirty = true;
 }
 
 type UsageTotals = {
@@ -930,7 +974,12 @@ function summaryText(database: AnyDatabase): string {
   const day = dayKey();
   const todayRow = dailyRows(database, day).find((r) => r.day === day);
   const today = totalsOf(todayRow);
-  const rate = tools.calls > 0 ? (tools.ok / tools.calls) * 100 : 0;
+  // Success rate is measured over completed calls (ok + fail). Older rows
+  // counted every started call, so `calls` can exceed completed; those
+  // leftovers are reported as pending instead of tanking the rate.
+  const completed = tools.ok + tools.fail;
+  const pending = Math.max(0, tools.calls - completed);
+  const rate = completed > 0 ? (tools.ok / completed) * 100 : 0;
   const tokenLine = (t: UsageTotals): string =>
     `input=${fmtInt(t.input)} output=${fmtInt(t.output)} reasoning=${fmtInt(t.reasoning)} cache_read=${fmtInt(t.cacheRead)} cache_write=${fmtInt(t.cacheWrite)}`;
   return [
@@ -1218,14 +1267,19 @@ function lifetimeSummaryLine(database: AnyDatabase): string {
   return `${fmtCompact(tokenTotal(life))} tokens / ${fmtShortUsd(life.cost)} / ${fmtCompact(tools.calls)} tool calls`;
 }
 
-function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo): string {
+function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, state: UsageState): string {
   const life = lifetimeTotals(database);
   const tools = lifetimeTools(database);
   const sessions = countSessions(database);
   const bg = backgroundTotals(database);
   const grid = heatmapGrid(database, cfg.heatmapWeeks, cfg.heatmapMetric, cfg.includeBackground);
   const recent = dailyRows(database, dayKey(shiftDays(new Date(), -29)));
-  const rate = tools.calls > 0 ? (tools.ok / tools.calls) * 100 : 0;
+  // Success rate is measured over completed calls (ok + fail). Older rows
+  // counted every started call, so `calls` can exceed completed; those
+  // leftovers are reported as pending instead of tanking the rate.
+  const completed = tools.ok + tools.fail;
+  const pending = Math.max(0, tools.calls - completed);
+  const rate = completed > 0 ? (tools.ok / completed) * 100 : 0;
 
   const toolRows = (
     database.prepare("SELECT * FROM tool_totals ORDER BY calls DESC, tool ASC LIMIT 15").all() as Array<
@@ -1256,7 +1310,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo): s
     const model = String(r.model);
     const slash = model.indexOf("/");
     const provider = slash >= 0 ? model.slice(0, slash) : "—";
-    const entries = priceOverrides.get(baseModelKey(model)) ?? pricing.get(baseModelKey(model));
+    const entries = state.priceOverrides.get(baseModelKey(model)) ?? state.pricing.get(baseModelKey(model));
     const rate = entries && entries.length > 0 ? selectRate(entries, t.input) : null;
     return [
       model,
@@ -1436,8 +1490,9 @@ function renderDashboard(
   database: AnyDatabase,
   cfg: Config,
   app: AppInfo,
+  state: UsageState,
 ): { path: string; bytes: number; summary: string } {
-  const html = buildDashboardHtml(database, cfg, app);
+  const html = buildDashboardHtml(database, cfg, app, state);
   mkdirSync(cfg.dir, { recursive: true });
   const path = join(cfg.dir, DASHBOARD_NAME);
   writeFileSync(path, html, "utf8");
@@ -1471,15 +1526,18 @@ export default Plugin.define({
   async setup(ctx) {
     const cfg = resolveConfig(ctx.options);
     if (!cfg.enabled) return () => {};
+    // US-1: per-setup state (db handle, pricing, dirty flag, session
+    // models, in-flight calls) — never module-level.
+    const state = createState();
 
     const log = (message: string): void => {
       if (cfg.log) console.error(`[usage-stats] ${message}`);
     };
-    const database = (): AnyDatabase => getDb(cfg);
+    const database = (): AnyDatabase => getDb(state, cfg);
     const app = (ctx.app ?? {}) as AppInfo;
 
     try {
-      getDb(cfg);
+      getDb(state, cfg);
     } catch (err) {
       log(`db init failed: ${String(err)}`);
     }
@@ -1488,20 +1546,20 @@ export default Plugin.define({
 
     const render = (): void => {
       try {
-        renderDashboard(database(), cfg, app);
-        dirty = false;
+        renderDashboard(database(), cfg, app, state);
+        state.dirty = false;
       } catch (err) {
         log(`dashboard render failed: ${String(err)}`);
       }
     };
 
     // Price list: fetch once at startup, then refresh periodically.
-    priceOverrides = parsePriceOverrides(cfg.prices);
-    if (priceOverrides.size > 0) log(`price overrides loaded for ${priceOverrides.size} model(s)`);
-    await refreshPricing(ctx, log);
+    state.priceOverrides = parsePriceOverrides(cfg.prices);
+    if (state.priceOverrides.size > 0) log(`price overrides loaded for ${state.priceOverrides.size} model(s)`);
+    await refreshPricing(ctx, log, state);
     if (cfg.pricingRefreshMin > 0) {
       const timer = setInterval(() => {
-        void refreshPricing(ctx, log);
+        void refreshPricing(ctx, log, state);
       }, cfg.pricingRefreshMin * 60_000);
       timer.unref?.();
       timers.push(timer);
@@ -1517,7 +1575,7 @@ export default Plugin.define({
     }
     if (cfg.autoRefreshSec > 0) {
       const timer = setInterval(() => {
-        if (dirty) render();
+        if (state.dirty) render();
       }, cfg.autoRefreshSec * 1000);
       timer.unref?.();
       timers.push(timer);
@@ -1533,10 +1591,10 @@ export default Plugin.define({
           // U5: sweep orphaned entries (execute.after never arrived) so the
           // map cannot grow without bound in long-lived servers.
           const cutoff = Date.now() - 600_000;
-          for (const [k, v] of pending) {
-            if (v.startedMs < cutoff) pending.delete(k);
+          for (const [k, v] of state.pending) {
+            if (v.startedMs < cutoff) state.pending.delete(k);
           }
-          pending.set(key, { tool: String(event.tool ?? "unknown"), startedMs: Date.now() });
+          state.pending.set(key, { tool: String(event.tool ?? "unknown"), startedMs: Date.now() });
         } catch (err) {
           log(`execute.before failed: ${String(err)}`);
         }
@@ -1547,12 +1605,12 @@ export default Plugin.define({
       await ctx.tool.hook("execute.after", (event) => {
         try {
           const key = String(event.id ?? "");
-          const entry = pending.get(key);
+          const entry = state.pending.get(key);
           const tool = String(event.tool ?? entry?.tool ?? "unknown");
           const duration = entry ? Date.now() - entry.startedMs : 0;
-          pending.delete(key);
+          state.pending.delete(key);
           const status = String((event as { status?: unknown }).status ?? "completed");
-          recordToolCall(database(), tool, status === "completed", duration);
+          recordToolCall(database(), tool, status === "completed", duration, state);
         } catch (err) {
           log(`execute.after failed: ${String(err)}`);
         }
@@ -1572,7 +1630,7 @@ export default Plugin.define({
                 // U6: pass the event's model along so attribution doesn't
                 // depend on the racy session_state.model fallback.
                 if (sessionID) {
-                  recordUsageUpdated(database(), sessionID, data.tokens, data.cost, data.model);
+                  recordUsageUpdated(database(), sessionID, data.tokens, data.cost, data.model, state);
                 }
                 break;
               case "session.usage.recorded":
@@ -1583,19 +1641,20 @@ export default Plugin.define({
                     String(data.source ?? "unknown"),
                     data.tokens,
                     data.cost,
+                    state,
                   );
                 }
                 break;
               case "session.model.selected":
-                if (sessionID) rememberModel(sessionID, modelKey(data.model));
+                if (sessionID) rememberModel(state, sessionID, modelKey(data.model));
                 break;
               case "session.created":
-                if (sessionID) recordSessionCreated(database(), sessionID);
+                if (sessionID) recordSessionCreated(database(), sessionID, state);
                 break;
               default:
                 break;
             }
-            prune(cfg, false);
+            prune(state, cfg, false);
           } catch (err) {
             log(`event ${String(ev.type)} failed: ${String(err)}`);
           }
@@ -1613,7 +1672,7 @@ export default Plugin.define({
         await ctx.session.hook("http.request", (event) => {
           try {
             if (event?.sessionID && event.model) {
-              rememberModel(String(event.sessionID), modelKey(event.model));
+              rememberModel(state, String(event.sessionID), modelKey(event.model));
             }
           } catch (err) {
             log(`http.request model attribution failed: ${String(err)}`);
@@ -1700,8 +1759,8 @@ export default Plugin.define({
           input: z.object({}),
           execute: async () => {
             try {
-              const dash = renderDashboard(database(), cfg, app);
-              dirty = false;
+              const dash = renderDashboard(database(), cfg, app, state);
+              state.dirty = false;
               return {
                 content: `dashboard: ${dash.path}\nbytes: ${dash.bytes}\nlifetime: ${dash.summary}`,
               };
@@ -1722,8 +1781,8 @@ export default Plugin.define({
             // No session.prompt: the command does its work server-side so the
             // model is never invoked and no tokens are spent.
             try {
-              const dash = renderDashboard(database(), cfg, app);
-              dirty = false;
+              const dash = renderDashboard(database(), cfg, app, state);
+              state.dirty = false;
               const opened = openInBrowser(dash.path);
               log(`/stats refreshed ${dash.path} (${dash.bytes} bytes)${opened ? ", opened in browser" : ""}`);
             } catch (err) {
@@ -1745,15 +1804,15 @@ export default Plugin.define({
           /* ignore */
         }
       }
-      pending.clear();
+      state.pending.clear();
       for (const timer of timers) clearInterval(timer);
-      if (db) {
+      if (state.db) {
         try {
-          db.close();
+          state.db.close();
         } catch {
           /* ignore */
         }
-        db = null;
+        state.db = null;
       }
     };
   },

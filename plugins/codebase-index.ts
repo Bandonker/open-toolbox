@@ -324,11 +324,25 @@ interface Chunk {
   content: string;
 }
 
-function chunkFile(absPath: string, rootPath: string): Chunk[] {
-  const stat = statSync(absPath);
+type FsLike = { statSync: typeof statSync; readFileSync: typeof readFileSync };
+
+function chunkFile(absPath: string, rootPath: string, fs: FsLike = { statSync, readFileSync }): Chunk[] {
+  let stat: ReturnType<typeof statSync>;
+  try {
+    stat = fs.statSync(absPath);
+  } catch {
+    // CI-1: file vanished or is unreadable between walkDir and read — skip it.
+    return [];
+  }
   if (!stat.isFile() || stat.size > MAX_FILE_SIZE || stat.size === 0) return [];
 
-  const content = readFileSync(absPath, "utf-8");
+  let content: string;
+  try {
+    content = fs.readFileSync(absPath, "utf-8") as string;
+  } catch {
+    // CI-1: locked/unreadable file — skip it instead of aborting the index.
+    return [];
+  }
   const lines = content.split("\n");
   if (lines.length === 0) return [];
 
@@ -352,7 +366,7 @@ function chunkFile(absPath: string, rootPath: string): Chunk[] {
   return chunks;
 }
 
-function indexProject(rootPath: string): { files: number; chunks: number } {
+function indexProject(rootPath: string): { files: number; chunks: number; skipped: number } {
   const database = getDb();
   const resolvedPath = normalizeRoot(rootPath);
   const projectName = resolvedPath.split(/[\\/]/).pop() || "unknown";
@@ -389,23 +403,38 @@ function indexProject(rootPath: string): { files: number; chunks: number } {
 
     let fileCount = 0;
     let chunkCount = 0;
+    let skipped = 0;
 
     for (const filePath of walkDir(resolvedPath)) {
-      const chunks = chunkFile(filePath, resolvedPath);
+      // CI-1: one bad file must not abort the whole re-index.
+      let chunks: Chunk[];
+      try {
+        chunks = chunkFile(filePath, resolvedPath);
+      } catch {
+        skipped++;
+        continue;
+      }
       if (chunks.length === 0) continue;
       fileCount++;
 
-      for (const ch of chunks) {
-        insertChunk.run(
-          projectId,
-          ch.absPath,
-          ch.relPath,
-          ch.index,
-          ch.startLine,
-          ch.endLine,
-          ch.content
-        );
-        chunkCount++;
+      try {
+        for (const ch of chunks) {
+          insertChunk.run(
+            projectId,
+            ch.absPath,
+            ch.relPath,
+            ch.index,
+            ch.startLine,
+            ch.endLine,
+            ch.content
+          );
+          chunkCount++;
+        }
+      } catch {
+        // A single file's rows failed (e.g. transient write error) —
+        // leave it out of the new index rather than failing everything.
+        fileCount--;
+        skipped++;
       }
     }
 
@@ -437,7 +466,7 @@ function indexProject(rootPath: string): { files: number; chunks: number } {
       END
     `);
 
-    return { files: fileCount, chunks: chunkCount };
+    return { files: fileCount, chunks: chunkCount, skipped };
   } catch (err) {
     try { database.exec("ROLLBACK"); } catch {}
     // Always restore triggers even on failure
@@ -488,6 +517,7 @@ export default Plugin.define({
               path: normalizeRoot(rootPath),
               files: result.files,
               chunks: result.chunks,
+              skipped: result.skipped,
             });
           });
           return { content: out };
@@ -663,8 +693,7 @@ export default Plugin.define({
       });
 
       editor.add({
-        name: "codebase_delete_index",
-        description:
+        name: "codebase_delete_index",        description:
           "Delete a project's index from the codebase database. Removes all chunks and FTS entries for the specified path.",
         input: z.object({
           path: z.string().describe("Root path of the project index to delete"),
@@ -689,3 +718,6 @@ export default Plugin.define({
     });
   },
 });
+
+/** Test hooks (CI-1): unit access to chunkFile without a database. */
+export const __test__ = { chunkFile };

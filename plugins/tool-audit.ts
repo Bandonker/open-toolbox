@@ -45,9 +45,6 @@ type Pending = {
   startedMs: number;
 };
 
-let db: AnyDatabase | null = null;
-const pending = new Map<string, Pending>();
-
 function resolveConfig(options: Record<string, unknown> | undefined): Config {
   const o = options ?? {};
   const env = (key: string): string | undefined => process.env[key];
@@ -162,15 +159,6 @@ function serializeInput(input: unknown, cfg: Config): string {
     text = text.slice(0, cfg.maxInputChars) + `…[truncated ${text.length - cfg.maxInputChars}]`;
   }
   return text;
-}
-
-function getDb(cfg: Config): AnyDatabase {
-  if (!db) {
-    db = openDatabase(join(cfg.dir, DB_NAME));
-    applyPragmas(db);
-    initSchema(db);
-  }
-  return db;
 }
 
 function initSchema(database: AnyDatabase): void {
@@ -349,6 +337,20 @@ export default Plugin.define({
   id: "tool-audit",
   async setup(ctx) {
     const cfg = resolveConfig(ctx.options as unknown as Record<string, unknown> | undefined);
+
+    // TA-1: per-setup state. These used to be module-level, so two
+    // concurrent setups shared one sqlite handle (opened for whichever
+    // dir came first) and one in-flight map — each setup owns its own.
+    let db: AnyDatabase | null = null;
+    const pending = new Map<string, Pending>();
+    const getDb = (config: Config): AnyDatabase => {
+      if (!db) {
+        db = openDatabase(join(config.dir, DB_NAME));
+        applyPragmas(db);
+        initSchema(db);
+      }
+      return db;
+    };
 
     if (cfg.enabled) {
       try {

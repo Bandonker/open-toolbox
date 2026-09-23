@@ -620,7 +620,11 @@ export default Plugin.define({
         parentSessionID: info.parentID ?? metaParent ?? "",
         shortId: short,
         title: title || sessionId,
-        state: "idle",
+        // OS-1: an adopted session may still be running — we cannot tell
+        // from `session.get`, so attach as running and fetch the latest
+        // outcome. Marking it idle made `waitFor` resolve immediately with
+        // empty text and reported a live session as finished.
+        state: "running",
         createdAt: Date.now(),
         startedAt: Date.now(),
         lastActivityAt: Date.now(),
@@ -628,6 +632,13 @@ export default Plugin.define({
         waiters: [],
       };
       tracked.set(sessionId, t);
+      try {
+        const o = await fetchOutcome(sessionId);
+        if (o.text) t.resultText = o.text;
+        if (o.error && !t.errorText) t.errorText = o.error;
+      } catch {
+        /* outcome fetch is best-effort; the event pump corrects state */
+      }
       log("debug", `adopted child ${sessionId} from server state`, {
         parent: t.parentSessionID,
       });
