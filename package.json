@@ -12,7 +12,7 @@
     "typescript": "5.8.2"
   },
   "scripts": {
-    "test": "node --test opencode-sessions/unit.test.mjs && node tests/verify-plugins.mjs && node tests/verify-cr3.mjs && node tests/verify-session-export.mjs && node tests/verify-memory.mjs && node tests/verify-goal.mjs && node tests/verify-secret-shield.mjs && node tests/verify-usage-stats.mjs && node tests/verify-usage-stats-isolation.mjs && node tests/verify-tool-audit-isolation.mjs && node tests/verify-opencode-sessions.mjs && node tests/verify-codebase-index.mjs",
+    "test": "node --test opencode-sessions/unit.test.mjs && node tests/verify-plugins.mjs && node tests/verify-cr3.mjs && node tests/verify-session-export.mjs && node tests/verify-memory.mjs && node tests/verify-memory-seen.mjs && node tests/verify-goal.mjs && node tests/verify-secret-shield.mjs && node tests/verify-usage-stats.mjs && node tests/verify-usage-stats-isolation.mjs && node tests/verify-tool-audit-isolation.mjs && node tests/verify-opencode-sessions.mjs && node tests/verify-codebase-index.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "measure": "node tests/measure-savings.mjs",
     "measure:live": "node tests/measure-live-savings.mjs",

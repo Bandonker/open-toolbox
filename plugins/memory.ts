@@ -3,7 +3,7 @@ import { z } from "zod";
 import { homedir } from "os";
 import { join } from "path";
 import { createHash } from "crypto";
-import { renameSync } from "fs";
+import { renameSync, statSync } from "fs";
 import {
   openDatabase,
   applyPragmas,
@@ -27,6 +27,47 @@ import { redactSecrets } from "../lib/redact.ts";
 
 const DB_DIR = join(homedir(), ".opencode-plugins", "memory");
 const DB_PATH = join(DB_DIR, "memory.db");
+
+/**
+ * M2: the auto-recall `seen` map is keyed by session and must be bounded —
+ * an unbounded in-memory map grows for every finished session and a restart
+ * re-injects fragments already shown. Entries expire after `SEEN_TTL_MS`
+ * idle, the map is capped at `MAX_SEEN_SESSIONS` (oldest-first eviction),
+ * per-session id sets are trimmed, and the map is persisted via
+ * `ctx.storage` so restarts pick up where they left off.
+ * M3: injection is additionally capped per session (`SESSION_BUDGET_MULT`
+ * times the per-request budget) so consecutive turns cannot inject
+ * unbounded context over a session's lifetime.
+ */
+interface SeenEntry {
+  ids: Set<number>;
+  at: number;
+  chars: number;
+}
+const MAX_SEEN_SESSIONS = 500;
+const MAX_SEEN_IDS = 2000;
+const SEEN_TTL_MS = 2 * 60 * 60 * 1000;
+const SESSION_BUDGET_MULT = 3;
+
+// Live pointer to the most recently set-up instance's map, for tests.
+let currentSeen: Map<string, SeenEntry> | null = null;
+let currentSweep: ((now?: number) => void) | null = null;
+
+/** Test seam (mirrors the `__test__` precedent in codebase-index). */
+export const __test__ = {
+  MAX_SEEN_SESSIONS,
+  SEEN_TTL_MS,
+  SESSION_BUDGET_MULT,
+  seenSize: (): number => currentSeen?.size ?? 0,
+  hasSeen: (sessionID: string): boolean => currentSeen?.has(sessionID) ?? false,
+  sessionChars: (sessionID: string): number => currentSeen?.get(sessionID)?.chars ?? 0,
+  injectSeen: (sessionID: string, ids: number[], at: number = Date.now()): void => {
+    currentSeen?.set(sessionID, { ids: new Set(ids), at, chars: 0 });
+  },
+  sweepSeen: (now: number = Date.now()): void => {
+    currentSweep?.(now);
+  },
+};
 const SCOPES = ["global", "project", "session"] as const;
 type Scope = (typeof SCOPES)[number];
 
@@ -384,6 +425,7 @@ export default Plugin.define({
               const existing = database.prepare("SELECT id FROM memories WHERE id = ?").get(args.id) as { id: number } | null;
               if (!existing) return { content: `No memory #${args.id}.` };
               database.prepare("DELETE FROM memories WHERE id = ?").run(args.id);
+              dropSeenIds([args.id]);
               return { content: `Forgot #${args.id}.` };
             }
             if (typeof args.query === "string") {
@@ -395,6 +437,7 @@ export default Plugin.define({
               if (rows.length === 0) return { content: "No memories matched." };
               const del = database.prepare("DELETE FROM memories WHERE id = ?");
               for (const row of rows) del.run(row.id);
+              dropSeenIds(rows.map((row) => row.id));
               return { content: `Forgot ${rows.length} memor${rows.length === 1 ? "y" : "ies"}.` };
             }
             return { content: "Provide an id or a query." };
@@ -437,10 +480,18 @@ export default Plugin.define({
             const groups = database.prepare("SELECT scope, count(*) AS n FROM memories GROUP BY scope").all() as Array<{ scope: string; n: number }>;
             const total = database.prepare("SELECT count(*) AS n FROM memories").get() as { n: number } | null;
             const byScope = SCOPES.map((s) => `${s}=${groups.find((g) => g.scope === s)?.n ?? 0}`).join(" ");
+            // M4: report the database file size alongside the totals.
+            let size = "unknown";
+            try {
+              const bytes = statSync(DB_PATH).size;
+              size = bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${(bytes / 1024).toFixed(1)} KB`;
+            } catch {
+              /* ignore — size stays "unknown" */
+            }
             return {
               content: [
                 `memories: ${total?.n ?? 0} (${byScope})`,
-                `db: ${DB_PATH}`,
+                `db: ${DB_PATH} (size: ${size})`,
                 `config: scope=${cfg.scope} topK=${cfg.topK} budgetChars=${cfg.budgetChars} minScore=${cfg.minScore} autoRecall=${cfg.autoRecall} maxEntries=${cfg.maxEntries === 0 ? "unlimited" : cfg.maxEntries}`,
               ].join("\n"),
             };
@@ -451,20 +502,82 @@ export default Plugin.define({
       });
     });
 
-    const seen = new Map<string, Set<number>>();
+    const seen = new Map<string, SeenEntry>();
+    const seenStoreKey = `memory:seen:${project}`;
+
+    const serializeSeen = (): Record<string, { ids: number[]; at: number; chars: number }> => {
+      const obj: Record<string, { ids: number[]; at: number; chars: number }> = {};
+      for (const [key, entry] of seen) {
+        obj[key] = { ids: [...entry.ids].slice(-MAX_SEEN_IDS), at: entry.at, chars: entry.chars };
+      }
+      return obj;
+    };
+    const saveSeen = (): void => {
+      try {
+        void ctx.storage?.set?.(seenStoreKey, serializeSeen());
+      } catch {
+        /* ignore — persistence is best-effort */
+      }
+    };
+    const sweepSeen = (now: number = Date.now()): void => {
+      for (const [key, entry] of seen) {
+        if (now - entry.at > SEEN_TTL_MS) seen.delete(key);
+      }
+      if (seen.size > MAX_SEEN_SESSIONS) {
+        const oldest = [...seen.entries()].sort((a, b) => a[1].at - b[1].at);
+        for (const [key] of oldest.slice(0, seen.size - MAX_SEEN_SESSIONS)) seen.delete(key);
+      }
+    };
+    const dropSeenIds = (ids: Iterable<number>): void => {
+      const gone = new Set(ids);
+      if (gone.size === 0) return;
+      for (const entry of seen.values()) {
+        for (const id of gone) entry.ids.delete(id);
+      }
+      saveSeen();
+    };
+    try {
+      const raw = await ctx.storage?.get?.(seenStoreKey);
+      if (raw && typeof raw === "object") {
+        const now = Date.now();
+        for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+          if (typeof key !== "string" || !value || typeof value !== "object") continue;
+          const v = value as { ids?: unknown; at?: unknown; chars?: unknown };
+          if (!Array.isArray(v.ids) || typeof v.at !== "number" || now - v.at > SEEN_TTL_MS) continue;
+          const ids = v.ids.filter((id): id is number => typeof id === "number").slice(-MAX_SEEN_IDS);
+          seen.set(key, { ids: new Set(ids), at: v.at, chars: typeof v.chars === "number" ? v.chars : 0 });
+        }
+        sweepSeen(now);
+      }
+    } catch {
+      /* ignore — start with an empty map */
+    }
+    currentSeen = seen;
+    currentSweep = sweepSeen;
 
     await ctx.session.hook("context", (event) => {
       try {
         if (!cfg.enabled || !cfg.autoRecall) return;
         const query = extractLatestUserText(event.messages);
         if (!query.trim()) return;
+        sweepSeen();
         const recallSessionID = typeof event.sessionID === "string" ? event.sessionID : null;
         const rows = search(requireDb(), toMatch(query, "any"), Math.max(cfg.topK * 4, 8), cfg.minScore, null).filter(
           (row) => visible(row, project, recallSessionID, cfg.recallAll),
         );
         if (rows.length === 0) return;
         const key = String(event.sessionID ?? "");
-        const used = seen.get(key) ?? new Set<number>();
+        const now = Date.now();
+        let entry = seen.get(key);
+        if (!entry) {
+          entry = { ids: new Set<number>(), at: now, chars: 0 };
+          seen.set(key, entry);
+        }
+        entry.at = now;
+        sweepSeen(now);
+        // M3: cumulative per-session cap on top of the per-request budget.
+        if (entry.chars >= cfg.budgetChars * SESSION_BUDGET_MULT) return;
+        const used = entry.ids;
         const header = "Relevant memories (local, may be stale):";
         let budget = cfg.budgetChars - header.length - 1;
         const picked: Array<{ id: number; line: string }> = [];
@@ -485,8 +598,14 @@ export default Plugin.define({
         }
         if (picked.length === 0) return;
         for (const p of picked) used.add(p.id);
-        seen.set(key, used);
+        if (used.size > MAX_SEEN_IDS) {
+          const trimmed = [...used].slice(-MAX_SEEN_IDS);
+          used.clear();
+          for (const id of trimmed) used.add(id);
+        }
         const text = `${header}\n${picked.map((p) => p.line).join("\n")}`;
+        entry.chars += text.length;
+        saveSeen();
         (event.messages as unknown as Array<{ role: string; content: Array<{ type: string; text: string }> }>).push({
           role: "system",
           content: [{ type: "text", text }],
