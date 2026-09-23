@@ -6,6 +6,10 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
+  renameSync,
+  rmSync,
+  statSync,
   writeFileSync,
 } from "fs";
 import { homedir } from "os";
@@ -14,6 +18,7 @@ import {
   RULES,
   buildAllowList,
   collectFindings,
+  isScanTruncated,
   readAllowFile,
   applyFindings,
   type AllowList,
@@ -197,6 +202,28 @@ function createAudit(cfg: ShieldConfig): {
   const hash = (value: string): string =>
     createHmac("sha256", key).update(value).digest("hex");
 
+  const MAX_AUDIT_BYTES = 5 * 1024 * 1024;
+  const MAX_ROTATED_AUDITS = 5;
+
+  // H6: rotate the audit log instead of growing it unbounded. Best-effort —
+  // auditing must never break a request.
+  const rotateAudit = (): void => {
+    try {
+      if (!existsSync(cfg.auditPath)) return;
+      if (statSync(cfg.auditPath).size < MAX_AUDIT_BYTES) return;
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+      renameSync(cfg.auditPath, join(cfg.installDir, `audit-${stamp}.jsonl`));
+      const old = readdirSync(cfg.installDir)
+        .filter((f) => f.startsWith("audit-") && f.endsWith(".jsonl"))
+        .sort();
+      for (const f of old.slice(0, Math.max(0, old.length - MAX_ROTATED_AUDITS))) {
+        rmSync(join(cfg.installDir, f));
+      }
+    } catch {
+      /* ignore rotation failures */
+    }
+  };
+
   const record = (
     findings: ReadonlyArray<Finding>,
     location: string,
@@ -223,6 +250,7 @@ function createAudit(cfg: ShieldConfig): {
     }
     try {
       mkdirSync(cfg.installDir, { recursive: true });
+      rotateAudit();
       appendFileSync(cfg.auditPath, `${lines.join("\n")}\n`, { mode: 0o600 });
     } catch {
       /* auditing must never break a request */
@@ -327,6 +355,11 @@ export default Plugin.define({
 
     /** Detect and (in redact/block) rewrite a text blob. */
     const processText = (text: string, location: string, action: string): string => {
+      // H5: oversize input is scanned head-only (see lib/redact.ts) — say so
+      // instead of silently covering just the prefix.
+      if (isScanTruncated(text)) {
+        log(`scan truncated to 2M chars at ${location} (input ${text.length} chars)`);
+      }
       const findings = collectFindings(text, location, cfg, allow);
       if (!findings.length) return text;
       audit.record(findings, location, cfg.mode === "observe" ? "detected" : action);
@@ -531,12 +564,14 @@ export default Plugin.define({
     // --- tools --------------------------------------------------------------
 
     const scanReport = (text: string): string => {
+      const truncated = isScanTruncated(text);
       const findings = collectFindings(text, "tool.secret_shield_scan", cfg, allow);
-      if (!findings.length) return "No secrets detected.";
+      const suffix = truncated ? " (input truncated to 2M chars for scan)" : "";
+      if (!findings.length) return `No secrets detected.${suffix}`;
       const lines = findings.map(
         (f) => `${f.rule} [${f.category}] offset=${f.start} length=${f.end - f.start}`,
       );
-      return `Detected ${findings.length} finding(s) (values withheld):\n${lines.join("\n")}`;
+      return `Detected ${findings.length} finding(s) (values withheld)${suffix}:\n${lines.join("\n")}`;
     };
 
     const statsReport = (): string => {

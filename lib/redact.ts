@@ -302,6 +302,10 @@ function inlineKeepFilter(text: string): (f: Finding) => boolean {
  * are de-duplicated by first-match precedence and filtered through the
  * allowlist. Linear in text length for a fixed rule set.
  */
+export function isScanTruncated(text: string): boolean {
+  return text.length > MAX_SCAN;
+}
+
 export function collectFindings(
   text: string,
   location: string,
@@ -312,16 +316,19 @@ export function collectFindings(
   const taken: Array<[number, number]> = [];
   const overlaps = (s: number, e: number): boolean =>
     taken.some(([a, b]) => s < b && e > a);
-  if (text.length > MAX_SCAN) return findings;
+  // H5: never silently skip oversize input — scan the head so secrets near
+  // the start are still caught. Callers use isScanTruncated() to surface the
+  // truncation instead of dropping everything.
+  const haystack = isScanTruncated(text) ? text.slice(0, MAX_SCAN) : text;
 
-  const lower = text.toLowerCase();
+  const lower = haystack.toLowerCase();
   const hasKeyword = KEYWORDS.some((k) => lower.includes(k));
 
   for (const rule of RULES) {
     if (rule.keyword && !hasKeyword) continue;
     rule.re.lastIndex = 0;
     let m: RegExpExecArray | null;
-    while ((m = rule.re.exec(text)) !== null) {
+    while ((m = rule.re.exec(haystack)) !== null) {
       if (m[0] === "") rule.re.lastIndex += 1;
       const range = groupRange(m, rule.group);
       if (!range) continue;
@@ -332,7 +339,7 @@ export function collectFindings(
         category: rule.category,
         start: s,
         end: e,
-        value: text.slice(s, e),
+        value: haystack.slice(s, e),
       });
       taken.push([s, e]);
     }
@@ -341,7 +348,7 @@ export function collectFindings(
   if (opts.entropy) {
     const gapRe = /[A-Za-z0-9+/=_\-]{24,}/g;
     let g: RegExpExecArray | null;
-    while ((g = gapRe.exec(text)) !== null) {
+    while ((g = gapRe.exec(haystack)) !== null) {
       const s = g.index;
       const e = s + g[0].length;
       if (overlaps(s, e)) continue;
@@ -358,7 +365,7 @@ export function collectFindings(
     }
   }
 
-  const keep = inlineKeepFilter(text);
+  const keep = inlineKeepFilter(haystack);
   return findings
     .filter((f) => !isAllowed(f, allow, location))
     .filter(keep)
