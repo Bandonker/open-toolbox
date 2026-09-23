@@ -550,6 +550,7 @@ export default Plugin.define({
     const evaluate = async (sessionID: string, failed: boolean): Promise<void> => {
       if (!cfg.enabled || inFlight.has(sessionID)) return;
       inFlight.add(sessionID);
+      const toolsRan = toolActivity.delete(sessionID);
       try {
         const st = await load(sessionID);
         if (!st || st.status !== "active") return;
@@ -620,7 +621,8 @@ export default Plugin.define({
 
         // G10: stall = no tools this turn AND the reply repeats something
         // recent (catches A/B/A/B alternation, not just exact A/A repeats).
-        const toolsRan = toolActivity.delete(sessionID);
+        // toolsRan was consumed at the top of evaluate so user-takeover and
+        // other early returns cannot leak it into the next turn (GO-1).
         const sig = signature(last.text);
         const ring = st.recentSignatures ?? [];
         if (toolsRan) {

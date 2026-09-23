@@ -394,5 +394,35 @@ async function makeHarness(options = {}) {
   await h.dispose();
 }
 
+/* ------------------------------------- GO-1: no toolActivity leak on takeover */
+
+{
+  const h = await makeHarness({ stallLimit: 10 });
+  const S = "ses_go1";
+  await h.commands.goal.execute({ sessionID: S, prompt: { text: "GO1 regression" } });
+  await waitFor(() => h.prompts.length === 1);
+
+  h.withGoalUser(S, h.assistant("m1", "same text here"));
+  h.fire("session.idle", S);
+  await sleep(40);
+  h.withGoalUser(S, h.assistant("m2", "same text here"));
+  h.fire("session.idle", S);
+  await sleep(40);
+  check("takeover setup reaches stallCount 1", (await h.goalOf(S))?.stallCount === 1);
+
+  await h.toolHooks["execute.before"]({ sessionID: S, tool: "read" });
+  const other = [{ id: "u", role: "user", content: [{ type: "text", text: "user typed something" }] },
+    h.assistant("m-takeover", "ack")];
+  h.setMessages(S, other);
+  h.fire("session.idle", S);
+  await sleep(40);
+
+  h.withGoalUser(S, h.assistant("m3", "same text here"));
+  h.fire("session.idle", S);
+  await sleep(40);
+  check("stale tool flag does not reset stall after takeover", (await h.goalOf(S))?.stallCount === 2);
+  await h.dispose();
+}
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exitCode = 1;
