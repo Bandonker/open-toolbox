@@ -189,6 +189,9 @@ type SummaryRecord = {
 
 type SessionState = {
   epoch: number;
+  /** C18: recency tick for LRU eviction + epoch/decisions reload guard. */
+  lastSeen: number;
+  loadedEpoch: boolean;
   decisions: Map<string, Decision>;
   summaries: Map<string, SummaryRecord>;
   loadedSummaries: boolean;
@@ -1252,17 +1255,37 @@ const totals = {
 };
 
 function stateFor(sessionID: string): SessionState {
+  // C18: monotonic recency tick (not wall clock) — every access strictly
+  // increases, so ties are impossible and tests are deterministic.
+  const now = ++seenClock;
   let st = sessions.get(sessionID);
-  if (!st) {
-    // C7: bound module state — summaries/recall persist through ctx.storage,
-    // so dropping the oldest idle session state is safe.
-    if (sessions.size >= 512) {
-      const oldest = sessions.keys().next();
-      if (!oldest.done) sessions.delete(oldest.value);
+  if (st) {
+    st.lastSeen = now;
+    return st;
+  }
+  // C18 (was C7): evict the least-recently-used session, not the
+  // first-inserted one, so active sessions survive eviction pressure.
+  // The victim's epoch/decisions are flushed first, making eviction lossless.
+  if (sessions.size >= 512) {
+    let stalestKey: string | undefined;
+    let stalestAt = Infinity;
+    for (const [key, entry] of sessions) {
+      if (entry.lastSeen < stalestAt) {
+        stalestAt = entry.lastSeen;
+        stalestKey = key;
+      }
     }
-    st = {
-      epoch: 0,
-      decisions: new Map(),
+    if (stalestKey !== undefined) {
+      const evicted = sessions.get(stalestKey);
+      if (evicted) flushEpoch(stalestKey, evicted);
+      sessions.delete(stalestKey);
+    }
+  }
+  st = {
+    epoch: 0,
+    lastSeen: now,
+    loadedEpoch: false,
+    decisions: new Map(),
       summaries: new Map(),
       loadedSummaries: false,
       pendingEstimate: 0,
@@ -1308,9 +1331,88 @@ function stateFor(sessionID: string): SessionState {
       collapseSavedTokens: 0,
     };
     sessions.set(sessionID, st);
-  }
+    // C18: epoch/decisions reload lazily (fire-and-forget, like summaries) —
+    // a restarted or evicted session resumes its epoch instead of repruning.
+    loadEpochInto(sessionID, st);
   return st;
 }
+
+/**
+ * C18: epoch/decisions store. Module-level because `stateFor` is module
+ * scope; `setup()` registers the ctx.storage-backed implementation, tests
+ * inject a fake. Eviction flushes through here, making it lossless.
+ */
+type EpochSnapshot = { epoch: number; decisions: Decision[] };
+const MAX_EPOCH_DECISIONS = 200;
+let seenClock = 0;
+let epochStore: {
+  load: (sessionID: string) => Promise<EpochSnapshot | undefined>;
+  save: (sessionID: string, snapshot: EpochSnapshot) => void;
+} | null = null;
+
+function sanitizeDecision(raw: unknown): Decision | null {
+  if (!isPlainObject(raw) || typeof raw.key !== "string") return null;
+  return {
+    key: raw.key,
+    reason: typeof raw.reason === "string" ? raw.reason : "",
+    origChars: num(raw.origChars),
+    savedChars: num(raw.savedChars),
+    savedTokens: num(raw.savedTokens),
+  };
+}
+
+function sanitizeEpochSnapshot(raw: unknown): EpochSnapshot | undefined {
+  if (!isPlainObject(raw)) return undefined;
+  const epoch = num(raw.epoch);
+  const decisions = Array.isArray(raw.decisions)
+    ? raw.decisions.map(sanitizeDecision).filter((d): d is Decision => d !== null).slice(-MAX_EPOCH_DECISIONS)
+    : [];
+  return { epoch: Number.isFinite(epoch) ? Math.max(0, Math.floor(epoch)) : 0, decisions };
+}
+
+function flushEpoch(sessionID: string, st: SessionState): void {
+  if (!epochStore) return;
+  try {
+    epochStore.save(sessionID, {
+      epoch: st.epoch,
+      decisions: [...st.decisions.values()].slice(-MAX_EPOCH_DECISIONS),
+    });
+  } catch {
+    /* ignore — epoch persistence is best-effort */
+  }
+}
+
+function loadEpochInto(sessionID: string, st: SessionState): void {
+  if (!epochStore || st.loadedEpoch) return;
+  st.loadedEpoch = true;
+  void epochStore
+    .load(sessionID)
+    .then((snap) => {
+      try {
+        if (!snap || sessions.get(sessionID) !== st) return;
+        const clean = sanitizeEpochSnapshot(snap);
+        if (!clean) return;
+        st.epoch = clean.epoch;
+        for (const d of clean.decisions) st.decisions.set(d.key, d);
+      } catch {
+        /* ignore */
+      }
+    })
+    .catch(() => {});
+}
+
+/** Test seam for C18 (session-state bounds + epoch persistence). */
+export const __test__ = {
+  stateFor,
+  sessionCount: (): number => sessions.size,
+  hasSession: (sessionID: string): boolean => sessions.has(sessionID),
+  resetSessions: (): void => {
+    sessions.clear();
+  },
+  setEpochStore: (store: typeof epochStore): void => {
+    epochStore = store;
+  },
+};
 
 /** Calibration is keyed per model string when the context hook has seen one. */
 const sessionModelKey = new Map<string, string>();
@@ -2061,6 +2163,14 @@ export default Plugin.define({
       }
     };
 
+    // C18: epoch/decisions survive eviction and restarts through ctx.storage
+    // (same best-effort pattern as summaries/recall). stateFor() flushes on
+    // eviction and reloads lazily on creation via this registration.
+    epochStore = {
+      save: (sid, snap) => writeStore(`epoch:${sid}`, { ...snap, at: Date.now() }),
+      load: async (sid) => sanitizeEpochSnapshot(await readStore(`epoch:${sid}`)),
+    };
+
     const persistSummaries = (sessionID: string, st: SessionState): void => {
       if (cfg.summaryKeep > 0) {
         while (st.summaries.size > cfg.summaryKeep) {
@@ -2166,6 +2276,7 @@ export default Plugin.define({
           // recomputing them every request let them flip-flop and broke the
           // byte-identical prompt prefix the provider cache relies on.
           for (const [k, v] of autoPlan) st.decisions.set(k, v);
+          flushEpoch(sessionID, st);
           const appliedStubs = applyDecisions(st.compressible, autoPlan, cfg, st.ratio, covered, st);
           if (appliedStubs.count > 0) {
             const savedStubs = appliedStubs.savedTokens;
@@ -2393,6 +2504,7 @@ export default Plugin.define({
               st.decisions = desired;
               st.epoch++;
               st.replanCount++;
+              flushEpoch(sessionID, st);
               st.lastReplan = "allowed";
               st.lastReplanShort = 0;
             }
