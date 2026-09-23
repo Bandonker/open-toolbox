@@ -17,6 +17,7 @@ import {
   isCorruption,
   latestValidBackup,
   quoteFtsQuery,
+  dbUnavailable,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
 const DB_DIR = join(homedir(), ".opencode-plugins", "codebase-index");
@@ -279,7 +280,9 @@ function writeDb<T>(fn: () => T): T {
         return result;
       } catch {}
     }
-    throw err;
+    // CR-3: never throw storage failures out of tools — every caller uses
+    // the result as tool `content`, so surface a readable message instead.
+    return dbUnavailable(err) as T;
   }
 }
 
@@ -288,9 +291,14 @@ function readDb<T>(fn: () => T): T {
     return fn();
   } catch (err) {
     if (isCorruption(err) && tryRestore()) {
-      return fn();
+      try {
+        return fn();
+      } catch (restoreErr) {
+        return dbUnavailable(restoreErr) as T;
+      }
     }
-    throw err;
+    // CR-3: never throw storage failures out of tools.
+    return dbUnavailable(err) as T;
   }
 }
 

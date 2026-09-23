@@ -11,6 +11,7 @@ import {
   isCorruption,
   parseStringArray,
   quoteFtsQuery,
+  dbUnavailable,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
 import { redactSecrets } from "../lib/redact.ts";
@@ -137,7 +138,9 @@ function withRetry<T>(fn: () => T, isWrite = false): T {
         return result;
       }
     }
-    throw err;
+    // CR-3: never throw storage failures out of tools — every caller uses
+    // the result as tool `content`, so surface a readable message instead.
+    return dbUnavailable(err) as T;
   }
 }
 

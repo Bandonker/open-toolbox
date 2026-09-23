@@ -11,6 +11,7 @@ import {
   isCorruption,
   parseStringArray,
   quoteFtsQuery,
+  dbUnavailable,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
 import { redactSecrets } from "../lib/redact.ts";
@@ -167,7 +168,9 @@ function withRetry<T>(fn: () => T, isWrite = false): T {
         return result;
       }
     }
-    throw err;
+    // CR-3: never throw storage failures out of tools — every caller uses
+    // the result as tool `content`, so surface a readable message instead.
+    return dbUnavailable(err) as T;
   }
 }
 
@@ -213,21 +216,25 @@ export default Plugin.define({
           const args = input as {
             error_text: string; context?: string; tags?: string[]; project?: string;
           };
-          const out = withRetry(() => {
-            const database = getDb();
-            const tagsJson = JSON.stringify(args.tags || []);
-            const stmt = database.prepare(
-              "INSERT INTO errors (error_text, context, tags, project) VALUES (?, ?, ?, ?)"
-            );
-            const result = stmt.run(
-              scrubStore(args.error_text),
-              args.context ? scrubStore(args.context) : null,
-              tagsJson,
-              args.project || null
-            ) as { lastInsertRowid: number | bigint };
-            return `Logged error #${result.lastInsertRowid}`;
-          }, true);
-          return { content: out };
+          try {
+            const out = withRetry(() => {
+              const database = getDb();
+              const tagsJson = JSON.stringify(args.tags || []);
+              const stmt = database.prepare(
+                "INSERT INTO errors (error_text, context, tags, project) VALUES (?, ?, ?, ?)"
+              );
+              const result = stmt.run(
+                scrubStore(args.error_text),
+                args.context ? scrubStore(args.context) : null,
+                tagsJson,
+                args.project || null
+              ) as { lastInsertRowid: number | bigint };
+              return `Logged error #${result.lastInsertRowid}`;
+            }, true);
+            return { content: out };
+          } catch (err) {
+            return { content: dbUnavailable(err) };
+          }
         },
       });
 

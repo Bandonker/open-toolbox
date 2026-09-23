@@ -9,6 +9,7 @@ import {
   applyPragmas,
   isCorruption,
   quoteFtsQuery,
+  dbUnavailable,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
 import { redactSecrets } from "../lib/redact.ts";
@@ -303,7 +304,10 @@ export default Plugin.define({
   async setup(ctx) {
     const cfg = resolveConfig(ctx.options);
     const project = projectHash(ctx.location?.directory ?? "");
-    const database = getDb();
+    // CR-3: open lazily per operation so a storage failure surfaces as tool
+    // content instead of throwing out of setup().
+    let database: AnyDatabase | null = null;
+    const requireDb = (): AnyDatabase => (database ??= getDb());
     const log = (msg: string): void => {
       if (cfg.log) console.error(`[memory] ${msg}`);
     };
@@ -323,16 +327,20 @@ export default Plugin.define({
           importance: z.number().min(0).max(10).optional().describe("0-10; higher ranks first."),
         }),
         execute: async (args, toolCtx) => {
-          const scope = resolveScope(args.scope);
-          const importance = resolveImportance(args.importance);
-          const tags = Array.isArray(args.tags) ? args.tags : [];
-          const result = remember(database, cfg, scrubStore(args.text), tags, scope, importance, project, toolCtx.sessionID ?? null);
-          log(result.created ? `remember #${result.id}` : `dedupe #${result.id}`);
-          return {
-            content: result.created
-              ? `Remembered #${result.id} [${scope}] (importance ${importance}).`
-              : `Already remembered as #${result.id} [${scope}] — bumped (use_count ${result.useCount}).`,
-          };
+          try {
+            const scope = resolveScope(args.scope);
+            const importance = resolveImportance(args.importance);
+            const tags = Array.isArray(args.tags) ? args.tags : [];
+            const result = remember(requireDb(), cfg, scrubStore(args.text), tags, scope, importance, project, toolCtx.sessionID ?? null);
+            log(result.created ? `remember #${result.id}` : `dedupe #${result.id}`);
+            return {
+              content: result.created
+                ? `Remembered #${result.id} [${scope}] (importance ${importance}).`
+                : `Already remembered as #${result.id} [${scope}] — bumped (use_count ${result.useCount}).`,
+            };
+          } catch (err) {
+            return { content: dbUnavailable(err) };
+          }
         },
       });
 
@@ -346,15 +354,19 @@ export default Plugin.define({
           all: z.boolean().optional().describe("Widen isolation: include memories from other projects/sessions (default false)."),
         }),
         execute: async (args, toolCtx) => {
-          const scope = args.scope ? resolveScope(args.scope) : null;
-          const limit = args.limit ?? cfg.topK;
-          const all = args.all === true || cfg.recallAll;
-          const sessionID = toolCtx?.sessionID ?? null;
-          const rows = search(database, toMatch(args.query, "all"), Math.max(limit * 3, limit), cfg.minScore, scope)
-            .filter((row) => visible(row, project, sessionID, all))
-            .slice(0, limit);
-          if (rows.length === 0) return { content: "No memories matched." };
-          return { content: rows.map(formatRow).join("\n") };
+          try {
+            const scope = args.scope ? resolveScope(args.scope) : null;
+            const limit = args.limit ?? cfg.topK;
+            const all = args.all === true || cfg.recallAll;
+            const sessionID = toolCtx?.sessionID ?? null;
+            const rows = search(requireDb(), toMatch(args.query, "all"), Math.max(limit * 3, limit), cfg.minScore, scope)
+              .filter((row) => visible(row, project, sessionID, all))
+              .slice(0, limit);
+            if (rows.length === 0) return { content: "No memories matched." };
+            return { content: rows.map(formatRow).join("\n") };
+          } catch (err) {
+            return { content: dbUnavailable(err) };
+          }
         },
       });
 
@@ -366,24 +378,29 @@ export default Plugin.define({
           query: z.string().min(1).optional().describe("Delete every FTS match."),
         }),
         execute: async (args) => {
-          if (typeof args.id === "number") {
-            const existing = database.prepare("SELECT id FROM memories WHERE id = ?").get(args.id) as { id: number } | null;
-            if (!existing) return { content: `No memory #${args.id}.` };
-            database.prepare("DELETE FROM memories WHERE id = ?").run(args.id);
-            return { content: `Forgot #${args.id}.` };
+          try {
+            const database = requireDb();
+            if (typeof args.id === "number") {
+              const existing = database.prepare("SELECT id FROM memories WHERE id = ?").get(args.id) as { id: number } | null;
+              if (!existing) return { content: `No memory #${args.id}.` };
+              database.prepare("DELETE FROM memories WHERE id = ?").run(args.id);
+              return { content: `Forgot #${args.id}.` };
+            }
+            if (typeof args.query === "string") {
+              const match = quoteFtsQuery(args.query);
+              if (!match) return { content: "Nothing to forget." };
+              const rows = database
+                .prepare("SELECT m.id FROM memories m JOIN memories_fts ON m.id = memories_fts.rowid WHERE memories_fts MATCH ?")
+                .all(match) as Array<{ id: number }>;
+              if (rows.length === 0) return { content: "No memories matched." };
+              const del = database.prepare("DELETE FROM memories WHERE id = ?");
+              for (const row of rows) del.run(row.id);
+              return { content: `Forgot ${rows.length} memor${rows.length === 1 ? "y" : "ies"}.` };
+            }
+            return { content: "Provide an id or a query." };
+          } catch (err) {
+            return { content: dbUnavailable(err) };
           }
-          if (typeof args.query === "string") {
-            const match = quoteFtsQuery(args.query);
-            if (!match) return { content: "Nothing to forget." };
-            const rows = database
-              .prepare("SELECT m.id FROM memories m JOIN memories_fts ON m.id = memories_fts.rowid WHERE memories_fts MATCH ?")
-              .all(match) as Array<{ id: number }>;
-            if (rows.length === 0) return { content: "No memories matched." };
-            const del = database.prepare("DELETE FROM memories WHERE id = ?");
-            for (const row of rows) del.run(row.id);
-            return { content: `Forgot ${rows.length} memor${rows.length === 1 ? "y" : "ies"}.` };
-          }
-          return { content: "Provide an id or a query." };
         },
       });
 
@@ -395,13 +412,18 @@ export default Plugin.define({
           limit: z.number().int().min(1).max(100).optional().describe("Max rows (default 20)."),
         }),
         execute: async (args) => {
-          const scope = args.scope ? resolveScope(args.scope) : null;
-          const limit = args.limit ?? 20;
-          const rows = scope
-            ? (database.prepare("SELECT * FROM memories WHERE scope = ? ORDER BY created_at DESC, id DESC LIMIT ?").all(scope, limit) as MemoryRow[])
-            : (database.prepare("SELECT * FROM memories ORDER BY created_at DESC, id DESC LIMIT ?").all(limit) as MemoryRow[]);
-          if (rows.length === 0) return { content: "No memories stored." };
-          return { content: rows.map(formatRow).join("\n") };
+          try {
+            const database = requireDb();
+            const scope = args.scope ? resolveScope(args.scope) : null;
+            const limit = args.limit ?? 20;
+            const rows = scope
+              ? (database.prepare("SELECT * FROM memories WHERE scope = ? ORDER BY created_at DESC, id DESC LIMIT ?").all(scope, limit) as MemoryRow[])
+              : (database.prepare("SELECT * FROM memories ORDER BY created_at DESC, id DESC LIMIT ?").all(limit) as MemoryRow[]);
+            if (rows.length === 0) return { content: "No memories stored." };
+            return { content: rows.map(formatRow).join("\n") };
+          } catch (err) {
+            return { content: dbUnavailable(err) };
+          }
         },
       });
 
@@ -410,16 +432,21 @@ export default Plugin.define({
         description: "Show memory totals by scope, the database path, and the active config.",
         input: z.object({}),
         execute: async () => {
-          const groups = database.prepare("SELECT scope, count(*) AS n FROM memories GROUP BY scope").all() as Array<{ scope: string; n: number }>;
-          const total = database.prepare("SELECT count(*) AS n FROM memories").get() as { n: number } | null;
-          const byScope = SCOPES.map((s) => `${s}=${groups.find((g) => g.scope === s)?.n ?? 0}`).join(" ");
-          return {
-            content: [
-              `memories: ${total?.n ?? 0} (${byScope})`,
-              `db: ${DB_PATH}`,
-              `config: scope=${cfg.scope} topK=${cfg.topK} budgetChars=${cfg.budgetChars} minScore=${cfg.minScore} autoRecall=${cfg.autoRecall} maxEntries=${cfg.maxEntries === 0 ? "unlimited" : cfg.maxEntries}`,
-            ].join("\n"),
-          };
+          try {
+            const database = requireDb();
+            const groups = database.prepare("SELECT scope, count(*) AS n FROM memories GROUP BY scope").all() as Array<{ scope: string; n: number }>;
+            const total = database.prepare("SELECT count(*) AS n FROM memories").get() as { n: number } | null;
+            const byScope = SCOPES.map((s) => `${s}=${groups.find((g) => g.scope === s)?.n ?? 0}`).join(" ");
+            return {
+              content: [
+                `memories: ${total?.n ?? 0} (${byScope})`,
+                `db: ${DB_PATH}`,
+                `config: scope=${cfg.scope} topK=${cfg.topK} budgetChars=${cfg.budgetChars} minScore=${cfg.minScore} autoRecall=${cfg.autoRecall} maxEntries=${cfg.maxEntries === 0 ? "unlimited" : cfg.maxEntries}`,
+              ].join("\n"),
+            };
+          } catch (err) {
+            return { content: dbUnavailable(err) };
+          }
         },
       });
     });
@@ -432,7 +459,7 @@ export default Plugin.define({
         const query = extractLatestUserText(event.messages);
         if (!query.trim()) return;
         const recallSessionID = typeof event.sessionID === "string" ? event.sessionID : null;
-        const rows = search(database, toMatch(query, "any"), Math.max(cfg.topK * 4, 8), cfg.minScore, null).filter(
+        const rows = search(requireDb(), toMatch(query, "any"), Math.max(cfg.topK * 4, 8), cfg.minScore, null).filter(
           (row) => visible(row, project, recallSessionID, cfg.recallAll),
         );
         if (rows.length === 0) return;

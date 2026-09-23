@@ -192,6 +192,16 @@ export function isBusy(err: unknown): boolean {
 }
 
 /**
+ * CR-3: format a storage failure as tool content instead of throwing out of
+ * a tool. Missing drivers, ENOTDIR, EACCES, and locked files must surface
+ * as a readable message so the session continues.
+ */
+export function dbUnavailable(err: unknown): string {
+  const msg = err instanceof Error ? err.message : String(err);
+  return `Storage unavailable: ${msg}`;
+}
+
+/**
  * CR-1: parse a JSON string-array cell defensively. A single corrupt row
  * must not throw out of a whole-tool read — returns [] instead.
  */
