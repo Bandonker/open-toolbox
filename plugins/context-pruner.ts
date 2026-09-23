@@ -1412,6 +1412,8 @@ export const __test__ = {
   setEpochStore: (store: typeof epochStore): void => {
     epochStore = store;
   },
+  sanitizeLabel,
+  summaryCacheKey,
 };
 
 /** Calibration is keyed per model string when the context hook has seen one. */
@@ -1894,6 +1896,30 @@ function extractProtected(text: string): { stripped: string; blocks: string[] } 
     return `[context-pruner protected #${blocks.length}]`;
   });
   return { stripped, blocks };
+}
+
+/**
+ * C19: topic/reason are caller-controlled free text that used to flow raw
+ * into the summarizer prompt (prompt injection: "ignore previous
+ * instructions", fake <material>/<protect> blocks, role prefixes) and into
+ * the summary cache key (cache fragmentation from whitespace/case/junk
+ * variants). Sanitize once; use the clean value for both prompt and key.
+ */
+const MAX_LABEL_CHARS = 200;
+function sanitizeLabel(raw: unknown): string {
+  let s = typeof raw === "string" ? raw : "";
+  s = s.replace(/[\0-\b\f-\x1f\x7f]+/g, " "); // control chars (keep \t\n for now)
+  s = s.replace(/<[^>\n]{0,64}>/g, " "); // tag-like framing: <material>, <protect>, <system>, ...
+  s = s.replace(/\b(ignore|disregard|forget)\s+(all\s+)?(previous|prior|above)\s+(instructions?|prompts?|directives?|rules?)\b/gi, " ");
+  s = s.replace(/\byou\s+are\s+now\b/gi, " ");
+  s = s.replace(/^\s*(system|assistant|user)\s*:\s*/gim, " ");
+  s = s.replace(/\s+/g, " ").trim();
+  if (s.length > MAX_LABEL_CHARS) s = s.slice(0, MAX_LABEL_CHARS).trimEnd();
+  return s;
+}
+
+function summaryCacheKey(topic: string, source: string): string {
+  return `summary:${hash32(`${VERSION}\0${sanitizeLabel(topic)}\0${source}`)}`;
 }
 
 function summaryPrompt(source: string, topic: string, reason: string, protectedBlocks: string[]): string {
@@ -2950,8 +2976,8 @@ export default Plugin.define({
       }
       if (targets.length > 40) targets = targets.slice(0, 40);
 
-      const topic = typeof args.topic === "string" ? args.topic : "";
-      const reason = typeof args.reason === "string" ? args.reason : "context limit";
+      const topic = sanitizeLabel(args.topic);
+      const reason = sanitizeLabel(args.reason) || "context limit";
 
       const rawSource = targets.map((r) => `### ${r.name}\n${r.text}`).join("\n\n");
       let protectedBlocks: string[] = [];
@@ -2965,7 +2991,7 @@ export default Plugin.define({
         source = `${source.slice(0, cfg.compressMaxSourceChars)}\n\n[truncated]`;
       }
 
-      const cacheKey = `summary:${hash32(`${VERSION}\u0000${topic}\u0000${source}`)}`;
+      const cacheKey = summaryCacheKey(topic, source);
       let body: string | undefined;
       const cached = await readStore(cacheKey);
       if (isPlainObject(cached) && typeof cached.text === "string" && cached.text) {
