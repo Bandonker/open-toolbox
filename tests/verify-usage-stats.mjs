@@ -267,6 +267,21 @@ summary = (await byName.stats_summary.execute({}, toolCtx)).content;
 check("summary reports tool calls and success rate", summary.includes("tool calls: 2 (ok 1, failed 1, 50.0% success)"));
 check("summary counts sessions", summary.includes("sessions: 1"));
 
+// legacy rows counted every started call, so calls can exceed ok + fail;
+// those leftovers surface as pending instead of tanking the success rate
+{
+  const { openDatabase: openStatsDb } = await import("../lib/sqlite.ts");
+  const tdb = openStatsDb(join(process.env.OPENCODE_USAGE_STATS_DIR, "stats.db"));
+  tdb.prepare("UPDATE lifetime SET tool_calls = tool_calls + 1").run();
+  tdb.close();
+}
+summary = (await byName.stats_summary.execute({}, toolCtx)).content;
+check(
+  "success rate is measured over completed calls, leftovers reported as pending",
+  summary.includes("tool calls: 3 (ok 1, failed 1, 1 pending, 50.0% success)"),
+  summary.split("\n").find((l) => l.includes("tool calls:")),
+);
+
 // --- pricing: list-price costs computed from the model price list -----------
 stream.push({
   type: "session.model.selected",
@@ -585,6 +600,83 @@ check(
   "/stats command refreshes the dashboard server-side",
   existsSync(dashPath) && readFileSync(dashPath, "utf8").length >= dashBefore,
 );
+
+// --- lifetime reconcile: a divergent lifetime row is healed from daily ---
+import { openDatabase as openStatsDb } from "../lib/sqlite.ts";
+const lifetimeBefore = (await byName.stats_summary.execute({}, toolCtx)).content;
+if (typeof cleanup === "function") await cleanup();
+const statsDbPath = join(process.env.OPENCODE_USAGE_STATS_DIR, "stats.db");
+const tamper = openStatsDb(statsDbPath);
+tamper.prepare("UPDATE lifetime SET cost_computed = cost_computed + 1000, cost = cost + 1000").run();
+const tampered = tamper.prepare("SELECT COALESCE(SUM(cost_computed), 0) AS s FROM lifetime").get().s;
+tamper.close();
+check("tamper step actually diverged lifetime from daily", tampered > 1000, `lifetime sum=${tampered}`);
+const toolsH = [];
+const ctxH = {
+  options: { autoRefreshSec: 0 },
+  app: ctx.app,
+  tool: {
+    transform: async (cb) => {
+      cb({ add: (t) => toolsH.push(t) });
+      return { dispose: async () => {} };
+    },
+    hook: async () => ({ dispose: async () => {} }),
+  },
+  command: { transform: async () => ({ dispose: async () => {} }) },
+  session: { prompt: async () => {}, hook: async () => ({ dispose: async () => {} }) },
+  model: ctx.model,
+  event: { subscribe: () => stream.subscribe() },
+};
+const cleanupH = await plugin.setup(ctxH);
+const byNameH = Object.fromEntries(toolsH.map((t) => [t.name, t]));
+const lifetimeAfter = (await byNameH.stats_summary.execute({}, toolCtx)).content;
+const lifetimeHead = (s) => s.split("\n").slice(0, 4).join("\n");
+check(
+  "reopen reconciles lifetime rows inside the retention window from daily",
+  lifetimeHead(lifetimeAfter) === lifetimeHead(lifetimeBefore),
+  lifetimeHead(lifetimeAfter).slice(0, 200),
+);
+if (typeof cleanupH === "function") await cleanupH();
+
+// --- legacy layout: daily with cost_computed last must reconcile by name ---
+{
+  const ldb = openStatsDb(statsDbPath);
+  const info = ldb.prepare("PRAGMA table_info(daily)").all();
+  const legacy = info.map((r) => r.name).filter((c) => c !== "cost_computed").concat(["cost_computed"]);
+  const defs = Object.fromEntries(info.map((r) => [r.name, r]));
+  ldb.exec("ALTER TABLE daily RENAME TO daily_neworder");
+  ldb.exec(
+    `CREATE TABLE daily (${legacy.map((c) => `${c} ${defs[c].type}${c === "day" ? " PRIMARY KEY" : ""}`).join(", ")})`,
+  );
+  ldb.exec(`INSERT INTO daily (${legacy.join(", ")}) SELECT ${legacy.join(", ")} FROM daily_neworder`);
+  ldb.exec("DROP TABLE daily_neworder");
+  ldb.prepare("UPDATE daily SET tool_calls = tool_calls + 5, cost_computed = cost_computed + 0.5").run();
+  ldb.close();
+}
+const toolsL = [];
+const ctxL = {
+  ...ctxH,
+  tool: {
+    transform: async (cb) => {
+      cb({ add: (t) => toolsL.push(t) });
+      return { dispose: async () => {} };
+    },
+    hook: async () => ({ dispose: async () => {} }),
+  },
+};
+const cleanupL = await plugin.setup(ctxL);
+{
+  const vdb = openStatsDb(statsDbPath);
+  const d = vdb.prepare("SELECT SUM(cost_computed) cc, SUM(tool_calls) tc FROM daily").get();
+  const l = vdb.prepare("SELECT SUM(cost_computed) cc, SUM(tool_calls) tc FROM lifetime").get();
+  vdb.close();
+  check(
+    "reconcile maps columns by name on legacy daily layouts",
+    d.cc === l.cc && d.tc === l.tc,
+    `daily=${JSON.stringify(d)} lifetime=${JSON.stringify(l)}`,
+  );
+}
+if (typeof cleanupL === "function") await cleanupL();
 
 if (typeof cleanup === "function") await cleanup();
 stream.close();

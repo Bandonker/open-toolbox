@@ -503,24 +503,23 @@ function initSchema(database: AnyDatabase): void {
       bg_cache_write INTEGER NOT NULL DEFAULT 0,
       bg_cost REAL NOT NULL DEFAULT 0
     );
-    INSERT INTO lifetime SELECT * FROM daily
-    ON CONFLICT(day) DO UPDATE SET
-      input=excluded.input,
-      output=excluded.output,
-      reasoning=excluded.reasoning,
-      cache_read=excluded.cache_read,
-      cache_write=excluded.cache_write,
-      cost=excluded.cost,
-      cost_computed=excluded.cost_computed,
-      tool_calls=excluded.tool_calls,
-      tool_ok=excluded.tool_ok,
-      tool_fail=excluded.tool_fail,
-      bg_input=excluded.bg_input,
-      bg_output=excluded.bg_output,
-      bg_reasoning=excluded.bg_reasoning,
-      bg_cache_read=excluded.bg_cache_read,
-      bg_cache_write=excluded.bg_cache_write,
-      bg_cost=excluded.bg_cost;
+    -- Reconcile: rows still inside the retention window are authoritative in
+    -- daily, so overwrite any divergent lifetime twin. (OR REPLACE, not an
+    -- ON CONFLICT upsert: INSERT ... SELECT ... ON CONFLICT misparses
+    -- because the parser reads ON as a JOIN constraint.) Days already pruned
+    -- from daily have no twin row and are preserved untouched.
+    -- Column lists are explicit on both sides: legacy databases exist where
+    -- daily carries cost_computed last (added via ALTER TABLE) while lifetime
+    -- already has it after cost, and a positional SELECT * copy shifts
+    -- tool_calls/tool_ok/tool_fail into cost_computed/tool_calls/tool_ok.
+    INSERT OR REPLACE INTO lifetime
+      (day, input, output, reasoning, cache_read, cache_write, cost,
+       cost_computed, tool_calls, tool_ok, tool_fail, bg_input, bg_output,
+       bg_reasoning, bg_cache_read, bg_cache_write, bg_cost)
+    SELECT day, input, output, reasoning, cache_read, cache_write, cost,
+       cost_computed, tool_calls, tool_ok, tool_fail, bg_input, bg_output,
+       bg_reasoning, bg_cache_read, bg_cache_write, bg_cost
+    FROM daily;
   `);
 }
 
@@ -989,7 +988,7 @@ function summaryText(database: AnyDatabase): string {
     `  cost (list price): ${fmtUsdOrDash(life.costComputed)}`,
     `  unknown models: ${fmtInt(unknownModels)} (no published pricing)`,
     `  sessions: ${sessions}`,
-    `  tool calls: ${fmtInt(tools.calls)} (ok ${fmtInt(tools.ok)}, failed ${fmtInt(tools.fail)}, ${rate.toFixed(1)}% success)`,
+    `  tool calls: ${fmtInt(tools.calls)} (ok ${fmtInt(tools.ok)}, failed ${fmtInt(tools.fail)}${pending > 0 ? `, ${fmtInt(pending)} pending` : ""}, ${rate.toFixed(1)}% success)`,
     `  background: tokens=${fmtInt(bg.total)} cost=${fmtUsd(bg.cost)} (title=${fmtInt(bg.bySource.title ?? 0)} compaction=${fmtInt(bg.bySource.compaction ?? 0)})`,
     "",
     `Usage stats — today (${day})`,
@@ -1352,7 +1351,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ["Cost (reported)", fmtShortUsd(life.cost), "c2", "USD billed by the provider"],
     ["Cost (list price)", fmtShortUsdOrDash(life.costComputed), "c2", "API-equivalent USD"],
     ["Sessions", fmtCompact(sessions), "c3", "tracked"],
-    ["Tool calls", fmtCompact(tools.calls), "c4", `${fmtCompact(tools.ok)} ok · ${fmtCompact(tools.fail)} failed`],
+    ["Tool calls", fmtCompact(tools.calls), "c4", `${fmtCompact(tools.ok)} ok · ${fmtCompact(tools.fail)} failed${pending > 0 ? ` · ${fmtCompact(pending)} pending` : ""}`],
     ["Success rate", `${rate.toFixed(1)}%`, "c5", "completed calls"],
     ["Background", fmtCompact(bg.total), "c6", `${fmtShortUsd(bg.cost)} title + compaction`],
   ];
