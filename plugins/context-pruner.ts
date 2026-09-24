@@ -544,7 +544,7 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
   );
 
   const charsPerToken = num(pick("charsPerToken", "OPENCODE_CONTEXT_PRUNER_CHARS_PER_TOKEN"), 3.6);
-  const keepHeadChars = asInt(pick("keepHeadChars", "OPENCODE_CONTEXT_PRUNER_KEEP_HEAD"), 400, 0, 100000);
+  const keepHeadChars = asInt(pick("keepHeadChars", "OPENCODE_CONTEXT_PRUNER_KEEP_HEAD"), 200, 0, 100000);
   const keepRecent = asInt(pick("keepRecent", "OPENCODE_CONTEXT_PRUNER_KEEP_RECENT"), 6, 0, 10000);
   // Prose (assistant/user text) is only eligible when compressText is on; the
   // most recent N prose parts stay untouched so the live reasoning is kept.

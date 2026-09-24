@@ -137,7 +137,7 @@ assert.equal(t.compilePatterns(["a.c"])[0].test("abc"), true, "compiled pattern 
 // CP-12: fire-and-forget auto-summarize must not surface unhandled rejections
 // (throws before its inner try would reject the void promise).
 assert.ok(
-  prunerSrc.includes("void maybeAutoSummarize(sessionID, st, rawEstimate).catch("),
+  prunerSrc.includes("void maybeAutoSummarize(sessionID, st, rawEstimate, turnAuto).catch("),
   "CP-12: void maybeAutoSummarize must carry a catch",
 );
 

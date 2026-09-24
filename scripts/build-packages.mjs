@@ -89,7 +89,7 @@ const PACKAGES = [
       ["OPENCODE_CONTEXT_PRUNER_ENABLED", "true", "Turn pruning off without uninstalling"],
       ["OPENCODE_CONTEXT_PRUNER_KEEP_RECENT", "6", "Most-recent tool results to leave untouched"],
       ["OPENCODE_CONTEXT_PRUNER_MIN_CHARS", "2000", "Only prune results longer than this"],
-      ["OPENCODE_CONTEXT_PRUNER_KEEP_HEAD", "400", "Chars of the result kept as a preview"],
+      ["OPENCODE_CONTEXT_PRUNER_KEEP_HEAD", "200", "Chars of the result kept as a preview"],
       ["OPENCODE_CONTEXT_PRUNER_KEEP_ERRORS", "true", "Never prune error results"],
       ["OPENCODE_CONTEXT_PRUNER_IGNORE", "context_pruner_stats", "Comma-separated tools to never prune"],
       ["OPENCODE_CONTEXT_PRUNER_LOG", "false", "Log each prune to stderr"],
