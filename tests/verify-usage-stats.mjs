@@ -368,11 +368,31 @@ check(
   new RegExp(`<title>\\d{4}-\\d{2}-\\d{2}: 7615 tokens\\n  input=4165 output=1040 reasoning=100 cache_read=2007 cache_write=303`).test(html),
 );
 check(
-  "model table includes a working client-side filter",
-  html.includes('id="model-filter"') &&
+  "model table includes searchable multi-select controls",
+  html.includes('id="model-filter-search"') &&
+    html.includes('type="search"') &&
+    html.includes('id="model-filter" multiple') &&
+    html.includes('id="model-filter-all"') &&
+    html.includes('id="model-filter-clear"') &&
+    html.includes('data-search="anthropic/claude-sonnet-4 anthropic"') &&
     html.includes('id="models-table"') &&
-    html.includes('data-model="anthropic/claude-sonnet-4"') &&
-    html.includes('select.addEventListener("change",apply)'),
+    html.includes('data-model="anthropic/claude-sonnet-4"'),
+);
+check(
+  "model filter script supports search, multi-select, and select-all/clear actions",
+  html.includes('search.addEventListener("input",apply)') &&
+    html.includes('select.addEventListener("change",function()') &&
+    html.includes('all.addEventListener("click"') &&
+    html.includes('clear.addEventListener("click"') &&
+    html.includes('var selectedValues=new Set();') &&
+    html.includes('var selectedSet=new Set(selected);') &&
+    html.includes('selectedValues.add(option.value)') &&
+    html.includes('selectedValues.delete(option.value)') &&
+    html.includes('select.textContent="";select.appendChild(fragment);'),
+);
+check(
+  "model filter reports an empty search result",
+  html.includes('id="model-filter-empty"') && html.includes("No models match"),
 );
 check("dashboard HTML is self-contained (no external script/CDN)", !html.includes("<script src") && !html.includes("http://") && !html.includes("https://"));
 check(

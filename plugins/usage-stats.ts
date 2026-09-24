@@ -1608,14 +1608,16 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
   const modelOptions = modelRecords
     .map((r) => {
       const model = String(r.model ?? "unknown");
-      return `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`;
+      const slash = model.indexOf("/");
+      const provider = slash >= 0 ? model.slice(0, slash) : "";
+      return `<option value="${escapeHtml(model)}" data-search="${escapeHtml(`${model} ${provider}`)}">${escapeHtml(model)}</option>`;
     })
     .join("");
   const modelFilterHtml = [
     `<div class="model-filter">`,
-    `<label for="model-filter">Filter models</label>`,
-    `<select id="model-filter"><option value="">All models</option>${modelOptions}</select>`,
-    `<span id="model-filter-status" class="muted" aria-live="polite">${fmtInt(modelRecords.length)} models</span>`,
+    `<label class="model-filter-field" for="model-filter-search"><span>Search models</span><input id="model-filter-search" type="search" autocomplete="off" placeholder="Model or provider" /></label>`,
+    `<label class="model-filter-field" for="model-filter"><span>Selected models</span><select id="model-filter" multiple size="5">${modelOptions}</select></label>`,
+    `<div class="model-filter-actions"><button type="button" id="model-filter-all">Select all</button><button type="button" id="model-filter-clear">Clear</button><span id="model-filter-status" class="muted" aria-live="polite">${fmtInt(modelRecords.length)} models</span><span id="model-filter-empty" class="muted" hidden>No models match</span></div>`,
     `</div>`,
   ].join("");
 
@@ -1723,10 +1725,17 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ".tbl thead th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-3);font-weight:700;border-bottom:1px solid var(--ink)}",
     ".tbl td.num,.tbl th.num{text-align:right;white-space:nowrap}",
     ".tbl tbody tr:last-child td{border-bottom:0}",
-    ".model-filter{display:flex;align-items:center;gap:var(--space-2xs);flex-wrap:wrap;margin:0 0 var(--space-s)}",
-    ".model-filter label{font-size:var(--step--1);text-transform:uppercase;letter-spacing:.06em;color:var(--ink-3)}",
-    ".model-filter select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:0;padding:var(--space-3xs) var(--space-2xs);min-width:12rem;max-width:100%}",
-    ".model-filter .muted{font-size:var(--step--1)}",
+    ".model-filter{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.5fr);align-items:start;gap:var(--space-s);margin:0 0 var(--space-s)}",
+    ".model-filter-field{display:grid;gap:var(--space-3xs);min-width:0}",
+    ".model-filter-field span{font-size:var(--step--1);text-transform:uppercase;letter-spacing:.06em;color:var(--ink-2)}",
+    ".model-filter input,.model-filter select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--ink-2);border-radius:0;padding:var(--space-3xs) var(--space-2xs);min-width:0}",
+    ".model-filter input{width:100%}",
+    ".model-filter select{width:100%;min-height:7rem}",
+    ".model-filter-actions{grid-column:1/-1;display:flex;align-items:center;gap:var(--space-2xs);flex-wrap:wrap;padding-bottom:var(--space-3xs)}",
+    ".model-filter-actions button{font:inherit;color:var(--ink);background:transparent;border:1px solid var(--ink);border-radius:0;padding:var(--space-3xs) var(--space-2xs);cursor:pointer}",
+    ".model-filter-actions button:hover,.model-filter-actions button:focus-visible{background:var(--ink);color:var(--surface)}",
+    ".model-filter .muted{font-size:var(--step--1);color:var(--ink-2)}",
+    "@media (max-width:60em){.model-filter{grid-template-columns:1fr}.model-filter-actions{padding-bottom:0}}",
     ".bg-panel{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--surface);padding:var(--space-s) var(--space-m);border-top:2px solid var(--ink)}",
     "p.sub{max-width:68ch}",
     ":focus-visible{outline:2px solid var(--accent);outline-offset:2px}",
@@ -1736,13 +1745,25 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
   const modelFilterScript = [
     `<script>`,
     `(function(){`,
+    `var search=document.getElementById("model-filter-search");`,
     `var select=document.getElementById("model-filter");`,
+    `var all=document.getElementById("model-filter-all");`,
+    `var clear=document.getElementById("model-filter-clear");`,
     `var status=document.getElementById("model-filter-status");`,
+    `var empty=document.getElementById("model-filter-empty");`,
     `var table=document.getElementById("models-table");`,
-    `if(!select||!status||!table)return;`,
+    `if(!search||!select||!all||!clear||!status||!empty||!table)return;`,
     `var rows=Array.prototype.slice.call(table.querySelectorAll("tbody tr[data-model]"));`,
-    `function apply(){var selected=select.value;var visible=0;rows.forEach(function(row){var match=!selected||row.getAttribute("data-model")===selected;row.hidden=!match;if(match)visible++;});status.textContent=selected?(visible===1?"1 model shown":visible+" models shown"):(visible===1?"1 model":visible+" models");}`,
-    `select.addEventListener("change",apply);`,
+    `var allOptions=Array.prototype.slice.call(select.options);`,
+    `var selectedValues=new Set();`,
+    `function matchesOption(option,query){return !query||(option.getAttribute("data-search")||"").toLowerCase().indexOf(query)>=0;}`,
+    `function updateOptions(){var query=search.value.trim().toLowerCase();var fragment=document.createDocumentFragment();var matches=0;allOptions.forEach(function(option){if(!matchesOption(option,query))return;matches++;option.selected=selectedValues.has(option.value);option.disabled=false;fragment.appendChild(option);});select.textContent="";select.appendChild(fragment);return matches;}`,
+    `function selectedModels(){return Array.from(selectedValues);}`,
+    `function apply(){var query=search.value.trim().toLowerCase();var matches=updateOptions();var selected=selectedModels();var selectedSet=new Set(selected);var visible=0;rows.forEach(function(row){var match=selected.length===0||selectedSet.has(row.getAttribute("data-model"));row.hidden=!match;if(match)visible++;});var noResults=query!==""&&matches===0;empty.hidden=!noResults;status.textContent=noResults?"No models match":selected.length?(selected.length+" of "+allOptions.length+" models selected"):(visible===1?"1 model":visible+" models");}`,
+    `search.addEventListener("input",apply);`,
+    `select.addEventListener("change",function(){Array.prototype.slice.call(select.options).forEach(function(option){if(option.selected)selectedValues.add(option.value);else selectedValues.delete(option.value);});apply();});`,
+    `all.addEventListener("click",function(){var query=search.value.trim().toLowerCase();allOptions.forEach(function(option){if(matchesOption(option,query))selectedValues.add(option.value);});apply();});`,
+    `clear.addEventListener("click",function(){selectedValues.clear();apply();});`,
     `apply();`,
     `})();`,
     `</script>`,
