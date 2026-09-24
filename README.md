@@ -323,9 +323,12 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 **The dashboard.** `stats_dashboard` (and `/stats`) writes a self-contained HTML
 report to `~/.opencode-plugins/usage-stats/dashboard.html` — a GitHub-style
 activity heatmap, a 30-day bar chart, top-tools and per-model tables, and a
-separate background (title/compaction) section. It has no JavaScript, no CDN and
-no network access; it auto-switches light/dark with your OS theme, and reloads
-itself every `autoRefreshSec` so it stays current **without spending any model
+separate background (title/compaction) section. Hovering an activity day shows
+its token categories, tool calls, model usage and cost; hovering a bar shows
+its exact token total; and the Models table can be filtered by model. It has
+no external scripts, CDN or network access; a small inline script powers the
+model filter, it auto-switches light/dark with your OS theme, and reloads itself
+every `autoRefreshSec` so it stays current **without spending any model
 tokens** (the plugin runs in the server process, not the model).
 
 **Cost is computed from the provider's real price list.** The plugin reads each

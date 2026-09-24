@@ -355,7 +355,26 @@ check(
   html.includes("<!-- heatmap -->") && html.includes("<!-- bar-chart -->") && html.includes("<!-- background -->"),
 );
 check("dashboard HTML shows lifetime totals", html.includes("190") && html.includes("anthropic/claude-sonnet-4"));
-check("dashboard HTML is self-contained (no script/CDN)", !html.includes("<script") && !html.includes("http://") && !html.includes("https://"));
+check(
+  "activity hover includes per-day tokens, tools, and model details",
+  html.includes("Tokens: 7615 total") &&
+    html.includes("Tools: 2 calls (1 ok, 1 failed)") &&
+    html.includes("Models: 4 used") &&
+    html.includes("anthropic/claude-sonnet-4: 200 tokens") &&
+    html.includes("acme/pricey: 4900 tokens"),
+);
+check(
+  "bar hover includes the exact token total for its day",
+  new RegExp(`<title>\\d{4}-\\d{2}-\\d{2}: 7615 tokens\\n  input=4165 output=1040 reasoning=100 cache_read=2007 cache_write=303`).test(html),
+);
+check(
+  "model table includes a working client-side filter",
+  html.includes('id="model-filter"') &&
+    html.includes('id="models-table"') &&
+    html.includes('data-model="anthropic/claude-sonnet-4"') &&
+    html.includes('select.addEventListener("change",apply)'),
+);
+check("dashboard HTML is self-contained (no external script/CDN)", !html.includes("<script src") && !html.includes("http://") && !html.includes("https://"));
 check(
   "dashboard shows reported vs list-price KPI cards",
   html.includes("Cost (reported)") && html.includes("Cost (list price)"),
@@ -434,7 +453,7 @@ const html2 = readFileSync(dashPath, "utf8");
 check("autoRefreshSec=0 omits the refresh meta", !html2.includes('<meta http-equiv="refresh"'));
 check(
   "dashboard stays self-contained with refresh off",
-  !html2.includes("<script") && !html2.includes("http://") && !html2.includes("https://"),
+  !html2.includes("<script src") && !html2.includes("http://") && !html2.includes("https://"),
 );
 if (typeof cleanup2 === "function") await cleanup2();
 

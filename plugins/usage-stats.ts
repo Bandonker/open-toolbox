@@ -24,8 +24,9 @@ import { openDatabase, applyPragmas, type AnyDatabase } from "../lib/sqlite.ts";
  *   - tool `execute.before` / `execute.after` hooks count calls, outcomes and
  *     durations per tool.
  *
- * The dashboard is a self-contained HTML file (inline SVG/CSS, no CDN, no
- * script) written to `<dir>/dashboard.html`. There is no way to open a browser
+ * The dashboard is a self-contained HTML file (inline SVG/CSS and a small
+ * inline model-filter script; no CDN or external assets) written to
+ * `<dir>/dashboard.html`. There is no way to open a browser
  * from a plugin, so tools return the path for the user to open.
  */
 
@@ -444,6 +445,29 @@ function initSchema(database: AnyDatabase): void {
       total_ms INTEGER NOT NULL DEFAULT 0,
       max_ms INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS daily_models (
+      day TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input INTEGER NOT NULL DEFAULT 0,
+      output INTEGER NOT NULL DEFAULT 0,
+      reasoning INTEGER NOT NULL DEFAULT 0,
+      cache_read INTEGER NOT NULL DEFAULT 0,
+      cache_write INTEGER NOT NULL DEFAULT 0,
+      cost REAL NOT NULL DEFAULT 0,
+      cost_computed REAL,
+      events INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, model)
+    );
+    CREATE TABLE IF NOT EXISTS daily_tools (
+      day TEXT NOT NULL,
+      tool TEXT NOT NULL,
+      calls INTEGER NOT NULL DEFAULT 0,
+      succeeded INTEGER NOT NULL DEFAULT 0,
+      failed INTEGER NOT NULL DEFAULT 0,
+      total_ms INTEGER NOT NULL DEFAULT 0,
+      max_ms INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, tool)
+    );
     CREATE TABLE IF NOT EXISTS sources (
       source TEXT PRIMARY KEY,
       count INTEGER NOT NULL DEFAULT 0,
@@ -561,6 +585,8 @@ function prune(state: UsageState, cfg: Config, force: boolean): void {
     const database = state.db;
     if (!database) return;
     database.prepare("DELETE FROM daily WHERE day < ?").run(cutoff);
+    database.prepare("DELETE FROM daily_models WHERE day < ?").run(cutoff);
+    database.prepare("DELETE FROM daily_tools WHERE day < ?").run(cutoff);
     // U1: never prune session_state rows that hold cumulative usage — a
     // resumed session would otherwise re-add its entire lifetime as one
     // delta (double counting everything). Only rows with no recorded
@@ -682,6 +708,32 @@ function addModelUsage(
     .run(model, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost, events, costComputed);
 }
 
+function addDailyModelUsage(
+  database: AnyDatabase,
+  day: string,
+  model: string,
+  t: Tokens,
+  cost: number,
+  events: number,
+  costComputed: number | null,
+): void {
+  database
+    .prepare(
+      `INSERT INTO daily_models(day, model, input, output, reasoning, cache_read, cache_write, cost, events, cost_computed)
+       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(day, model) DO UPDATE SET
+         input = input + excluded.input,
+         output = output + excluded.output,
+         reasoning = reasoning + excluded.reasoning,
+         cache_read = cache_read + excluded.cache_read,
+         cache_write = cache_write + excluded.cache_write,
+         cost = cost + excluded.cost,
+         events = events + excluded.events,
+         cost_computed = CASE WHEN excluded.cost_computed IS NULL THEN cost_computed ELSE COALESCE(cost_computed, 0) + excluded.cost_computed END`,
+    )
+    .run(day, model, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost, events, costComputed);
+}
+
 /**
  * US-3: background usage must also land in model_totals (with a computed
  * list-price cost) — otherwise cost_computed is never written for it and
@@ -730,7 +782,9 @@ function addBackgroundUsage(
   // list-price cost — without this, cost_computed is never written for
   // background traffic and per-model totals miss it entirely.
   const model = state.sessionModels.get(sessionID) ?? loadSession(database, sessionID)?.model ?? "unknown";
-  addModelUsage(database, model, t, cost, 1, computedCost(model, t, state));
+  const modelCost = computedCost(model, t, state);
+  addModelUsage(database, model, t, cost, 1, modelCost);
+  addDailyModelUsage(database, day, model, t, cost, 1, modelCost);
 }
 
 function recordUsageUpdated(
@@ -783,6 +837,7 @@ function recordUsageUpdated(
     if (changed) {
       addDailyUsage(database, day, delta, deltaCost, deltaComputed);
       addModelUsage(database, model, delta, deltaCost, 1, deltaComputed);
+      addDailyModelUsage(database, day, model, delta, deltaCost, 1, deltaComputed);
     }
     database
       .prepare(
@@ -841,8 +896,24 @@ function rememberModel(state: UsageState, sessionID: string, model: string): voi
   }
 }
 
+function addDailyToolUsage(database: AnyDatabase, day: string, tool: string, ok: boolean, durationMs: number): void {
+  database
+    .prepare(
+      `INSERT INTO daily_tools(day, tool, calls, succeeded, failed, total_ms, max_ms)
+       VALUES(?, ?, 1, ?, ?, ?, ?)
+       ON CONFLICT(day, tool) DO UPDATE SET
+         calls = calls + 1,
+         succeeded = succeeded + excluded.succeeded,
+         failed = failed + excluded.failed,
+         total_ms = total_ms + excluded.total_ms,
+         max_ms = MAX(max_ms, excluded.max_ms)`,
+    )
+    .run(day, tool, ok ? 1 : 0, ok ? 0 : 1, durationMs, durationMs);
+}
+
 function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durationMs: number, state: UsageState): void {
   const ms = Math.max(0, Math.round(durationMs));
+  const day = dayKey();
   // U3: both rollups are written atomically; U2: the daily increment is
   // mirrored into the never-pruned lifetime rollup.
   database.exec("BEGIN TRANSACTION");
@@ -859,6 +930,7 @@ function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durati
            max_ms = MAX(max_ms, excluded.max_ms)`,
       )
       .run(tool, ok ? 1 : 0, ok ? 0 : 1, ms, ms);
+    addDailyToolUsage(database, day, tool, ok, ms);
     for (const table of ["daily", "lifetime"] as const) {
       database
         .prepare(
@@ -869,7 +941,7 @@ function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durati
              tool_ok = tool_ok + excluded.tool_ok,
              tool_fail = tool_fail + excluded.tool_fail`,
         )
-        .run(dayKey(), ok ? 1 : 0, ok ? 0 : 1);
+        .run(day, ok ? 1 : 0, ok ? 0 : 1);
     }
     database.exec("COMMIT");
   } catch (err) {
@@ -1103,7 +1175,7 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 const DOWS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const HEAT_CHARS = ["·", "░", "▒", "▓", "█"];
 
-type HeatCell = { day: string; value: number; inRange: boolean };
+type HeatCell = { day: string; value: number; inRange: boolean; row: DayRow | null };
 type HeatGrid = {
   weeks: number;
   metric: HeatMetric;
@@ -1159,7 +1231,7 @@ function heatmapGrid(
         max = Math.max(max, value);
         total += value;
       }
-      cells.push({ day: key, value, inRange });
+      cells.push({ day: key, value, inRange, row: r ?? null });
     }
     const first = shiftDays(startSunday, col * 7);
     // Month labels sit in a single 12px column but render ~18px wide, so
@@ -1174,6 +1246,124 @@ function heatmapGrid(
     columns.push(cells);
   }
   return { weeks, metric, max, total, columns, months, start: startSunday, end: todayMid };
+}
+
+type DayModelUsage = UsageTotals & { model: string; events: number };
+type DayToolUsage = {
+  tool: string;
+  calls: number;
+  succeeded: number;
+  failed: number;
+  avgMs: number;
+  maxMs: number;
+};
+type DayBreakdown = { models: DayModelUsage[]; tools: DayToolUsage[] };
+
+function dayBreakdowns(database: AnyDatabase, grid: HeatGrid): Map<string, DayBreakdown> {
+  const start = dayKey(grid.start);
+  const end = dayKey(grid.end);
+  const result = new Map<string, DayBreakdown>();
+  const ensure = (day: string): DayBreakdown => {
+    let breakdown = result.get(day);
+    if (!breakdown) {
+      breakdown = { models: [], tools: [] };
+      result.set(day, breakdown);
+    }
+    return breakdown;
+  };
+  const models = database
+    .prepare(
+      `SELECT day, model, input, output, reasoning, cache_read, cache_write, cost, cost_computed, events
+       FROM daily_models
+       WHERE day >= ? AND day <= ?
+       ORDER BY day ASC, (input + output + reasoning + cache_read + cache_write) DESC, model ASC`,
+    )
+    .all(start, end) as Array<Record<string, unknown>>;
+  for (const row of models) {
+    const totals = totalsOf(row);
+    ensure(String(row.day ?? "")).models.push({
+      model: String(row.model ?? "unknown"),
+      ...totals,
+      events: num(row.events),
+    });
+  }
+  const tools = database
+    .prepare(
+      `SELECT day, tool, calls, succeeded, failed, total_ms, max_ms
+       FROM daily_tools
+       WHERE day >= ? AND day <= ?
+       ORDER BY day ASC, calls DESC, tool ASC`,
+    )
+    .all(start, end) as Array<Record<string, unknown>>;
+  for (const row of tools) {
+    const calls = num(row.calls);
+    ensure(String(row.day ?? "")).tools.push({
+      tool: String(row.tool ?? "unknown"),
+      calls,
+      succeeded: num(row.succeeded),
+      failed: num(row.failed),
+      avgMs: calls > 0 ? num(row.total_ms) / calls : 0,
+      maxMs: num(row.max_ms),
+    });
+  }
+  return result;
+}
+
+function tokenBreakdownText(t: UsageTotals): string {
+  return `input=${fmtInt(t.input)} output=${fmtInt(t.output)} reasoning=${fmtInt(t.reasoning)} cache_read=${fmtInt(t.cacheRead)} cache_write=${fmtInt(t.cacheWrite)}`;
+}
+
+function heatmapDayTitle(
+  row: DayRow,
+  metric: HeatMetric,
+  includeBackground: boolean,
+  breakdown: DayBreakdown | undefined,
+): string {
+  const background: UsageTotals = {
+    input: row.bg_input,
+    output: row.bg_output,
+    reasoning: row.bg_reasoning,
+    cacheRead: row.bg_cache_read,
+    cacheWrite: row.bg_cache_write,
+    cost: row.bg_cost,
+    costComputed: null,
+  };
+  const displayed: UsageTotals = includeBackground
+    ? {
+        input: row.input + background.input,
+        output: row.output + background.output,
+        reasoning: row.reasoning + background.reasoning,
+        cacheRead: row.cacheRead + background.cacheRead,
+        cacheWrite: row.cacheWrite + background.cacheWrite,
+        cost: row.cost + background.cost,
+        costComputed: row.costComputed,
+      }
+    : row;
+  const lines = [
+    `${row.day} — ${heatCellLabel(metricValue(row, metric, includeBackground), metric)} ${metric}`,
+    `Tokens: ${fmtInt(tokenTotal(displayed))} total`,
+    `  ${tokenBreakdownText(displayed)}`,
+  ];
+  if (includeBackground && tokenTotal(background) > 0) {
+    lines.push(`Background: ${fmtInt(tokenTotal(background))} tokens (${tokenBreakdownText(background)})`);
+  }
+  lines.push(`Tools: ${fmtInt(row.tool_calls)} calls (${fmtInt(row.tool_ok)} ok, ${fmtInt(row.tool_fail)} failed)`);
+  for (const tool of breakdown?.tools ?? []) {
+    lines.push(
+      `  ${tool.tool}: ${fmtInt(tool.calls)} calls (${fmtInt(tool.succeeded)} ok, ${fmtInt(tool.failed)} failed), avg ${Math.round(tool.avgMs)}ms, max ${fmtInt(tool.maxMs)}ms`,
+    );
+  }
+  lines.push(`Models: ${breakdown?.models.length ?? 0} used`);
+  for (const model of breakdown?.models ?? []) {
+    lines.push(
+      `  ${model.model}: ${fmtInt(tokenTotal(model))} tokens (${tokenBreakdownText(model)}), ${fmtInt(model.events)} events, cost ${fmtUsd(model.cost)}${model.costComputed === null ? "" : ` (list ${fmtUsd(model.costComputed)})`}`,
+    );
+  }
+  if ((breakdown?.models.length ?? 0) === 0) {
+    lines.push("  No per-model history was recorded for this day.");
+  }
+  lines.push(`Cost: ${fmtUsd(displayed.cost)} reported${includeBackground && row.bg_cost > 0 ? ` (including ${fmtUsd(row.bg_cost)} background)` : ""}`);
+  return lines.join("\n");
 }
 
 function heatmapText(database: AnyDatabase, weeks: number, metric: HeatMetric, includeBackground: boolean): string {
@@ -1207,7 +1397,11 @@ function heatCellLabel(value: number, metric: HeatMetric): string {
   return metric === "cost" ? fmtShortUsd(value) : fmtCompact(value);
 }
 
-function buildHeatmapHtml(grid: HeatGrid): string {
+function buildHeatmapHtml(
+  grid: HeatGrid,
+  breakdowns: Map<string, DayBreakdown>,
+  includeBackground: boolean,
+): string {
   const cells: string[] = [];
   for (let col = 0; col < grid.weeks; col++) {
     for (let row = 0; row < 7; row++) {
@@ -1215,8 +1409,10 @@ function buildHeatmapHtml(grid: HeatGrid): string {
       if (!cell) continue;
       const level = cell.inRange ? heatLevel(cell.value, grid.max) : 0;
       const cls = cell.inRange ? `hm-cell ${HEAT_COLORS[level]}` : "hm-cell hm-out";
-      const title = `${cell.day}: ${heatCellLabel(cell.value, grid.metric)} ${grid.metric}`;
-      cells.push(`<span class="${cls}" title="${escapeHtml(title)}"></span>`);
+      const title = cell.inRange && cell.row
+        ? heatmapDayTitle(cell.row, grid.metric, includeBackground, breakdowns.get(cell.day))
+        : `${cell.day}: no usage recorded`;
+      cells.push(`<span class="${cls}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"></span>`);
     }
   }
   const monthSpans = grid.months
@@ -1274,12 +1470,23 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean, metric: H
       const x = padL + i * step + (step - barW) / 2;
       const y = padT + plotH - bh;
       const rx = Math.min(3, barW / 2);
-      const barTitle =
-        metric === "cost"
-          ? `${r.day}: ${fmtShortUsd(v)}`
-          : metric === "calls"
-            ? `${r.day}: ${fmtInt(v)} tool calls`
-            : `${r.day}: ${fmtInt(v)} tokens`;
+      const backgroundTokens = r.bg_input + r.bg_output + r.bg_reasoning + r.bg_cache_read + r.bg_cache_write;
+      const barTokens = tokenTotal(r) + (includeBackground ? backgroundTokens : 0);
+      const barTitle = [
+        `${r.day}: ${fmtInt(barTokens)} tokens`,
+        `  ${tokenBreakdownText(includeBackground ? {
+          input: r.input + r.bg_input,
+          output: r.output + r.bg_output,
+          reasoning: r.reasoning + r.bg_reasoning,
+          cacheRead: r.cacheRead + r.bg_cache_read,
+          cacheWrite: r.cacheWrite + r.bg_cache_write,
+          cost: 0,
+          costComputed: null,
+        } : r)}`,
+        ...(metric === "tokens"
+          ? []
+          : [metric === "cost" ? `  ${heatCellLabel(v, "cost")} cost` : `  ${fmtInt(v)} tool calls`]),
+      ].join("\n");
       return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${bh}" rx="${rx.toFixed(1)}" class="bar"><title>${escapeHtml(barTitle)}</title></rect>`;
     })
     .join("");
@@ -1305,7 +1512,12 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean, metric: H
   ].join("");
 }
 
-function tableHtml(headers: string[], rows: Cell[][]): string {
+function tableHtml(
+  headers: string[],
+  rows: Cell[][],
+  rowAttributes: Array<string | undefined> = [],
+  tableId?: string,
+): string {
   const cell = (c: Cell, tag: "th" | "td", num: boolean): string => {
     const cls = num ? ' class="num"' : "";
     return typeof c === "string"
@@ -1315,9 +1527,15 @@ function tableHtml(headers: string[], rows: Cell[][]): string {
   const head = headers.map((x, i) => cell(x, "th", i > 0)).join("");
   const body =
     rows.length > 0
-      ? rows.map((r) => `<tr>${r.map((c, i) => cell(c, "td", i > 0)).join("")}</tr>`).join("")
+      ? rows
+          .map((r, rowIndex) => {
+            const attrs = rowAttributes[rowIndex] ? ` ${rowAttributes[rowIndex]}` : "";
+            return `<tr${attrs}>${r.map((c, i) => cell(c, "td", i > 0)).join("")}</tr>`;
+          })
+          .join("")
       : `<tr><td colspan="${headers.length}" class="muted">No data yet</td></tr>`;
-  return `<div class="tbl-wrap"><table class="tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+  const idAttribute = tableId ? ` id="${escapeHtml(tableId)}"` : "";
+  return `<div class="tbl-wrap"><table${idAttribute} class="tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
 type AppInfo = { name?: string; version?: string; channel?: string };
@@ -1334,6 +1552,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
   const sessions = countSessions(database);
   const bg = backgroundTotals(database);
   const grid = heatmapGrid(database, cfg.heatmapWeeks, cfg.heatmapMetric, cfg.includeBackground);
+  const breakdowns = dayBreakdowns(database, grid);
   const recent = dailyRows(database, dayKey(shiftDays(new Date(), -29)));
   // Success rate is measured over completed calls (ok + fail). Older rows
   // counted every started call, so `calls` can exceed completed; those
@@ -1359,14 +1578,13 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ];
   });
 
-  const modelRows = (
-    database
-      .prepare(
-        `SELECT * FROM model_totals
-         ORDER BY (input + output + reasoning + cache_read + cache_write) DESC, model ASC LIMIT 20`,
-      )
-      .all() as Array<Record<string, unknown>>
-  ).map((r) => {
+  const modelRecords = database
+    .prepare(
+      `SELECT * FROM model_totals
+       ORDER BY (input + output + reasoning + cache_read + cache_write) DESC, model ASC`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  const modelRows = modelRecords.map((r) => {
     const t = totalsOf(r);
     const model = String(r.model);
     const slash = model.indexOf("/");
@@ -1384,6 +1602,22 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
       compactCell(num(r.events)),
     ];
   });
+  const modelAttributes = modelRecords.map(
+    (r) => `data-model="${escapeHtml(String(r.model ?? "unknown"))}"`,
+  );
+  const modelOptions = modelRecords
+    .map((r) => {
+      const model = String(r.model ?? "unknown");
+      return `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`;
+    })
+    .join("");
+  const modelFilterHtml = [
+    `<div class="model-filter">`,
+    `<label for="model-filter">Filter models</label>`,
+    `<select id="model-filter"><option value="">All models</option>${modelOptions}</select>`,
+    `<span id="model-filter-status" class="muted" aria-live="polite">${fmtInt(modelRecords.length)} models</span>`,
+    `</div>`,
+  ].join("");
 
   const sourceRows = (
     database
@@ -1489,10 +1723,29 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ".tbl thead th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-3);font-weight:700;border-bottom:1px solid var(--ink)}",
     ".tbl td.num,.tbl th.num{text-align:right;white-space:nowrap}",
     ".tbl tbody tr:last-child td{border-bottom:0}",
+    ".model-filter{display:flex;align-items:center;gap:var(--space-2xs);flex-wrap:wrap;margin:0 0 var(--space-s)}",
+    ".model-filter label{font-size:var(--step--1);text-transform:uppercase;letter-spacing:.06em;color:var(--ink-3)}",
+    ".model-filter select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:0;padding:var(--space-3xs) var(--space-2xs);min-width:12rem;max-width:100%}",
+    ".model-filter .muted{font-size:var(--step--1)}",
     ".bg-panel{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--surface);padding:var(--space-s) var(--space-m);border-top:2px solid var(--ink)}",
     "p.sub{max-width:68ch}",
     ":focus-visible{outline:2px solid var(--accent);outline-offset:2px}",
     "footer{color:var(--ink-3);font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;text-align:left;border-top:3px double var(--ink);padding:var(--space-xs) 0 0}",
+  ].join("\n");
+
+  const modelFilterScript = [
+    `<script>`,
+    `(function(){`,
+    `var select=document.getElementById("model-filter");`,
+    `var status=document.getElementById("model-filter-status");`,
+    `var table=document.getElementById("models-table");`,
+    `if(!select||!status||!table)return;`,
+    `var rows=Array.prototype.slice.call(table.querySelectorAll("tbody tr[data-model]"));`,
+    `function apply(){var selected=select.value;var visible=0;rows.forEach(function(row){var match=!selected||row.getAttribute("data-model")===selected;row.hidden=!match;if(match)visible++;});status.textContent=selected?(visible===1?"1 model shown":visible+" models shown"):(visible===1?"1 model":visible+" models");}`,
+    `select.addEventListener("change",apply);`,
+    `apply();`,
+    `})();`,
+    `</script>`,
   ].join("\n");
 
   return [
@@ -1513,7 +1766,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `<section class="kpis">${cardsHtml}</section>`,
     `<section class="panel">`,
     `<div class="panel-head"><h2>Activity</h2><span class="sub">last ${grid.weeks} weeks · metric: ${escapeHtml(grid.metric)}</span></div>`,
-    buildHeatmapHtml(grid),
+    buildHeatmapHtml(grid, breakdowns, cfg.includeBackground),
     `</section>`,
     `<section class="panel">`,
     `<div class="panel-head"><h2>Activity per day</h2><span class="sub">last 30 days · metric: ${escapeHtml(cfg.heatmapMetric)}</span></div>`,
@@ -1526,9 +1779,12 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `</section>`,
     `<section class="panel">`,
     `<div class="panel-head"><h2>Models</h2><span class="sub">$/M list rates</span></div>`,
+    modelFilterHtml,
     tableHtml(
       ["model", "provider", "in $/M", "out $/M", "tokens", "cost", "cost (list)", "events"],
       modelRows,
+      modelAttributes,
+      "models-table",
     ),
     `</section>`,
     `</div>`,
@@ -1543,6 +1799,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
       `list-price column shows the API-equivalent value. Unknown prices render <b>—</b>, never $0.</p>`,
     `<footer>lifetime: ${escapeHtml(lifetimeSummaryLine(database))} · usage-stats</footer>`,
     `</div>`,
+    modelFilterScript,
     "</body></html>",
   ].join("\n");
 }
