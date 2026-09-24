@@ -142,8 +142,8 @@ const PACKAGES = [
     dir: "session-export",
     name: `${SCOPE}/opencode-session-export`,
     source: "plugins/session-export.ts",
-    helpers: [],
-    rewrites: {},
+    helpers: [{ src: "lib/redact.ts", dest: "lib/redact.js" }],
+    rewrites: { "../lib/redact.ts": "./lib/redact.js" },
     description:
       "Export a session transcript to markdown, json, jsonl or text with reasoning/tool filtering, secret redaction, home-path rewriting and non-overwriting filenames.",
     keywords: ["session", "export", "transcript", "redaction"],
@@ -165,8 +165,11 @@ const PACKAGES = [
     dir: "memory",
     name: `${SCOPE}/opencode-memory`,
     source: "plugins/memory.ts",
-    helpers: [{ src: "lib/sqlite.ts", dest: "lib/sqlite.js" }],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js" },
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/redact.ts", dest: "lib/redact.js" },
+    ],
+    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
     description:
       "Local-first long-term memory: store and BM25-recall fragments with SQLite FTS5. No embedding API, no cloud. Auto-injects relevant memories into each request within a hard character budget.",
     keywords: ["memory", "recall", "sqlite", "fts5", "local-first"],
@@ -192,8 +195,8 @@ const PACKAGES = [
     dir: "secret-shield",
     name: `${SCOPE}/opencode-secret-shield`,
     source: "plugins/secret-shield.ts",
-    helpers: [],
-    rewrites: {},
+    helpers: [{ src: "lib/redact.ts", dest: "lib/redact.js" }],
+    rewrites: { "../lib/redact.ts": "./lib/redact.js" },
     description:
       "v2-native secret detector/redactor: scrubs the outbound HTTP body (title/compaction/generate), prompt, tool args/results and child-process env; observe/redact/block modes with entropy detection, allowlist precedence and a hashed JSONL audit.",
     keywords: ["secrets", "redaction", "security", "guardrails"],
@@ -260,8 +263,11 @@ const PACKAGES = [
     dir: "decision-log",
     name: `${SCOPE}/opencode-decision-log`,
     source: "plugins/decision-log.ts",
-    helpers: [{ src: "lib/sqlite.ts", dest: "lib/sqlite.js" }],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js" },
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/redact.ts", dest: "lib/redact.js" },
+    ],
+    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
     description:
       "Record and search architectural decisions in a local SQLite FTS5 database.",
     keywords: ["decisions", "adr", "memory", "sqlite", "fts5"],
@@ -278,8 +284,11 @@ const PACKAGES = [
     dir: "error-journal",
     name: `${SCOPE}/opencode-error-journal`,
     source: "plugins/error-journal.ts",
-    helpers: [{ src: "lib/sqlite.ts", dest: "lib/sqlite.js" }],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js" },
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/redact.ts", dest: "lib/redact.js" },
+    ],
+    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
     description:
       "Log errors with context, search past ones, and record resolutions so you stop re-debugging the same failure.",
     keywords: ["errors", "journal", "debugging", "sqlite", "fts5"],
@@ -296,8 +305,11 @@ const PACKAGES = [
     dir: "snippet-library",
     name: `${SCOPE}/opencode-snippet-library`,
     source: "plugins/snippet-library.ts",
-    helpers: [{ src: "lib/sqlite.ts", dest: "lib/sqlite.js" }],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js" },
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/redact.ts", dest: "lib/redact.js" },
+    ],
+    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
     description:
       "Save reusable code snippets and search them by language, tag or full text.",
     keywords: ["snippets", "library", "sqlite", "fts5"],
@@ -367,8 +379,8 @@ const PACKAGES = [
     dir: "strip-skills-catalog",
     name: `${SCOPE}/opencode-strip-skills-catalog`,
     source: "plugins/strip-skills-catalog.ts",
-    helpers: [],
-    rewrites: {},
+    helpers: [{ src: "opencode-sessions/helpers.ts", dest: "lib/helpers.js" }],
+    rewrites: { "../opencode-sessions/helpers.ts": "./lib/helpers.js" },
     description:
       "Strips the <available_skills> catalog from the system prompt to save tokens; the skill tool still works on demand.",
     keywords: ["context", "tokens", "skills", "prompt"],
@@ -588,8 +600,8 @@ for (const pkg of PACKAGES) {
     const mod = await import(entryUrl);
     const keys = Object.keys(mod);
     const ok =
-      keys.length === 1 &&
-      keys[0] === "default" &&
+      keys.includes("default") &&
+      keys.every((k) => k === "default" || k === "__test__") &&
       typeof mod.default?.id === "string" &&
       typeof mod.default?.setup === "function";
     if (!ok) {
