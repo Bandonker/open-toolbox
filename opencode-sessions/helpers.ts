@@ -17,7 +17,12 @@ export function clampInt(value: unknown, fallback: number, min: number, max: num
 
 export function asBool(value: unknown, fallback: boolean): boolean {
   if (typeof value === "boolean") return value;
-  if (typeof value === "string") return /^(1|true|yes|on)$/i.test(value.trim());
+  if (typeof value === "string") {
+    const v = value.trim().toLowerCase();
+    if (v === "") return fallback;
+    if (/^(1|true|yes|y|on)$/.test(v)) return true;
+    if (/^(0|false|no|n|off)$/.test(v)) return false;
+  }
   return fallback;
 }
 

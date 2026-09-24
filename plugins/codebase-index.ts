@@ -761,7 +761,7 @@ export default Plugin.define({
                     ${filterWhere}
                   ORDER BY c.file_path, c.start_line
                   LIMIT ?
-                `).all(`%${escapeLike(args.query)}%`, ...scopeParams, ...filterParams, limit) as SearchRow[];
+                `).all(`%${escapeLike(tokens.join(" "))}%`, ...scopeParams, ...filterParams, limit) as SearchRow[];
               }
             } catch (err) {
               return JSON.stringify({
@@ -875,9 +875,11 @@ export default Plugin.define({
             if (!project) {
               return JSON.stringify({ deleted: false, error: "not found", path: resolved });
             }
-            // PRAGMA foreign_keys is never enabled (see lib/sqlite.ts), so
-            // ON DELETE CASCADE on code_chunks/indexed_files is inert —
-            // delete the rows explicitly or re-indexing resurrects orphans.
+            // Foreign keys are enabled for this database (PRAGMA foreign_keys=ON
+            // in getDb above) and the schema declares ON DELETE CASCADE, so
+            // deleting the project row cascades to code_chunks/indexed_files.
+            // The explicit deletes below are belt-and-braces for older DB
+            // files created before the PRAGMA was added.
             database.query("DELETE FROM code_chunks WHERE project_id = ?").run(project.id);
             database.query("DELETE FROM indexed_files WHERE project_id = ?").run(project.id);
             database.query("DELETE FROM projects WHERE id = ?").run(project.id);

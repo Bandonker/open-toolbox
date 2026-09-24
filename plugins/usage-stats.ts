@@ -68,6 +68,8 @@ interface UsageState {
   sessionModels: Map<string, string>;
   /** In-flight tool calls keyed by call id, for duration measurement. */
   pending: Map<string, { tool: string; startedMs: number }>;
+  /** Last US-6 threshold-gated pending sweep (epoch ms). */
+  lastPendingSweep: number;
 }
 
 function createState(): UsageState {
@@ -79,6 +81,7 @@ function createState(): UsageState {
     dirty: false,
     sessionModels: new Map(),
     pending: new Map(),
+    lastPendingSweep: 0,
   };
 }
 
@@ -523,6 +526,21 @@ function initSchema(database: AnyDatabase): void {
   `);
 }
 
+/** US-7: last unconditional db-failure notice (epoch ms, module-level). */
+let lastDbErrorLog = 0;
+
+/**
+ * US-7: db failures must never fail silently. This logs unconditionally
+ * (independent of cfg.log) but rate-limited to one notice per 5 minutes so
+ * a permanently broken db cannot spam stderr on every tool call.
+ */
+function logDbError(message: string): void {
+  const now = Date.now();
+  if (now - lastDbErrorLog < 300_000) return;
+  lastDbErrorLog = now;
+  console.error(`[usage-stats] ${message}`);
+}
+
 function getDb(state: UsageState, cfg: Config): AnyDatabase {
   if (!state.db) {
     state.db = openDatabase(join(cfg.dir, DB_NAME));
@@ -664,7 +682,20 @@ function addModelUsage(
     .run(model, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost, events, costComputed);
 }
 
-function addBackgroundUsage(database: AnyDatabase, day: string, source: string, t: Tokens, cost: number): void {
+/**
+ * US-3: background usage must also land in model_totals (with a computed
+ * list-price cost) — otherwise cost_computed is never written for it and
+ * per-model totals silently miss background traffic.
+ */
+function addBackgroundUsage(
+  database: AnyDatabase,
+  state: UsageState,
+  day: string,
+  sessionID: string,
+  source: string,
+  t: Tokens,
+  cost: number,
+): void {
   database
     .prepare(
       `INSERT INTO sources(source, count, cost, input, output, reasoning, cache_read, cache_write)
@@ -695,6 +726,11 @@ function addBackgroundUsage(database: AnyDatabase, day: string, source: string, 
       )
       .run(day, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost);
   }
+  // US-3: attribute background usage to a model as well, storing a computed
+  // list-price cost — without this, cost_computed is never written for
+  // background traffic and per-model totals miss it entirely.
+  const model = state.sessionModels.get(sessionID) ?? loadSession(database, sessionID)?.model ?? "unknown";
+  addModelUsage(database, model, t, cost, 1, computedCost(model, t, state));
 }
 
 function recordUsageUpdated(
@@ -776,7 +812,7 @@ function recordUsageUpdated(
 
 function recordUsageRecorded(database: AnyDatabase, sessionID: string, source: string, tokensRaw: unknown, costRaw: unknown, state: UsageState): void {
   ensureSession(database, sessionID, null);
-  addBackgroundUsage(database, dayKey(), source || "unknown", readTokens(tokensRaw), readCost(costRaw));
+  addBackgroundUsage(database, state, dayKey(), sessionID, source || "unknown", readTokens(tokensRaw), readCost(costRaw));
   state.dirty = true;
 }
 
@@ -918,6 +954,25 @@ function dailyRows(database: AnyDatabase, sinceDay?: string): DayRow[] {
   }));
 }
 
+/** US-8: fetch a single day row directly instead of scanning the table. */
+function dailyRow(database: AnyDatabase, day: string): DayRow | undefined {
+  const r = database.prepare("SELECT * FROM daily WHERE day = ?").get(day) as Record<string, unknown> | null;
+  if (!r) return undefined;
+  return {
+    day: String(r.day ?? ""),
+    ...totalsOf(r),
+    tool_calls: num(r.tool_calls),
+    tool_ok: num(r.tool_ok),
+    tool_fail: num(r.tool_fail),
+    bg_input: num(r.bg_input),
+    bg_output: num(r.bg_output),
+    bg_reasoning: num(r.bg_reasoning),
+    bg_cache_read: num(r.bg_cache_read),
+    bg_cache_write: num(r.bg_cache_write),
+    bg_cost: num(r.bg_cost),
+  };
+}
+
 function lifetimeTotals(database: AnyDatabase): UsageTotals {
   const r = database
     .prepare(
@@ -971,7 +1026,7 @@ function summaryText(database: AnyDatabase): string {
   const bg = backgroundTotals(database);
   const unknownModels = countUnknownModels(database);
   const day = dayKey();
-  const todayRow = dailyRows(database, day).find((r) => r.day === day);
+  const todayRow = dailyRow(database, day);
   const today = totalsOf(todayRow);
   // Success rate is measured over completed calls (ok + fail). Older rows
   // counted every started call, so `calls` can exceed completed; those
@@ -1185,9 +1240,10 @@ function buildHeatmapHtml(grid: HeatGrid): string {
   ].join("");
 }
 
-function buildBarChartHtml(rows: DayRow[], includeBackground: boolean): string {
+/** US-4: the bar chart follows the configured metric instead of hardcoding tokens. */
+function buildBarChartHtml(rows: DayRow[], includeBackground: boolean, metric: HeatMetric): string {
   const last = rows.slice(-30);
-  const values = last.map((r) => metricValue(r, "tokens", includeBackground));
+  const values = last.map((r) => metricValue(r, metric, includeBackground));
   const max = Math.max(1, ...values);
   const w = 760;
   const h = 220;
@@ -1218,7 +1274,13 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean): string {
       const x = padL + i * step + (step - barW) / 2;
       const y = padT + plotH - bh;
       const rx = Math.min(3, barW / 2);
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${bh}" rx="${rx.toFixed(1)}" class="bar"><title>${escapeHtml(`${r.day}: ${fmtInt(v)} tokens`)}</title></rect>`;
+      const barTitle =
+        metric === "cost"
+          ? `${r.day}: ${fmtShortUsd(v)}`
+          : metric === "calls"
+            ? `${r.day}: ${fmtInt(v)} tool calls`
+            : `${r.day}: ${fmtInt(v)} tokens`;
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${bh}" rx="${rx.toFixed(1)}" class="bar"><title>${escapeHtml(barTitle)}</title></rect>`;
     })
     .join("");
 
@@ -1234,7 +1296,7 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean): string {
 
   return [
     `<!-- bar-chart -->`,
-    `<svg class="bars" viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="tokens per day over the last 30 days">`,
+    `<svg class="bars" viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="${metric} per day over the last 30 days">`,
     gridLines,
     rects,
     `<line x1="${padL}" y1="${padT + plotH}" x2="${w - padR}" y2="${padT + plotH}" class="axis-line"/>`,
@@ -1454,8 +1516,8 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     buildHeatmapHtml(grid),
     `</section>`,
     `<section class="panel">`,
-    `<div class="panel-head"><h2>Tokens per day</h2><span class="sub">last 30 days</span></div>`,
-    buildBarChartHtml(recent, cfg.includeBackground),
+    `<div class="panel-head"><h2>Activity per day</h2><span class="sub">last 30 days · metric: ${escapeHtml(cfg.heatmapMetric)}</span></div>`,
+    buildBarChartHtml(recent, cfg.includeBackground, cfg.heatmapMetric),
     `</section>`,
     `<div class="grid2">`,
     `<section class="panel">`,
@@ -1492,6 +1554,9 @@ function renderDashboard(
   state: UsageState,
 ): { path: string; bytes: number; summary: string } {
   const html = buildDashboardHtml(database, cfg, app, state);
+  // US-5: intentionally synchronous — this runs on the render path (command
+  // or 60s interval), writes a single small file, and keeping it sync avoids
+  // interleaved dashboard writes from overlapping renders.
   mkdirSync(cfg.dir, { recursive: true });
   const path = join(cfg.dir, DASHBOARD_NAME);
   writeFileSync(path, html, "utf8");
@@ -1507,12 +1572,20 @@ function renderDashboard(
 function openInBrowser(filePath: string): boolean {
   if (process.env.OPENCODE_USAGE_STATS_NO_OPEN) return false;
   try {
+    // US-2: never pass the path through a shell (cmd /c start re-parses
+    // metacharacters such as `&` — a command-injection vector). Launch the
+    // opener directly with an argv list, and swallow async spawn failures so
+    // they cannot crash the host as an unhandled "error" event.
     const child =
       process.platform === "win32"
-        ? spawn("cmd", ["/c", "start", "", filePath], { detached: true, stdio: "ignore" })
+        ? spawn("powershell", ["-NoProfile", "-Command", "Start-Process", "-FilePath", filePath], {
+            detached: true,
+            stdio: "ignore",
+          })
         : process.platform === "darwin"
           ? spawn("open", [filePath], { detached: true, stdio: "ignore" })
           : spawn("xdg-open", [filePath], { detached: true, stdio: "ignore" });
+    child.on("error", () => {});
     child.unref?.();
     return true;
   } catch {
@@ -1538,6 +1611,9 @@ export default Plugin.define({
     try {
       getDb(state, cfg);
     } catch (err) {
+      // US-7: unconditional (not cfg.log-gated), rate-limited — a dead db
+      // must not silently stop recording.
+      logDbError(`db init failed: ${String(err)}`);
       log(`db init failed: ${String(err)}`);
     }
 
@@ -1587,11 +1663,17 @@ export default Plugin.define({
         try {
           const key = String(event.id ?? "");
           if (!key) return;
-          // U5: sweep orphaned entries (execute.after never arrived) so the
-          // map cannot grow without bound in long-lived servers.
-          const cutoff = Date.now() - 600_000;
-          for (const [k, v] of state.pending) {
-            if (v.startedMs < cutoff) state.pending.delete(k);
+          // U5/US-6: sweep orphaned entries (execute.after never arrived) so the
+          // map cannot grow without bound in long-lived servers. The full
+          // scan is threshold-gated — it only runs when the map is large or
+          // a minute has passed since the last sweep, not on every tool call.
+          const now = Date.now();
+          if (state.pending.size > 500 || now - state.lastPendingSweep > 60_000) {
+            state.lastPendingSweep = now;
+            const cutoff = now - 600_000;
+            for (const [k, v] of state.pending) {
+              if (v.startedMs < cutoff) state.pending.delete(k);
+            }
           }
           state.pending.set(key, { tool: String(event.tool ?? "unknown"), startedMs: Date.now() });
         } catch (err) {

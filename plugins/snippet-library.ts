@@ -215,7 +215,7 @@ export default Plugin.define({
       editor.add({
         name: "snippet_save",
         description:
-          "Save a code snippet to the project snippet library. Persists across sessions. Snippet code is stored verbatim (unredacted); title/description are secret-scrubbed.",
+          "Save a code snippet to the project snippet library. Persists across sessions. Snippet code is stored verbatim (unredacted); title/description are secret-scrubbed. Snippets are immutable by design (no update tool — save a corrected copy instead; use snippet_delete to remove the old one).",
         input: z.object({
           title: z.string().describe("Short descriptive title"),
           code: z.string().describe("The code snippet"),
