@@ -134,4 +134,25 @@ assert.deepEqual(
 );
 assert.equal(t.compilePatterns(["a.c"])[0].test("abc"), true, "compiled pattern must match");
 
+// CP-12: fire-and-forget auto-summarize must not surface unhandled rejections
+// (throws before its inner try would reject the void promise).
+assert.ok(
+  prunerSrc.includes("void maybeAutoSummarize(sessionID, st, rawEstimate).catch("),
+  "CP-12: void maybeAutoSummarize must carry a catch",
+);
+
+// CP-13: persist-chain cleanup must not leave a rejecting tail.
+assert.ok(
+  prunerSrc.includes("persistChains.delete(sessionID);") &&
+    prunerSrc.includes("}).catch("),
+  "CP-13: persist chain cleanup must carry a catch",
+);
+
+// CP-14: usage-stream driver must not surface unhandled rejections.
+assert.ok(
+  prunerSrc.includes("for await (const event of stream") &&
+    prunerSrc.includes("})().catch("),
+  "CP-14: usage stream driver must carry a catch",
+);
+
 console.log("verify-pruner-fix: all assertions passed");

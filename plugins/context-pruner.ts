@@ -2325,7 +2325,7 @@ export default Plugin.define({
       persistChains.set(sessionID, head);
       void head.then(() => {
         if (persistChains.get(sessionID) === head) persistChains.delete(sessionID);
-      });
+      }).catch(() => {});
     };
 
     /**
@@ -2637,7 +2637,7 @@ export default Plugin.define({
             // low steady target, but a digest of the stubbed units is smaller
             // still. The record is stored now and applied on the next request.
             const rawEstimate = sentTokens(results, overhead, new Map(), 0);
-            if (!cfg.manualMode.enabled) void maybeAutoSummarize(sessionID, st, rawEstimate);
+            if (!cfg.manualMode.enabled) void maybeAutoSummarize(sessionID, st, rawEstimate).catch(() => {});
 
             const summaryApplied = applySummaries(results, st);
             const applied = applyDecisions(results, decisions, cfg, ratio, covered, st);
@@ -2819,7 +2819,7 @@ export default Plugin.define({
             } catch {
               /* stream closed */
             }
-          })();
+          })().catch(() => {});
         } else if (typeof stream === "function") {
           track(stream as () => void | Promise<void>);
         } else if (stream && typeof (stream as PromiseLike<unknown>).then === "function") {
