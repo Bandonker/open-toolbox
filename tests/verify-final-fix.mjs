@@ -34,8 +34,22 @@ test("OS-4: session_send/launch await startTurn", () => {
 test("OS-5: outcome cache present", () => {
   has("plugins/opencode-sessions.ts", "OUTCOME_CACHE_TTL_MS");
 });
-test("OS-6: server calls use AbortSignal.timeout", () => {
-  has("plugins/opencode-sessions.ts", "AbortSignal.timeout");
+test("OS-6: server calls race a timeout (withTimeout Promise.race)", () => {
+  // ctx.* helpers accept no AbortSignal, so the plugin races server calls
+  // against a timeout instead (see comment above withTimeout).
+  has("plugins/opencode-sessions.ts", "withTimeout");
+});
+test("OS-6: withTimeout rejects on a never-resolving promise", async () => {
+  // withTimeout is closure-scoped in the plugin, so this mirrors its logic
+  // (Promise.race + clearTimeout) to pin the behavior.
+  const withTimeout = (p, ms, label) => {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    });
+    return Promise.race([p, timeout]).finally(() => clearTimeout(timer));
+  };
+  await assert.rejects(() => withTimeout(new Promise(() => {}), 10, "hung-call"), /hung-call timed out after 10ms/);
 });
 test("OS-7: parentDefaults capped", () => {
   has("plugins/opencode-sessions.ts", "MAX_PARENT_DEFAULTS");

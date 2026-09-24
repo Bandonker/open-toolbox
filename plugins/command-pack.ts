@@ -49,8 +49,12 @@ const TOOLBOX_TOOLS = [
   "codebase_delete_index",
   "trace_query",
   "trace_stats",
+  "trace_sessions",
   "trace_export",
   "context_pruner_stats",
+  "context_pruner_recall",
+  "context_report",
+  "compress",
   "session_export",
   "session_export_info",
   "memory_remember",
@@ -209,11 +213,14 @@ const COMMANDS: CommandSpec[] = [
     description: "Show which open-toolbox tools are installed in this session.",
     requires: [],
     build: (args, available) => {
-      // CP-1: work from the live tool list and only fall back to the static
-      // inventory when the live listing failed (empty set).
+      // CP-1: work from the live tool list (dynamic — any live tool with a
+      // known provider counts) and only fall back to the static inventory
+      // when the live listing failed (empty set). Gating on TOOL_OWNERS
+      // instead of the static TOOLBOX_TOOLS keeps tools like trace_sessions
+      // visible even as the pack grows.
       const live = [...available];
       const source = live.length ? live : [...TOOLBOX_TOOLS];
-      const installed = source.filter((t) => TOOLBOX_TOOLS.includes(t) && (!live.length || available.has(t)));
+      const installed = source.filter((t) => t in TOOL_OWNERS);
       const lines = installed.length
         ? installed.map((t) => `- ${t} (${ownerOf(t)})`)
         : ["(no open-toolbox tools detected)"];
