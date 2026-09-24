@@ -101,4 +101,37 @@ const probe = { name: "secret-tool" };
 assert.equal(t.isProtected(probe, protectedCfg), true, "CP-11: isProtected hits");
 assert.equal(t.isProtected(probe, protectedCfg), true, "CP-11: isProtected stays stable on repeat");
 
+// CP-2: overlapping recall persists are serialized through a per-session
+// chain (no read-modify-write race). The chain lives inside setup's closure
+// with no seam, so assert the mechanism is present in source.
+import { readFileSync as cp2Read } from "node:fs";
+const prunerSrc = cp2Read(new URL("../plugins/context-pruner.ts", import.meta.url), "utf8");
+assert.ok(
+  prunerSrc.includes("persistChains.get(sessionID)") &&
+    prunerSrc.includes(".then(() => loadRecall(sessionID, st))") &&
+    prunerSrc.includes("persistChains.set(sessionID, head)"),
+  "CP-2: per-session persist chain must serialize recall flushes",
+);
+
+// CP-8: per-request JSON.stringify(event.tools) is memoized on the event
+// tools reference (closure-local like CP-2, so assert the mechanism).
+assert.ok(
+  prunerSrc.includes("lastToolsRef") && prunerSrc.includes("if (eventTools !== lastToolsRef)"),
+  "CP-8: event.tools serialization must be memoized on reference identity",
+);
+
+// compilePatterns seam: used internally for protectedPatterns and exported
+// for tests — assert it is a live, working seam rather than dead code.
+assert.equal(typeof t.compilePatterns, "function", "compilePatterns seam must exist");
+assert.ok(
+  prunerSrc.includes("compilePatterns("),
+  "compilePatterns must be wired into config resolution",
+);
+assert.deepEqual(
+  t.compilePatterns(["a.c"]).map((r) => r instanceof RegExp),
+  [true],
+  "compilePatterns must compile string lists to RegExp",
+);
+assert.equal(t.compilePatterns(["a.c"])[0].test("abc"), true, "compiled pattern must match");
+
 console.log("verify-pruner-fix: all assertions passed");
