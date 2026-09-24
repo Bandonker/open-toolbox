@@ -10,6 +10,9 @@ import {
   isCorruption,
   quoteFtsQuery,
   dbUnavailable,
+  clampLimit,
+  truncateStored,
+  STORE_CAPS,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
 import { redactSecrets } from "../lib/redact.ts";
@@ -131,7 +134,9 @@ function ageOf(iso: string): string {
 function formatRow(row: MemoryRow): string {
   const tags = parseTags(row.tags);
   const tagStr = tags.length > 0 ? ` tags=${tags.join(",")}` : "";
-  return `#${row.id} [${row.scope}] imp=${row.importance} age=${ageOf(row.created_at)}${tagStr} ${row.text.replace(/\s+/g, " ").trim()}`;
+  // ME-10: cap per-row length before budgeting so one huge row cannot eat
+  // the whole recall budget (recall/auto-recall budget on these lines).
+  return truncateStored(`#${row.id} [${row.scope}] imp=${row.importance} age=${ageOf(row.created_at)}${tagStr} ${row.text.replace(/\s+/g, " ").trim()}`, STORE_CAPS.memoryRecallRow);
 }
 
 /** Latest user-authored text in a request, joined from its text parts. */
@@ -335,9 +340,12 @@ function remember(
 const scopeSchema = z.enum(["global", "project", "session"]);
 
 /** P5: redact obvious secrets before they hit the pack's own store (opt-out via env). */
-const STORE_REDACT = process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+// Lazy read (call time, not module load) so toggles take effect without a re-import.
+function storeRedactOn(): boolean {
+  return process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+}
 function scrubStore(text: string): string {
-  return STORE_REDACT ? redactSecrets(text) : text;
+  return storeRedactOn() ? redactSecrets(text) : text;
 }
 
 export default Plugin.define({
@@ -371,8 +379,10 @@ export default Plugin.define({
           try {
             const scope = resolveScope(args.scope);
             const importance = resolveImportance(args.importance);
-            const tags = Array.isArray(args.tags) ? args.tags : [];
-            const result = remember(requireDb(), cfg, scrubStore(args.text), tags, scope, importance, project, toolCtx.sessionID ?? null);
+            // ME-5: scrub tags via the existing scrub util; ME-6/CR-4: cap
+            // stored text (~20k) with a visible marker.
+            const tags = (Array.isArray(args.tags) ? args.tags : []).map((t) => scrubStore(t));
+            const result = remember(requireDb(), cfg, truncateStored(scrubStore(args.text), STORE_CAPS.memoryText), tags, scope, importance, project, toolCtx.sessionID ?? null);
             log(result.created ? `remember #${result.id}` : `dedupe #${result.id}`);
             return {
               content: result.created
@@ -397,7 +407,7 @@ export default Plugin.define({
         execute: async (args, toolCtx) => {
           try {
             const scope = args.scope ? resolveScope(args.scope) : null;
-            const limit = args.limit ?? cfg.topK;
+            const limit = clampLimit(args.limit ?? cfg.topK, cfg.topK, 100);
             const all = args.all === true || cfg.recallAll;
             const sessionID = toolCtx?.sessionID ?? null;
             const rows = search(requireDb(), toMatch(args.query, "all"), Math.max(limit * 3, limit), cfg.minScore, scope)
@@ -458,7 +468,8 @@ export default Plugin.define({
           try {
             const database = requireDb();
             const scope = args.scope ? resolveScope(args.scope) : null;
-            const limit = args.limit ?? 20;
+            // Shared clampLimit: trunc + finite guard before LIMIT.
+            const limit = clampLimit(args.limit ?? 20, 20, 100);
             const rows = scope
               ? (database.prepare("SELECT * FROM memories WHERE scope = ? ORDER BY created_at DESC, id DESC LIMIT ?").all(scope, limit) as MemoryRow[])
               : (database.prepare("SELECT * FROM memories ORDER BY created_at DESC, id DESC LIMIT ?").all(limit) as MemoryRow[]);
@@ -566,7 +577,8 @@ export default Plugin.define({
           (row) => visible(row, project, recallSessionID, cfg.recallAll),
         );
         if (rows.length === 0) return;
-        const key = String(event.sessionID ?? "");
+        // ME-7: single expression for the session key ("" vs null mismatch).
+        const key = recallSessionID ?? "";
         const now = Date.now();
         let entry = seen.get(key);
         if (!entry) {
@@ -615,6 +627,13 @@ export default Plugin.define({
         if (cfg.log) console.error(`[memory] auto-recall failed: ${String(err)}`);
       }
     });
+
+    // ME-8: dispose the lazy DB handle on teardown (parity with the
+    // error-journal dispose pattern).
+    return () => {
+      try { database?.close(); } catch { /* ignore */ }
+      database = null;
+    };
   },
 });
 

@@ -283,3 +283,79 @@ export function checkOpenDb(db: AnyDatabase): boolean {
     return false;
   }
 }
+
+/* ------------------------------------------------------------------ *
+ * Cross-cutting robustness helpers (Task 1: CR-4/CR-7/CR-8/CR-9,
+ * DL-6/SN-6). Shared by decision-log, snippet-library, error-journal,
+ * memory, and codebase-index so the copies cannot drift again.
+ * ------------------------------------------------------------------ */
+
+/**
+ * CR-4: caps for unbounded text stored into SQLite/FTS. Values that exceed
+ * a cap are truncated with a " [truncated]" marker so the loss is visible.
+ * Caps: error-journal error_text/context/resolution 20_000 each;
+ * decision-log title 500 / bodies 20_000; memory text 20_000; snippets
+ * title 300 / code 100_000 / description 5_000; memory recall row 2_000;
+ * snippet preview 600.
+ */
+export const STORE_CAPS = {
+  errorField: 20_000,
+  decisionTitle: 500,
+  decisionBody: 20_000,
+  memoryText: 20_000,
+  snippetTitle: 300,
+  snippetCode: 100_000,
+  snippetDescription: 5_000,
+  memoryRecallRow: 2_000,
+  snippetPreview: 600,
+} as const;
+
+const TRUNC_MARKER = " [truncated]";
+
+/** CR-4: truncate over-long stored text, marking the cut visibly. */
+export function truncateStored(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(0, Math.max(0, max - TRUNC_MARKER.length)) + TRUNC_MARKER;
+}
+
+/**
+ * DL-6/SN-6: coerce a user-supplied `limit` into a safe integer for LIMIT.
+ * Non-numbers, NaN, Infinity, and out-of-range values fall back to `def`;
+ * fractional values are truncated. Result is always in [1, max].
+ */
+export function clampLimit(value: unknown, def: number, max: number): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return def;
+  return Math.min(Math.max(Math.trunc(n), 1), max);
+}
+
+/** CR-9: true when every named trigger exists (checks ai/ad/au, not just ai). */
+export function hasTriggers(database: AnyDatabase, names: string[]): boolean {
+  const rows = database
+    .query("SELECT name FROM sqlite_master WHERE type='trigger'")
+    .all() as Array<{ name?: unknown }>;
+  const present = new Set(rows.map((r) => r.name));
+  return names.every((n) => present.has(n));
+}
+
+/**
+ * CR-8: replace a corrupt db file with a backup copy. Filesystem I/O is
+ * wrapped so failures surface with context instead of a bare fs error.
+ */
+export function copyBackupIntoPlace(dbPath: string, latest: string): void {
+  // Best-effort sidecar cleanup: a sibling process may still hold the db
+  // open (Windows locks the -wal), and a locked sidecar must not fail the
+  // restore — this matches the historical per-file ignore behavior.
+  for (const suffix of ["-wal", "-shm", "-journal"]) {
+    try {
+      rmSync(`${dbPath}${suffix}`, { force: true });
+    } catch { /* ignore */ }
+  }
+  try {
+    copyFileSync(latest, dbPath);
+  } catch (err) {
+    throw new Error(
+      `Failed to restore backup ${latest} to ${dbPath}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}

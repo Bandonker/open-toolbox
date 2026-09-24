@@ -19,6 +19,8 @@ import {
   checkOpenDb,
   quoteFtsQuery,
   dbUnavailable,
+  clampLimit,
+  copyBackupIntoPlace,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
 const DB_DIR = join(homedir(), ".opencode-plugins", "codebase-index");
@@ -77,11 +79,19 @@ let lastBackupTime = 0;
 
 function getDb(): AnyDatabase {
   if (!db) {
-    if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
-    db = openDatabase(DB_PATH);
-    applyPragmas(db);
-    db.exec("PRAGMA foreign_keys=ON");
-    initSchema(db);
+    // DL-2: mkdir inside try; on failure reset the half-open handle and
+    // rethrow — callers (writeDb/readDb) route it to backup-restore.
+    try {
+      if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
+      db = openDatabase(DB_PATH);
+      applyPragmas(db);
+      db.exec("PRAGMA foreign_keys=ON");
+      initSchema(db);
+    } catch (e) {
+      try { db?.close(); } catch { /* ignore */ }
+      db = null;
+      throw e;
+    }
   }
   return db;
 }
@@ -267,11 +277,9 @@ function tryRestore(): boolean {
       try { db.close(); } catch {}
       db = null;
     }
-    for (const ext of ["", "-wal", "-shm"]) {
-      const p = DB_PATH + ext;
-      if (existsSync(p)) rmSync(p, { force: true });
-    }
-    copyFileSync(backup, DB_PATH);
+    // CR-7/CR-8: shared helper — wrapped I/O with context; also drops
+    // -wal/-shm/-journal so they cannot be replayed on the restored snapshot.
+    copyBackupIntoPlace(DB_PATH, backup);
     getDb();
     // J1: verify the restored copy — open/schema succeed lazily on corrupt
     // files, so a bad restore must be rejected, never served silently.
@@ -616,7 +624,8 @@ export default Plugin.define({
             if (args.query.trim().split(/\s+/).some((t) => t.length < 3)) {
               return "No results — use search terms of at least 3 characters.";
             }
-            const limit = Math.min(Math.max(args.limit ?? 15, 1), 50);
+            // Shared clampLimit: trunc + finite guard.
+            const limit = clampLimit(args.limit ?? 15, 15, 50);
             const params: unknown[] = [ftsQuery];
 
             let projectWhere = "";
