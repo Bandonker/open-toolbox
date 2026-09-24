@@ -2224,6 +2224,9 @@ export default Plugin.define({
 
   async setup(ctx) {
     const c = ctx as unknown as LooseCtx;
+    // Temporarily disabled: this plugin must not register hooks or tools until
+    // its session-stability fix has been validated in a fresh process.
+    if (process.env.OPENCODE_CONTEXT_PRUNER_HARD_DISABLE === "1") return async () => {};
     let cfg = resolveConfig(c.location?.directory, c.options);
     if (!cfg.enabled) {
       // Keep the plugin file loadable for easy re-enabling, but do not register
