@@ -365,7 +365,25 @@ check(
 );
 check(
   "bar hover includes the exact token total for its day",
-  new RegExp(`<title>\\d{4}-\\d{2}-\\d{2}: 7615 tokens\\n  input=4165 output=1040 reasoning=100 cache_read=2007 cache_write=303`).test(html),
+  new RegExp(`data-tooltip="\\d{4}-\\d{2}-\\d{2}: 7615 tokens\\n  input=4165 output=1040 reasoning=100 cache_read=2007 cache_write=303`).test(html),
+);
+check(
+  "activity and bar data use an accessible custom tooltip",
+  html.includes('id="usage-tooltip"') &&
+    html.includes('class="usage-tooltip"') &&
+    html.includes('role="tooltip"') &&
+    html.includes('role="group"') &&
+    html.includes('data-tooltip="') &&
+    html.includes('tabindex="0"') &&
+    html.includes('tabindex="-1"') &&
+    html.includes('pointer-events:auto') &&
+    html.includes('ArrowLeft') &&
+    html.includes('Scrollable table') &&
+    html.includes('updateScrollableTables') &&
+    html.includes('removeAttribute("tabindex")') &&
+    html.includes('mouseenter') &&
+    html.includes('focus') &&
+    html.includes('Escape'),
 );
 check(
   "model table includes searchable multi-select controls",

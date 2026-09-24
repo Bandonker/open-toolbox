@@ -1412,7 +1412,7 @@ function buildHeatmapHtml(
       const title = cell.inRange && cell.row
         ? heatmapDayTitle(cell.row, grid.metric, includeBackground, breakdowns.get(cell.day))
         : `${cell.day}: no usage recorded`;
-      cells.push(`<span class="${cls}" title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"></span>`);
+      cells.push(`<span class="${cls}" tabindex="0" role="button" data-tooltip="${escapeHtml(title)}" aria-label="${escapeHtml(`${cell.day} usage details`)}"></span>`);
     }
   }
   const monthSpans = grid.months
@@ -1425,11 +1425,11 @@ function buildHeatmapHtml(
   const span = `${dayKey(grid.start)} → ${dayKey(grid.end)}`;
   return [
     `<!-- heatmap -->`,
-    `<div class="hm-wrap" role="img" aria-label="${escapeHtml(`activity heatmap ${span}, metric ${grid.metric}`)}">`,
-    `<div class="hm-months" style="grid-template-columns:repeat(${grid.weeks},12px)">${monthSpans}</div>`,
+    `<div class="hm-wrap" role="group" aria-label="${escapeHtml(`activity heatmap ${span}, metric ${grid.metric}`)}">`,
+    `<div class="hm-months" style="grid-template-columns:repeat(${grid.weeks},24px)">${monthSpans}</div>`,
     `<div class="hm-body">`,
     `<div class="hm-days">${dayLabels}</div>`,
-    `<div class="hm-grid" style="grid-template-columns:repeat(${grid.weeks},12px)">${cells.join("")}</div>`,
+    `<div class="hm-grid" style="grid-template-columns:repeat(${grid.weeks},24px)">${cells.join("")}</div>`,
     `</div>`,
     `</div>`,
     `<div class="hm-legend"><span class="muted">Less</span>${legend}<span class="muted">More</span><span class="hm-max">peak ${escapeHtml(heatCellLabel(grid.max, grid.metric))}</span></div>`,
@@ -1467,8 +1467,9 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean, metric: H
     .map((r, i) => {
       const v = values[i] ?? 0;
       const bh = Math.max(0, Math.round((v / max) * plotH));
+      const visibleHeight = Math.max(4, bh);
       const x = padL + i * step + (step - barW) / 2;
-      const y = padT + plotH - bh;
+      const y = padT + plotH - visibleHeight;
       const rx = Math.min(3, barW / 2);
       const backgroundTokens = r.bg_input + r.bg_output + r.bg_reasoning + r.bg_cache_read + r.bg_cache_write;
       const barTokens = tokenTotal(r) + (includeBackground ? backgroundTokens : 0);
@@ -1487,7 +1488,7 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean, metric: H
           ? []
           : [metric === "cost" ? `  ${heatCellLabel(v, "cost")} cost` : `  ${fmtInt(v)} tool calls`]),
       ].join("\n");
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${bh}" rx="${rx.toFixed(1)}" class="bar"><title>${escapeHtml(barTitle)}</title></rect>`;
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${visibleHeight}" rx="${rx.toFixed(1)}" class="bar" tabindex="0" focusable="true" role="button" data-tooltip="${escapeHtml(barTitle)}" aria-label="${escapeHtml(`${r.day} usage details`)}"></rect>`;
     })
     .join("");
 
@@ -1503,7 +1504,7 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean, metric: H
 
   return [
     `<!-- bar-chart -->`,
-    `<svg class="bars" viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="${metric} per day over the last 30 days">`,
+    `<svg class="bars" viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="xMidYMid meet" role="group" aria-label="${metric} per day over the last 30 days">`,
     gridLines,
     rects,
     `<line x1="${padL}" y1="${padT + plotH}" x2="${w - padR}" y2="${padT + plotH}" class="axis-line"/>`,
@@ -1664,7 +1665,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ":root{--font-display:Georgia,'Iowan Old Style','Times New Roman',serif;--font-text:ui-monospace,'SF Mono','Cascadia Code',Menlo,Consolas,monospace;",
     "--step--1:0.75rem;--step-0:1rem;--step-1:1.333rem;--step-2:1.777rem;--step-3:2.369rem;--step-4:3.157rem;--step-5:4.209rem;",
     "--space-3xs:0.25rem;--space-2xs:0.5rem;--space-xs:0.75rem;--space-s:1rem;--space-m:1.5rem;--space-l:2rem;--space-xl:3rem;--space-2xl:4.5rem;--space-3xl:7rem;",
-    "--base:#f4f1ea;--surface:#fdfcf7;--surface-2:#ece5d3;--line:#d9d1c1;--ink:#161310;--ink-2:#575046;--ink-3:#7a7368;",
+    "--base:#f4f1ea;--surface:#fdfcf7;--surface-2:#ece5d3;--line:#d9d1c1;--ink:#161310;--ink-2:#575046;--ink-3:#726b61;",
     "--accent:#a92c1a;--accent-deep:#7e1f12;--ok:#1e6b3a;",
     "--hm0:#e5ddcb;--hm1:#d8b9a5;--hm2:#d08a6d;--hm3:#c15535;--hm4:#9e2a16;",
     "--radius:0;--shadow:none}",
@@ -1700,22 +1701,28 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ".panel-head h2::before{content:'0' counter(section) ' — ';color:var(--accent);font-weight:400}",
     ".sub{color:var(--ink-3);font-size:var(--step--1)}",
     ".muted{color:var(--ink-3)}",
-    ".grid2{display:grid;grid-template-columns:5fr 7fr;gap:var(--space-xl)}",
+    ".grid2{display:grid;grid-template-columns:5fr 7fr;gap:var(--space-xl);min-width:0}",
+    ".grid2>.panel{min-width:0}",
     "@media (max-width:60em){.grid2{grid-template-columns:1fr}.wrap{padding:var(--space-s) var(--space-s) var(--space-xl)}.kpi:first-child .v{font-size:var(--step-3)}}",
     ".hm-wrap{display:inline-block;max-width:100%;overflow-x:auto;padding-bottom:var(--space-2xs)}",
-    ".hm-months{display:grid;gap:3px;margin-left:30px;height:14px;font-size:10px;color:var(--ink-3);align-items:end;text-transform:uppercase;letter-spacing:.06em}",
+    ".hm-months{display:grid;gap:0;margin-left:30px;height:14px;font-size:10px;color:var(--ink-3);align-items:end;text-transform:uppercase;letter-spacing:.06em}",
     ".hm-months span{white-space:nowrap}",
     ".hm-body{display:flex;gap:6px;margin-top:4px}",
-    ".hm-days{display:grid;grid-template-rows:repeat(7,12px);gap:3px;width:24px;font-size:10px;color:var(--ink-3);text-align:right;line-height:12px}",
-    ".hm-grid{display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,12px);gap:3px}",
-    ".hm-cell{display:block;width:12px;height:12px;border-radius:0;border:1px solid var(--line)}",
-    ".hm-out{background:transparent;opacity:1;border:1px dashed var(--line)}",
-    ".hm-l0{background:var(--hm0)}.hm-l1{background:var(--hm1)}.hm-l2{background:var(--hm2)}.hm-l3{background:var(--hm3)}.hm-l4{background:var(--hm4)}",
+    ".hm-days{display:grid;grid-template-rows:repeat(7,24px);gap:0;width:24px;font-size:10px;color:var(--ink-3);text-align:right;line-height:24px}",
+    ".hm-grid{display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,24px);gap:0}",
+    ".hm-cell{position:relative;display:grid;place-items:center;width:24px;height:24px;background:transparent;border:0;cursor:pointer}",
+    ".hm-cell::before{content:\"\";display:block;width:12px;height:12px;background:var(--hm0);border:1px solid var(--line);border-radius:0}",
+    ".hm-out::before{background:transparent;border:1px dashed var(--line)}",
+    ".hm-cell.hm-l0::before{background:var(--hm0)}.hm-cell.hm-l1::before{background:var(--hm1)}.hm-cell.hm-l2::before{background:var(--hm2)}.hm-cell.hm-l3::before{background:var(--hm3)}.hm-cell.hm-l4::before{background:var(--hm4)}",
     ".hm-legend{display:flex;align-items:center;gap:5px;margin-top:var(--space-s);font-size:11.5px;color:var(--ink-3)}",
     ".hm-legend i{width:12px;height:12px;border-radius:0;display:inline-block;border:1px solid var(--line)}",
     ".hm-max{margin-left:auto;font-variant-numeric:tabular-nums}",
     ".bars{display:block;width:100%;height:auto;overflow:visible}",
-    ".bar{fill:var(--ink);opacity:1}.bar:hover{fill:var(--accent)}.bar:last-of-type{fill:var(--accent)}",
+    ".bar{fill:var(--ink);opacity:1;cursor:pointer}.bar:hover,.bar:focus-visible{fill:var(--accent)}.bar:last-of-type{fill:var(--accent)}",
+    ".hm-cell{cursor:pointer}",
+    "[data-tooltip]{cursor:help}",
+    ".usage-tooltip{position:fixed;z-index:100;width:max-content;max-width:min(36rem,calc(100vw - 1.5rem));max-height:min(32rem,calc(100vh - 1.5rem));overflow:auto;padding:var(--space-s);background:var(--surface);border:1px solid var(--ink);border-left:3px solid var(--accent);box-shadow:5px 5px 0 var(--surface-2);color:var(--ink);font:400 var(--step--1)/1.55 var(--font-text);white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:auto;overscroll-behavior:contain}",
+    ".usage-tooltip[hidden]{display:none}",
     ".gl{stroke:var(--line);stroke-width:1}",
     ".axis{fill:var(--ink-3);font-size:10.5px;font-family:var(--font-text);font-variant-numeric:tabular-nums}",
     ".axis-line{stroke:var(--ink);stroke-width:1}",
@@ -1740,6 +1747,39 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     "p.sub{max-width:68ch}",
     ":focus-visible{outline:2px solid var(--accent);outline-offset:2px}",
     "footer{color:var(--ink-3);font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;text-align:left;border-top:3px double var(--ink);padding:var(--space-xs) 0 0}",
+  ].join("\n");
+
+  const tooltipScript = [
+    `<script>`,
+    `(function(){`,
+    `var tooltip=document.getElementById("usage-tooltip");`,
+    `if(!tooltip)return;`,
+    `var active=null;`,
+    `var pinned=false;`,
+    `var returnFocus=null;`,
+    `var returning=false;`,
+    `var hideTimer;`,
+    `function position(target){tooltip.style.left="0px";tooltip.style.top="0px";var box=target.getBoundingClientRect();var gap=10;var edge=12;var width=tooltip.offsetWidth;var height=tooltip.offsetHeight;var left=box.left+box.width/2-width/2;var top=box.bottom+gap;left=Math.max(edge,Math.min(left,window.innerWidth-width-edge));if(top+height>window.innerHeight-edge)top=box.top-height-gap;top=Math.max(edge,Math.min(top,window.innerHeight-height-edge));tooltip.style.left=left+"px";tooltip.style.top=top+"px";}`,
+    `function hide(){var focusTarget=returnFocus;var restoreFocus=!!(focusTarget&&document.activeElement===tooltip);if(active)active.removeAttribute("aria-describedby");active=null;pinned=false;returnFocus=null;tooltip.hidden=true;tooltip.setAttribute("aria-hidden","true");if(restoreFocus){returning=true;focusTarget.focus();setTimeout(function(){returning=false;},0);}}`,
+    `function show(target,pin,keyboard){var text=target.getAttribute("data-tooltip");if(!text||returning)return;clearTimeout(hideTimer);if(active&&active!==target)active.removeAttribute("aria-describedby");active=target;pinned=pin===true;returnFocus=keyboard?target:null;tooltip.textContent=text;tooltip.hidden=false;tooltip.setAttribute("aria-hidden","false");target.setAttribute("aria-describedby","usage-tooltip");position(target);if(keyboard)tooltip.focus();}`,
+    `function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(function(){if(!pinned&&document.activeElement!==active&&!tooltip.matches(":hover"))hide();},120);}`,
+    `function toggle(target,keyboard){if(active===target&&pinned)hide();else show(target,true,keyboard);}`,
+    `function bind(target){target.addEventListener("mouseenter",function(){show(target,false);});target.addEventListener("mouseleave",function(){scheduleHide();});target.addEventListener("focus",function(){if(target.classList.contains("hm-cell"))setHeatIndex(target);if(!returning)show(target,false);});target.addEventListener("blur",function(){scheduleHide();});target.addEventListener("click",function(event){event.stopPropagation();toggle(target,false);});target.addEventListener("keydown",function(event){if(event.key==="Escape"){hide();}else if(event.key==="Enter"||event.key===" "){event.preventDefault();toggle(target,true);}});}`,
+    `var heatCells=Array.prototype.slice.call(document.querySelectorAll(".hm-grid .hm-cell"));`,
+    `var heatIndex=0;`,
+    `function setHeatIndex(target){var index=heatCells.indexOf(target);if(index<0)return;heatIndex=index;heatCells.forEach(function(cell,i){cell.tabIndex=i===heatIndex?0:-1;});}`,
+    `function focusHeatCell(index){if(!heatCells.length)return;heatIndex=Math.max(0,Math.min(heatCells.length-1,index));setHeatIndex(heatCells[heatIndex]);heatCells[heatIndex].focus();}`,
+    `if(heatCells.length){heatCells.forEach(function(cell){cell.tabIndex=-1;});heatCells[0].tabIndex=0;heatCells.forEach(function(cell,index){cell.addEventListener("keydown",function(event){var next=index;if(event.key==="ArrowLeft")next--;else if(event.key==="ArrowRight")next++;else if(event.key==="ArrowUp")next-=7;else if(event.key==="ArrowDown")next+=7;else if(event.key==="Home")next=0;else if(event.key==="End")next=heatCells.length-1;else return;event.preventDefault();focusHeatCell(next);});});}`,
+    `document.querySelectorAll("[data-tooltip]").forEach(bind);`,
+    `function updateScrollableTables(){document.querySelectorAll(".tbl-wrap").forEach(function(wrapper){if(wrapper.scrollWidth>wrapper.clientWidth){var panel=wrapper.closest(".panel");var heading=panel&&panel.querySelector("h2");wrapper.tabIndex=0;wrapper.setAttribute("role","region");wrapper.setAttribute("aria-label",heading?heading.textContent+" table, scrollable":"Scrollable table");}else{wrapper.removeAttribute("tabindex");wrapper.removeAttribute("role");wrapper.removeAttribute("aria-label");}});}`,
+    `updateScrollableTables();`,
+    `tooltip.addEventListener("mouseenter",function(){clearTimeout(hideTimer);});`,
+    `tooltip.addEventListener("mouseleave",function(){scheduleHide();});`,
+    `document.addEventListener("click",function(event){if(!(event.target instanceof Element)||(!event.target.closest("[data-tooltip]")&&!tooltip.contains(event.target)))hide();});`,
+    `document.addEventListener("keydown",function(event){if(event.key==="Escape")hide();});`,
+    `window.addEventListener("resize",function(){updateScrollableTables();if(active)position(active);});`,
+    `})();`,
+    `</script>`,
   ].join("\n");
 
   const modelFilterScript = [
@@ -1820,6 +1860,8 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
       `list-price column shows the API-equivalent value. Unknown prices render <b>—</b>, never $0.</p>`,
     `<footer>lifetime: ${escapeHtml(lifetimeSummaryLine(database))} · usage-stats</footer>`,
     `</div>`,
+    `<div id="usage-tooltip" class="usage-tooltip" role="tooltip" tabindex="-1" aria-hidden="true" hidden></div>`,
+    tooltipScript,
     modelFilterScript,
     "</body></html>",
   ].join("\n");
