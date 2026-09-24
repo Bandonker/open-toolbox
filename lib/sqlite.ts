@@ -265,3 +265,21 @@ export function latestValidBackup(backupDir: string): string | null {
   }
   return null;
 }
+
+/**
+ * J1: verify an already-open handle before serving it. The pre-copy
+ * `latestValidBackup` check is not enough — a backup can land corrupt
+ * (failed copy, concurrent write), and open/schema calls succeed lazily on
+ * such copies. Run `integrity_check` on the restored handle itself so a bad
+ * restore is rejected instead of served silently. Restores are rare, so the
+ * full check is affordable here.
+ */
+export function checkOpenDb(db: AnyDatabase): boolean {
+  try {
+    const row = db.query("PRAGMA integrity_check").get() as { integrity_check?: unknown } | null;
+    const value = row?.integrity_check;
+    return typeof value === "string" && value.toLowerCase() === "ok";
+  } catch {
+    return false;
+  }
+}

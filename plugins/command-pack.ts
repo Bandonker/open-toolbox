@@ -69,6 +69,65 @@ const TOOLBOX_TOOLS = [
   "stats_dashboard",
 ];
 
+/**
+ * Q1: which plugin provides each toolbox tool. Used by /toolbox and by the
+ * "plugin not installed" note so both name the provider, not just the tool.
+ */
+const TOOL_OWNERS: Record<string, string> = {
+  spawn_session: "opencode-sessions",
+  session_result: "opencode-sessions",
+  session_send: "opencode-sessions",
+  session_cancel: "opencode-sessions",
+  session_permission: "opencode-sessions",
+  session_handoff: "opencode-sessions",
+  list_sessions: "opencode-sessions",
+  decision_log: "decision-log",
+  decision_search: "decision-log",
+  decision_list: "decision-log",
+  decision_get: "decision-log",
+  decision_update: "decision-log",
+  error_log: "error-journal",
+  error_search: "error-journal",
+  error_list: "error-journal",
+  error_resolve: "error-journal",
+  error_delete: "error-journal",
+  snippet_save: "snippet-library",
+  snippet_search: "snippet-library",
+  snippet_list: "snippet-library",
+  snippet_get: "snippet-library",
+  snippet_delete: "snippet-library",
+  codebase_index: "codebase-index",
+  codebase_index_status: "codebase-index",
+  codebase_search: "codebase-index",
+  codebase_delete_index: "codebase-index",
+  trace_query: "tool-audit",
+  trace_stats: "tool-audit",
+  trace_sessions: "tool-audit",
+  trace_export: "tool-audit",
+  context_pruner_stats: "context-pruner",
+  context_pruner_recall: "context-pruner",
+  context_report: "context-pruner",
+  compress: "context-pruner",
+  session_export: "session-export",
+  session_export_info: "session-export",
+  memory_remember: "memory",
+  memory_recall: "memory",
+  memory_forget: "memory",
+  memory_list: "memory",
+  memory_stats: "memory",
+  secret_shield_scan: "secret-shield",
+  secret_shield_stats: "secret-shield",
+  secret_shield_shape: "secret-shield",
+  secret_shield_keys: "secret-shield",
+  stats_summary: "usage-stats",
+  stats_tools: "usage-stats",
+  stats_tokens: "usage-stats",
+  stats_heatmap: "usage-stats",
+  stats_dashboard: "usage-stats",
+};
+
+const ownerOf = (tool: string): string => TOOL_OWNERS[tool] ?? "unknown plugin";
+
 const COMMANDS: CommandSpec[] = [
   {
     name: "handoff",
@@ -143,7 +202,7 @@ const COMMANDS: CommandSpec[] = [
     build: (args, available) => {
       const installed = TOOLBOX_TOOLS.filter((t) => available.has(t));
       const lines = installed.length
-        ? installed.map((t) => `- ${t}`)
+        ? installed.map((t) => `- ${t} (${ownerOf(t)})`)
         : ["(no open-toolbox tools detected)"];
       return [
         "These open-toolbox tools are installed in this session:",
@@ -181,7 +240,7 @@ export default Plugin.define({
             const missing = spec.requires.filter((t) => !available.has(t));
             const body = spec.build(args, available);
             const text = missing.length
-              ? `Note: this command needs ${missing.join(", ")} but that plugin is not installed, so the request below cannot be completed.\n\n${body}`
+              ? `Note: this command needs ${missing.map((t) => `${t} (from ${ownerOf(t)})`).join(", ")} but that plugin is not installed, so the request below cannot be completed.\n\n${body}`
               : body;
             try {
               await ctx.session.prompt({

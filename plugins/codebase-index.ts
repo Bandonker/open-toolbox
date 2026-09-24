@@ -16,6 +16,7 @@ import {
   applyPragmas,
   isCorruption,
   latestValidBackup,
+  checkOpenDb,
   quoteFtsQuery,
   dbUnavailable,
   type AnyDatabase,
@@ -272,6 +273,13 @@ function tryRestore(): boolean {
     }
     copyFileSync(backup, DB_PATH);
     getDb();
+    // J1: verify the restored copy — open/schema succeed lazily on corrupt
+    // files, so a bad restore must be rejected, never served silently.
+    if (!db || !checkOpenDb(db)) {
+      try { db?.close(); } catch {}
+      db = null;
+      return false;
+    }
     return true;
   } catch {
     return false;

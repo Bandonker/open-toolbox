@@ -8,6 +8,7 @@ import {
   applyPragmas,
   maybeBackupDb,
   latestValidBackup,
+  checkOpenDb,
   isCorruption,
   parseStringArray,
   quoteFtsQuery,
@@ -119,6 +120,12 @@ function tryRestore(): AnyDatabase | null {
   const restored = openDatabase(DB_PATH);
   applyPragmas(restored);
   initSchema(restored);
+  // J1: verify the restored copy on its own handle — the pre-copy backup
+  // check cannot catch a copy that lands corrupt. Never serve it silently.
+  if (!checkOpenDb(restored)) {
+    try { restored.close(); } catch { /* ignore */ }
+    return null;
+  }
   return restored;
 }
 
