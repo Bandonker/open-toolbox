@@ -2961,8 +2961,9 @@ export default Plugin.define({
 
     // ------------------------------------------------------------------ tools
     if (typeof c.tool?.transform === "function") {
-      track(
-        await c.tool.transform((editor) => {
+      try {
+        track(
+          await c.tool.transform((editor) => {
           editor.add({
             name: "context_pruner_stats",
             description: "Show what context-pruner trimmed and the active configuration.",
@@ -3083,14 +3084,19 @@ export default Plugin.define({
               }
             },
           });
-        }),
-      );
+          }),
+        );
+      } catch (err) {
+        log(`tool registration failed; continuing with the remaining plugins: ${String(err)}`);
+        debug(`tool registration failed: ${String(err)}`);
+      }
     }
 
     // --------------------------------------------------------------- commands
     if (typeof c.command?.transform === "function") {
-      track(
-        await c.command.transform((editor) => {
+      try {
+        track(
+          await c.command.transform((editor) => {
           editor.add({
             name: "context",
             description: "Report the current context-compiler budget, epoch, summaries and prune decisions.",
@@ -3123,8 +3129,12 @@ export default Plugin.define({
               }
             },
           });
-        }),
-      );
+          }),
+        );
+      } catch (err) {
+        log(`command registration failed; continuing with the remaining plugins: ${String(err)}`);
+        debug(`command registration failed: ${String(err)}`);
+      }
     }
 
     // --- compress tool implementation (closure over ctx/st) ------------------
