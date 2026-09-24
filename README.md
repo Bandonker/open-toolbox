@@ -83,6 +83,7 @@ cd .opencode && npm install
 | **memory** | 5 | Local-first long-term memory in SQLite FTS5 — `memory_remember`, `memory_recall`, `memory_forget`, `memory_list`, `memory_stats`. No embedding API, no cloud, no network. Relevant memories are auto-injected into each request (`session.hook("context")`) within a hard character budget, deduped per session. DB at `~/.opencode-plugins/memory/memory.db`. |
 | **goal** | 3 | Set an objective for a session and keep working until it is actually reached. `/goal <objective>` (add `- ` lines for success criteria) starts the loop; the goal is re-injected into every request (`session.hook("context")`) so it survives long turns, and when a turn ends the model is auto-continued (`session.prompt`) with the remaining budget. The loop stops only on `goal_complete` (with evidence) or `goal_blocked`, a user interrupt (which pauses), a detected stall (turns that run no tools and repeat themselves), a failure streak, or the iteration/time budget. Goal state is persisted per session, so it survives a plugin reload. Tools: `goal_complete`, `goal_blocked`, `goal_progress`. |
 | **secret-shield** | 4 | v2-native secret detector and redactor. Scrubs the **outbound HTTP body** (session-title, compaction and generate calls), the prompt, tool arguments/results and child-process env; `observe`/`redact`/`block` modes, 69 high-precision rules plus a Shannon-entropy fallback, allowlist precedence, and a hashed JSONL audit that never stores the value. Tools: `secret_shield_scan`, `secret_shield_stats`, `secret_shield_shape`, `secret_shield_keys`. |
+| **finish-guard** | — | Normalises OpenAI-compatible SSE streams at the `session.hook("http.response")` seam so a content/reasoning/tool delta that arrives *after* the `finish_reason` chunk cannot abort the turn. Fixes `AI.Error.InvalidProviderOutput: OpenAI Chat received content after the finish reason` (and the `Failed to drain Session` cascade) from reasoning models behind strict OpenAI-compatible gateways. |
 | **strip-skills-catalog** | — | Strips the `<available_skills>` catalog from the system prompt to save tokens. The `skill` tool still works on demand — agents can call it by name. |
 | **usage-stats** | 5 | Lifetime token / dollar / tool accounting in local SQLite. Cumulative `session.usage.updated` totals are delta-attributed to the session's current model; `title`/`compaction` spend is tracked separately as background. `stats_summary`, `stats_tools`, `stats_tokens`, `stats_heatmap` and `/stats` expose the numbers; `stats_dashboard` writes a self-contained HTML dashboard (heatmap + bar chart + tables) to `~/.opencode-plugins/usage-stats/dashboard.html`. |
 
@@ -294,6 +295,13 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 | `blockEnvReads` | `OPENCODE_SECRET_SHIELD_BLOCK_ENV_READS` | `true` | In `block` mode, deny protected secret-file reads |
 | `log` | `OPENCODE_SECRET_SHIELD_LOG` | `false` | Emit diagnostics to stderr |
 
+### finish-guard options
+
+| Option | Env var | Default | Meaning |
+| :-- | :-- | :-- | :-- |
+| `enabled` | `OPENCODE_FINISH_GUARD_ENABLED` | `true` | Turn stream normalisation off without uninstalling |
+| `log` | `OPENCODE_FINISH_GUARD_LOG` | `false` | Log each normalised stream to stderr |
+
 ### usage-stats options
 
 | Option | Env var | Default | Meaning |
@@ -360,6 +368,7 @@ since some plugins import helpers that live outside it:
 │   ├── session-export.ts
 │   ├── memory.ts
 │   ├── secret-shield.ts
+│   ├── finish-guard.ts
 │   ├── usage-stats.ts
 │   ├── goal.ts
 │   └── strip-skills-catalog.ts

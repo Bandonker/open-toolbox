@@ -213,6 +213,21 @@ const PACKAGES = [
     ],
   },
   {
+    dir: "finish-guard",
+    name: `${SCOPE}/opencode-finish-guard`,
+    source: "plugins/finish-guard.ts",
+    helpers: [],
+    rewrites: {},
+    description:
+      "Normalises OpenAI-compatible SSE streams so a content or reasoning delta that arrives after the finish reason cannot kill a session (\"OpenAI Chat received content after the finish reason\").",
+    keywords: ["stream", "sse", "provider", "openai", "compatibility"],
+    tools: [],
+    config: [
+      ["OPENCODE_FINISH_GUARD_ENABLED", "true", "Turn stream normalisation off without uninstalling"],
+      ["OPENCODE_FINISH_GUARD_LOG", "false", "Log each normalised stream to stderr"],
+    ],
+  },
+  {
     dir: "usage-stats",
     name: `${SCOPE}/opencode-usage-stats`,
     source: "plugins/usage-stats.ts",
