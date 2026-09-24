@@ -86,7 +86,8 @@ type Config = {
   // tier 3 — compression
   compressEnabled: boolean;
   compressText: boolean;
-  compressMode: "range" | "message";
+  // NOTE: a `compressMode` ("range" | "message") option existed historically but
+  // both branches behaved as "range"; it was removed — range behavior is the only mode.
   compressMaxSourceChars: number;
   protectTags: boolean;
   protectUserMessages: boolean;
@@ -572,7 +573,6 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
   const dedupeFile = firstDefined(getPath(strategies, "deduplication"), getPath(file, "deduplication"));
   const purgeFile = firstDefined(getPath(strategies, "purgeErrors"), getPath(file, "purgeErrors"));
 
-  const modeRaw = String(firstDefined(compressValue("mode", "", "compressMode"), "range")).toLowerCase();
   const nudgeForceRaw = String(firstDefined(compressValue("nudgeForce", "", "nudgeForce"), "soft")).toLowerCase();
 
   return {
@@ -600,16 +600,15 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
     superseded: asBool(pick("superseded", "OPENCODE_CONTEXT_PRUNER_SUPERSEDED"), true),
     compressEnabled: asBool(compressValue("enabled", "OPENCODE_CONTEXT_PRUNER_COMPRESS", "compressEnabled"), true),
     compressText: asBool(compressValue("text", "OPENCODE_CONTEXT_PRUNER_COMPRESS_TEXT", "compressText"), true),
-    // C15: `message` mode was never implemented (dead config) — every
-    // accepted value now maps to `range`, while configs that still set
-    // "message" keep parsing without error.
-    compressMode: modeRaw === "message" ? "range" : "range",
+    // CP-6: the `compress.mode` option was dead config (every accepted value
+    // mapped to "range"); it is no longer read — range behavior always applies,
+    // and legacy configs that still set "mode" keep parsing without error.
     compressMaxSourceChars: asInt(compressValue("maxSourceChars", "OPENCODE_CONTEXT_PRUNER_COMPRESS_MAX_CHARS", "compressMaxSourceChars"), 24000, 500, 10_000_000),
     protectTags: asBool(compressValue("protectTags", "OPENCODE_CONTEXT_PRUNER_PROTECT_TAGS", "protectTags"), true),
     protectUserMessages: asBool(compressValue("protectUserMessages", "OPENCODE_CONTEXT_PRUNER_PROTECT_USER", "protectUserMessages"), false),
     summaryBuffer: asBool(compressValue("summaryBuffer", "OPENCODE_CONTEXT_PRUNER_SUMMARY_BUFFER", "summaryBuffer"), true),
     autoSummarize: asBool(compressValue("autoSummarize", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS", "autoSummarize"), true),
-    autoSummarizeMaxCalls: asInt(compressValue("autoSummarizeMaxCalls", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX", "autoSummarizeMaxCalls"), 0, 0, 1000),
+    autoSummarizeMaxCalls: asInt(compressValue("autoSummarizeMaxCalls", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX", "autoSummarizeMaxCalls"), 5, 0, 1000),
     autoSummarizeMinTokens: asInt(compressValue("autoSummarizeMinTokens", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MIN", "autoSummarizeMinTokens"), 4000, 0, 10_000_000),
     // DCP has no cap on compression. The cap stays for the conservative
     // profile, but any profile can set it to 0 (unlimited); the model-call
@@ -673,7 +672,9 @@ function valueToText(value: unknown): string {
     // size estimate still reflects the payload instead of reading empty.
   }
   try {
-    return JSON.stringify(value);
+    // CP-9: file-only payloads can be huge — cap the serialized form.
+    const json = JSON.stringify(value) ?? "";
+    return json.length > 2000 ? `${json.slice(0, 2000)}\n[truncated]` : json;
   } catch {
     return String(value);
   }
@@ -934,18 +935,28 @@ function deriveTitle(messages: MessageLike[]): string | undefined {
   return undefined;
 }
 
+// CP-11: shared RegExp instances are stateful when global/sticky — a `g`/`y`
+// flag left over from a future caller or hand-built config would make
+// `test()` alternate true/false via `lastIndex`. Reset around every test.
+function statelessTest(re: RegExp, text: string): boolean {
+  re.lastIndex = 0;
+  const hit = re.test(text);
+  re.lastIndex = 0;
+  return hit;
+}
+
 function blockedByFilePattern(result: CollectedResult, cfg: Config): boolean {
   if (cfg.protectedFilePatterns.length === 0) return false;
   const path = filePathOf(result);
   if (!path) return false;
-  return cfg.protectedFilePatterns.some((re) => re.test(path));
+  return cfg.protectedFilePatterns.some((re) => statelessTest(re, path));
 }
 
 function isProtected(result: CollectedResult, cfg: Config): boolean {
   return (
     cfg.ignoreTools.has(result.name) ||
     cfg.protectedTools.has(result.name) ||
-    cfg.protectedPatterns.some((re) => re.test(result.name)) ||
+    cfg.protectedPatterns.some((re) => statelessTest(re, result.name)) ||
     blockedByFilePattern(result, cfg)
   );
 }
@@ -1073,7 +1084,15 @@ function makeStub(
     savedChars: Math.max(0, r.text.length - stub.length),
     savedTokens: Math.max(0, r.tokens - estimateTokens(stub, cfg, ratio)),
   };
-  if (stubMemo.size >= STUB_MEMO_MAX) stubMemo.clear();
+  // CP-10: FIFO-evict the oldest entries instead of dropping the whole
+  // cache — a full clear throws away hot stubs next to cold ones.
+  if (stubMemo.size >= STUB_MEMO_MAX) {
+    let evicted = 0;
+    for (const oldest of stubMemo.keys()) {
+      stubMemo.delete(oldest);
+      if (++evicted >= 512) break;
+    }
+  }
   stubMemo.set(memoKey, out);
   return out;
 }
@@ -1112,7 +1131,10 @@ function writeUnit(r: CollectedResult, value: string): void {
     r.part.text = value;
     return;
   }
-  r.part.result = typedResult(r, value);
+  // CP-7: preserve extra host fields — replacing the whole object drops
+  // metadata the host attached to `result`.
+  const prev = isPlainObject(r.part.result) ? (r.part.result as AnyRecord) : {};
+  r.part.result = { ...prev, ...typedResult(r, value) };
 }
 
 function sumSaved(decisions: Map<string, Decision>): number {
@@ -1190,7 +1212,10 @@ function resolveModel(ctx: LooseCtx, ref: AnyRecord | undefined): ModelInfo | un
 function budgetFor(model: ModelInfo | undefined, cfg: Config): { window: number; budget: number; target: number } | null {
   const window = num(model?.limit?.context);
   if (!window || window <= 0) return null;
-  const reserve = Math.min(num(model?.limit?.output, cfg.maxOutputReserve) || cfg.maxOutputReserve, cfg.maxOutputReserve);
+  // CP-5: real hard cap — reserve is the model's output limit clamped to
+  // maxOutputReserve, falling back to maxOutputReserve when unknown.
+  const outputLimit = num(model?.limit?.output);
+  const reserve = outputLimit > 0 ? Math.min(outputLimit, cfg.maxOutputReserve) : cfg.maxOutputReserve;
   const budget = Math.max(0, Math.floor(window * cfg.budgetRatio) - reserve);
   const target = Math.max(0, Math.floor(budget * cfg.targetRatio));
   return { window, budget, target };
@@ -1217,6 +1242,25 @@ function overrideLimit(map: AnyRecord, model: ModelInfo | undefined, ref: AnyRec
 
 const sessions = new Map<string, SessionState>();
 const calibration = new Map<string, number>();
+// CP-4: model-key hint per session — must be evicted with its session (see stateFor).
+const sessionModelKey = new Map<string, string>();
+
+/**
+ * CP-1: best-effort storage write — a throwing or rejecting store must never
+ * surface (sync throw is swallowed, async rejection gets a no-op catch so
+ * Node never reports an unhandled rejection).
+ */
+function guardedSet(store: unknown, key: string, value: unknown): void {
+  try {
+    Promise.resolve(
+      (store as { set?: (k: string, v: unknown) => unknown } | undefined)?.set?.(key, value),
+    ).catch(() => {
+      /* ignore */
+    });
+  } catch {
+    /* ignore */
+  }
+}
 /**
  * Adaptive cache economics. Rewriting a cached prefix pays the provider's
  * cache-write premium once; pruning saves cache-read tokens on every later
@@ -1279,6 +1323,9 @@ function stateFor(sessionID: string): SessionState {
       const evicted = sessions.get(stalestKey);
       if (evicted) flushEpoch(stalestKey, evicted);
       sessions.delete(stalestKey);
+      // CP-4: the model-key hint must die with its session or the map
+      // grows without bound across sessions.
+      sessionModelKey.delete(stalestKey);
     }
   }
   st = {
@@ -1408,16 +1455,34 @@ export const __test__ = {
   hasSession: (sessionID: string): boolean => sessions.has(sessionID),
   resetSessions: (): void => {
     sessions.clear();
+    sessionModelKey.clear();
   },
   setEpochStore: (store: typeof epochStore): void => {
     epochStore = store;
   },
   sanitizeLabel,
   summaryCacheKey,
+  // CP-1..CP-11 verification seams.
+  resolveConfig,
+  guardedSet,
+  valueToText,
+  statelessTest,
+  compilePatterns,
+  isProtected,
+  writeUnit,
+  budgetFor,
+  makeStub,
+  stubMemoSize: (): number => stubMemo.size,
+  clearStubMemo: (): void => {
+    stubMemo.clear();
+  },
+  setModelKey: (sid: string, key: string): void => {
+    sessionModelKey.set(sid, key);
+  },
+  hasModelKey: (sid: string): boolean => sessionModelKey.has(sid),
 };
 
 /** Calibration is keyed per model string when the context hook has seen one. */
-const sessionModelKey = new Map<string, string>();
 
 function modelKeyHint(sessionID: string): string {
   return sessionModelKey.get(sessionID) ?? "";
@@ -2141,20 +2206,27 @@ export default Plugin.define({
         return undefined;
       }
     };
+    // CP-1: storage writes are best-effort — a rejecting store must never
+    // surface as an unhandled rejection.
     const writeStore = (key: string, value: unknown): void => {
-      try {
-        void c.storage?.set?.(key, value);
-      } catch {
-        /* ignore */
-      }
+      guardedSet(c.storage, key, value);
     };
+    // CP-2: per-session persist chain — serializes recall read-modify-write
+    // so overlapping flushes cannot clobber each other.
+    const persistChains = new Map<string, Promise<void>>();
+    // CP-8: memoize the per-request JSON.stringify(event.tools).
+    let lastToolsRef: unknown;
+    let lastToolsJson = "{}";
 
     const notify = (sessionID: string, summaryLine: string, detail: string): void => {
       if (cfg.notify === "off") return;
       const text = cfg.notify === "minimal" ? summaryLine : detail;
       if (cfg.notifyType === "chat") {
         try {
-          void c.session?.synthetic?.({ sessionID, text: `[context-pruner] ${text}`, description: "context-pruner", delivery: "queue" });
+          // CP-1: guarded so a rejecting session sink cannot escape.
+          Promise.resolve(c.session?.synthetic?.({ sessionID, text: `[context-pruner] ${text}`, description: "context-pruner", delivery: "queue" })).catch(() => {
+            /* ignore */
+          });
         } catch {
           /* ignore */
         }
@@ -2238,9 +2310,21 @@ export default Plugin.define({
     /** Flush newly pruned outputs, merging anything already persisted first. */
     const persistRecall = (sessionID: string, st: SessionState): void => {
       if (!st.recallDirty) return;
-      void loadRecall(sessionID, st).then(() => {
-        writeStore(`recall:${sessionID}`, [...st.recall.entries()].map(([id, entry]) => ({ id, ...entry })));
-        st.recallDirty = false;
+      // CP-2: chain onto the session's pending persist so an in-flight
+      // read-modify-write finishes before the next one starts.
+      const tail = persistChains.get(sessionID) ?? Promise.resolve();
+      const head = tail
+        .then(() => loadRecall(sessionID, st))
+        .then(() => {
+          writeStore(`recall:${sessionID}`, [...st.recall.entries()].map(([id, entry]) => ({ id, ...entry })));
+          st.recallDirty = false;
+        })
+        .catch(() => {
+          /* CP-1: ignore */
+        });
+      persistChains.set(sessionID, head);
+      void head.then(() => {
+        if (persistChains.get(sessionID) === head) persistChains.delete(sessionID);
       });
     };
 
@@ -2249,10 +2333,11 @@ export default Plugin.define({
      * summarise the largest compressible results immediately instead of waiting
      * for the model to act on a nudge. Runs at most `autoSummarizeMaxCalls`
      * times per session, and the summary is applied on the next request.
+     * Default budget is 5 calls; 0 opts out into unlimited.
      */
     async function maybeAutoSummarize(sessionID: string, st: SessionState, estimate: number): Promise<void> {
       if (!cfg.autoSummarize || !cfg.compressEnabled || st.autoSummarizing) return;
-      // 0 = unlimited, matching uncapped model-driven compression.
+      // 0 = opt-out unlimited; default 5 bounds `session.generate` spend on stuck sessions.
       if (cfg.autoSummarizeMaxCalls > 0 && st.autoSummarizeCalls >= cfg.autoSummarizeMaxCalls) return;
       if (st.target === null || estimate <= st.target) return;
       const session = c.session;
@@ -2410,13 +2495,15 @@ export default Plugin.define({
                     calibration.set(mKey, r);
                     st.ratio = r;
                   }
+                }).catch(() => {
+                  /* CP-1: ignore */
                 });
               } catch {
                 /* ignore */
               }
             }
             if (mKey) sessionModelKey.set(sessionID, mKey);
-            if (!st.loadedSummaries) void loadSummaries(sessionID, st);
+            if (!st.loadedSummaries) void loadSummaries(sessionID, st).catch(() => {});
 
             const ratio = st.ratio;
             const messages = ((event as AnyRecord).messages ?? []) as MessageLike[];
@@ -2463,9 +2550,20 @@ export default Plugin.define({
             if (steady !== null) effectiveTarget = effectiveTarget === null ? steady : Math.min(effectiveTarget, steady);
             if (effectiveTarget !== null) st.target = effectiveTarget;
 
+            // CP-8: `event.tools` rarely changes between requests — reuse the
+            // last serialization when the reference is identical.
+            const eventTools = (event as AnyRecord).tools;
+            if (eventTools !== lastToolsRef) {
+              try {
+                lastToolsJson = JSON.stringify(eventTools ?? {});
+              } catch {
+                lastToolsJson = "{}";
+              }
+              lastToolsRef = eventTools;
+            }
             const overhead =
               estimateTokens(systemTextOf(event as AnyRecord), cfg, ratio) +
-              estimateTokens(JSON.stringify((event as AnyRecord).tools ?? {}), cfg, ratio) +
+              estimateTokens(lastToolsJson, cfg, ratio) +
               messages.length * 4;
 
             const candidates = candidateResults(results, messages, cfg, covered, cfg.minChars, undefined, st.turnProtectedFrom);
@@ -2629,7 +2727,10 @@ export default Plugin.define({
                     map,
                   ].join("\n");
                   try {
-                    void c.session?.synthetic?.({ sessionID, text: nudge, description: "context-pruner nudge", delivery: "queue" });
+                    // CP-1: guarded so a rejecting session sink cannot escape.
+                    Promise.resolve(c.session?.synthetic?.({ sessionID, text: nudge, description: "context-pruner nudge", delivery: "queue" })).catch(() => {
+                      /* ignore */
+                    });
                   } catch {
                     /* ignore */
                   }
@@ -3129,7 +3230,7 @@ export default Plugin.define({
     }
 
     log(
-      `ready (budgetRatio=${cfg.budgetRatio}, targetRatio=${cfg.targetRatio}, keepRecent=${cfg.keepRecent}, relaxRecentFloor=${cfg.relaxRecentFloor}, minReplanTokens=${cfg.minReplanTokens}, compress=${cfg.compressEnabled ? cfg.compressMode : "off"}${cfg.compressEnabled && cfg.compressText ? "+text" : ""}, collapse=${cfg.collapseRanges ? (cfg.collapseStubs ? "stubs" : "on") : "off"}${cfg.configPath ? `, config=${cfg.configPath}` : ""})`,
+      `ready (budgetRatio=${cfg.budgetRatio}, targetRatio=${cfg.targetRatio}, keepRecent=${cfg.keepRecent}, relaxRecentFloor=${cfg.relaxRecentFloor}, minReplanTokens=${cfg.minReplanTokens}, compress=${cfg.compressEnabled ? "range" : "off"}${cfg.compressEnabled && cfg.compressText ? "+text" : ""}, collapse=${cfg.collapseRanges ? (cfg.collapseStubs ? "stubs" : "on") : "off"}${cfg.configPath ? `, config=${cfg.configPath}` : ""})`,
     );
     debug("context-pruner initialised");
 
