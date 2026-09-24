@@ -195,7 +195,12 @@ nudges. It reads optional config from
 | `charsPerToken` | `OPENCODE_CONTEXT_PRUNER_CHARS_PER_TOKEN` | `3.6` | Seed estimator before calibration |
 | `protectedTools` | `OPENCODE_CONTEXT_PRUNER_PROTECTED_TOOLS` | `task,skill,compress,context_report` | Tools never pruned |
 | `protectedPatterns` | `OPENCODE_CONTEXT_PRUNER_PROTECTED_PATTERNS` | (none) | Regexes of tools never pruned |
-| `notify` | `OPENCODE_CONTEXT_PRUNER_NOTIFY` | `true` | One-line stderr summary when pruning |
+| `notify` | `OPENCODE_CONTEXT_PRUNER_NOTIFY` | `true` | Receipt verbosity: `off` \| `minimal` \| `detailed` |
+| `notifyType` | `OPENCODE_CONTEXT_PRUNER_NOTIFY_TYPE` | `toast` | `chat` posts the receipt inline (`session.synthetic`); `toast` logs to stderr |
+| `notifyMinTokens` | `OPENCODE_CONTEXT_PRUNER_NOTIFY_MIN_TOKENS` | `500` | Turn savings needed to trigger a receipt (`0` = every prune) |
+| `notifyOnTopic` | `OPENCODE_CONTEXT_PRUNER_NOTIFY_ON_TOPIC` | `true` | Also send a receipt when a summary is applied, even below the token floor |
+| `collapseRanges` | `OPENCODE_CONTEXT_PRUNER_COLLAPSE` | `true` | Collapse fully-pruned message spans |
+| `collapseStubs` | `OPENCODE_CONTEXT_PRUNER_COLLAPSE_STUBS` | `true` | Also collapse spans that are only stubbed (max savings) |
 | `superseded` | `OPENCODE_CONTEXT_PRUNER_SUPERSEDED` | `true` | Prune output superseded by a newer read/write of the same file |
 | `autoSummarize` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS` | `true` | Summarise automatically when the token target is exceeded |
 | `autoSummarizeMaxCalls` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX` | `0` | Max automatic summariser calls per session (`0` = unlimited) |

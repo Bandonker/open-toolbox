@@ -149,6 +149,10 @@ type Config = {
   // reporting
   notify: NotifyLevel;
   notifyType: NotifyType;
+  /** Minimum turn savings that trigger an inline prune receipt (0 = every prune). */
+  notifyMinTokens: number;
+  /** Also send a receipt when a summary is applied, even below the token floor. */
+  notifyOnTopic: boolean;
   log: boolean;
   debug: boolean;
   configPath: string | undefined;
@@ -550,6 +554,8 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
 
   const notifyTypeRaw = String(firstDefined(pick("notifyType", "OPENCODE_CONTEXT_PRUNER_NOTIFY_TYPE"), "toast")).toLowerCase();
   const notifyType: NotifyType = notifyTypeRaw === "chat" ? "chat" : "toast";
+  const notifyMinTokens = asInt(pick("notifyMinTokens", "OPENCODE_CONTEXT_PRUNER_NOTIFY_MIN_TOKENS"), 500, 0, 10_000_000);
+  const notifyOnTopic = asBool(pick("notifyOnTopic", "OPENCODE_CONTEXT_PRUNER_NOTIFY_ON_TOPIC"), true);
 
   const manualRaw = getPath(file, "manualMode");
   const manualMode: ManualMode = {
@@ -620,7 +626,7 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
     steadyTargetRatio: Math.min(Math.max(num(pick("steadyTargetRatio", "OPENCODE_CONTEXT_PRUNER_STEADY_RATIO"), 0.06), 0), 1),
     steadyTargetMinTokens: asInt(pick("steadyTargetMinTokens", "OPENCODE_CONTEXT_PRUNER_STEADY_MIN"), 1500, 0, 10_000_000),
     collapseRanges: asBool(pick("collapseRanges", "OPENCODE_CONTEXT_PRUNER_COLLAPSE"), true),
-    collapseStubs: asBool(pick("collapseStubs", "OPENCODE_CONTEXT_PRUNER_COLLAPSE_STUBS"), false),
+    collapseStubs: asBool(pick("collapseStubs", "OPENCODE_CONTEXT_PRUNER_COLLAPSE_STUBS"), true),
     cacheAware: asBool(pick("cacheAware", "OPENCODE_CONTEXT_PRUNER_CACHE_AWARE"), true),
     cacheAmortize: asInt(pick("cacheAmortize", "OPENCODE_CONTEXT_PRUNER_CACHE_AMORTIZE"), 4, 1, 100),
     compactionCheckpoint: asBool(pick("compactionCheckpoint", "OPENCODE_CONTEXT_PRUNER_COMPACTION"), true),
@@ -646,6 +652,8 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
     turnProtection,
     notify,
     notifyType,
+    notifyMinTokens,
+    notifyOnTopic,
     log: asBool(pick("log", "OPENCODE_CONTEXT_PRUNER_LOG"), false),
     debug: asBool(pick("debug", "OPENCODE_CONTEXT_PRUNER_DEBUG"), false),
     configPath: path,
@@ -1480,6 +1488,7 @@ export const __test__ = {
     sessionModelKey.set(sid, key);
   },
   hasModelKey: (sid: string): boolean => sessionModelKey.has(sid),
+  latestTopic,
 };
 
 /** Calibration is keyed per model string when the context hook has seen one. */
@@ -1981,6 +1990,19 @@ function sanitizeLabel(raw: unknown): string {
   s = s.replace(/\s+/g, " ").trim();
   if (s.length > MAX_LABEL_CHARS) s = s.slice(0, MAX_LABEL_CHARS).trimEnd();
   return s;
+}
+
+/** Most recently created summary topic ("": none). Receipts reuse it. */
+function latestTopic(st: SessionState): string {
+  let topic = "";
+  let at = -Infinity;
+  for (const rec of st.summaries.values()) {
+    if (rec.topic && rec.at >= at) {
+      at = rec.at;
+      topic = rec.topic;
+    }
+  }
+  return topic;
 }
 
 function summaryCacheKey(topic: string, source: string): string {
@@ -2688,10 +2710,16 @@ export default Plugin.define({
 
             if ((applied.count > 0 || summaryApplied > 0 || collapsed.spans > 0) && cfg.notify !== "off") {
               const saved = applied.savedTokens + stats.saved + collapsed.savedTokens;
-              notify(
-                sessionID,
-                `pruned ${applied.count} result(s)${summaryApplied ? `, ${summaryApplied} summarised` : ""}${collapsed.spans > 0 ? `, ${collapsed.messages} message(s) collapsed` : ""}, ~${saved} tokens saved (epoch ${st.epoch})`,
-                `epoch ${st.epoch}: pruned ${applied.count}/${results.length}, summaries ${st.summaries.size}, ~${saved} tokens saved` +
+              const sessionTotal = st.savedTokensTotal + st.summarySavedTokens;
+              const topic = latestTopic(st);
+              // Throttled receipt: meaningful saves always report; a freshly
+              // applied summary reports too so the new topic is visible in chat.
+              if (saved >= cfg.notifyMinTokens || (summaryApplied > 0 && cfg.notifyOnTopic)) {
+                const receipt = `saved ~${saved} tokens this turn · ~${sessionTotal} session total${topic ? ` · topic: ${topic}` : ""}`;
+                notify(
+                  sessionID,
+                  `pruned ${applied.count} result(s)${summaryApplied ? `, ${summaryApplied} summarised` : ""}${collapsed.spans > 0 ? `, ${collapsed.messages} message(s) collapsed` : ""} — ${receipt} (epoch ${st.epoch})`,
+                  `epoch ${st.epoch}: pruned ${applied.count}/${results.length}, summaries ${st.summaries.size}, ${receipt}` +
                   (collapsed.spans > 0
                     ? `\n  span collapse: ${collapsed.spans} span(s), ${collapsed.messages} message(s), ~${collapsed.savedTokens} tokens`
                     : "") +
@@ -2699,6 +2727,7 @@ export default Plugin.define({
                     ? `\n  reasons: ${[...new Set([...decisions.values()].map((d) => d.reason))].join(", ")}`
                     : ""),
               );
+              }
             }
 
             // nudges -------------------------------------------------------
