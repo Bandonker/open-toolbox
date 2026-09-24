@@ -490,7 +490,9 @@ function compilePatterns(list: string[]): RegExp[] {
   const out: RegExp[] = [];
   for (const pattern of list) {
     try {
-      out.push(new RegExp(pattern));
+      const re = new RegExp(pattern);
+      const flags = re.flags.replace(/[gy]/g, "");
+      out.push(flags !== re.flags ? new RegExp(re.source, flags) : re);
     } catch {
       /* ignore malformed patterns */
     }
@@ -670,7 +672,7 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
 }
 
 function valueToText(value: unknown): string {
-  if (typeof value === "string") return value;
+  if (typeof value === "string") return value.length > 50000 ? `${value.slice(0, 50000)}\n[truncated]` : value;
   if (value === undefined || value === null) return "";
   if (Array.isArray(value)) {
     // Live tool-result values are arrays of content parts
@@ -2224,9 +2226,6 @@ export default Plugin.define({
 
   async setup(ctx) {
     const c = ctx as unknown as LooseCtx;
-    // Temporarily disabled: this plugin must not register hooks or tools until
-    // its session-stability fix has been validated in a fresh process.
-    if (process.env.OPENCODE_CONTEXT_PRUNER_HARD_DISABLE === "1") return async () => {};
     let cfg = resolveConfig(c.location?.directory, c.options);
     if (!cfg.enabled) {
       // Keep the plugin file loadable for easy re-enabling, but do not register
@@ -2608,7 +2607,8 @@ export default Plugin.define({
             if (!st.loadedSummaries) void loadSummaries(sessionID, st).catch(() => {});
 
             const ratio = st.ratio;
-            const messages = ((event as AnyRecord).messages ?? []) as MessageLike[];
+            const rawMessages = (event as AnyRecord).messages;
+            const messages = (Array.isArray(rawMessages) ? rawMessages : []) as MessageLike[];
             const results = collectResults(messages, cfg, ratio);
             st.compressible = results;
             const protectTurns = Math.max(cfg.keepRecentTurns, cfg.turnProtection.enabled ? cfg.turnProtection.turns : 0);
@@ -2657,7 +2657,8 @@ export default Plugin.define({
             const eventTools = (event as AnyRecord).tools;
             if (eventTools !== lastToolsRef) {
               try {
-                lastToolsJson = JSON.stringify(eventTools ?? {});
+                const raw = JSON.stringify(eventTools ?? {});
+                lastToolsJson = raw.length > 50000 ? raw.slice(0, 50000) : raw;
               } catch {
                 lastToolsJson = "{}";
               }
@@ -3240,10 +3241,15 @@ export default Plugin.define({
           return { content: "The session model is unavailable, so compress cannot generate a summary right now." };
         }
         const prompt = summaryPrompt(source, topic, reason, protectedBlocks);
-        const response = await session.generate({ sessionID, prompt });
-        body = generatedText(response);
+        try {
+          const response = await session.generate({ sessionID, prompt });
+          body = generatedText(response);
+        } catch {
+          body = "";
+        }
+        if (!body && cfg.autoSummarizeStub) body = fallbackSummary(targets);
         if (!body) {
-          debug(`compress generate returned empty (${isPlainObject(response) ? Object.keys(response).join(",") : typeof response})`);
+          debug(`compress generate returned empty`);
           return { content: "The model returned an empty summary; nothing was compressed." };
         }
         totals.generations++;
