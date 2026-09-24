@@ -672,7 +672,10 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
 }
 
 function valueToText(value: unknown): string {
-  if (typeof value === "string") return value.length > 50000 ? `${value.slice(0, 50000)}\n[truncated]` : value;
+  if (typeof value === "string") {
+    if (value.length > 2000 && value.length % 4 === 0 && /^[A-Za-z0-9+/=]+$/.test(value.slice(0, 2000)) && /[A-Z]/.test(value) && /[a-z]/.test(value) && /[0-9]/.test(value)) return `${value.slice(0, 2000)}\n[truncated]`;
+    return value.length > 50000 ? `${value.slice(0, 50000)}\n[truncated]` : value;
+  }
   if (value === undefined || value === null) return "";
   if (Array.isArray(value)) {
     // Live tool-result values are arrays of content parts
@@ -840,6 +843,39 @@ function countToolCalls(messages: MessageLike[]): number {
     for (const part of message.content ?? []) if (part.type === "tool-call") n++;
   }
   return n;
+}
+
+function partHasReasoning(part: unknown): boolean {
+  if (!isPlainObject(part)) return false;
+  const p = part as AnyRecord;
+  const type = String(p.type ?? "").toLowerCase();
+  if (type === "reasoning" || type === "thinking") return true;
+  if (typeof p.reasoning === "string" && p.reasoning.length > 0) return true;
+  if (typeof p.thinking === "string" && p.thinking.length > 0) return true;
+  return false;
+}
+
+function messageHasReasoning(message: unknown): boolean {
+  if (!isPlainObject(message)) return false;
+  const m = message as AnyRecord;
+  if (typeof m.reasoning === "string" && m.reasoning.length > 0) return true;
+  if (typeof m.thinking === "string" && m.thinking.length > 0) return true;
+  const content = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : [];
+  for (const part of content) if (partHasReasoning(part)) return true;
+  return false;
+}
+
+/**
+ * Reasoning turns are provider-sensitive. Injecting a synthetic turn into a
+ * session whose transcript already carries assistant reasoning makes strict
+ * providers (reasoning_content round-trip / "thinking is enabled but
+ * reasoning_content is missing") reject the next request and kills the
+ * session. Detect the real part shape (`type: "reasoning"`) as well as the
+ * legacy top-level `reasoning`/`thinking` fields and `parts` arrays.
+ */
+function hasReasoningContent(messages: MessageLike[]): boolean {
+  for (const message of messages) if (messageHasReasoning(message)) return true;
+  return false;
 }
 
 /** C16: prose compresses far better than tool output — lower floor for it. */
@@ -2414,6 +2450,10 @@ export default Plugin.define({
           /* CP-1: ignore */
         });
       persistChains.set(sessionID, head);
+      if (persistChains.size > 20) {
+        const first = persistChains.keys().next().value as string | undefined;
+        if (first !== undefined && first !== sessionID) persistChains.delete(first);
+      }
       void head.then(() => {
         if (persistChains.get(sessionID) === head) persistChains.delete(sessionID);
       }).catch(() => {});
@@ -2845,13 +2885,21 @@ export default Plugin.define({
                     "",
                     map,
                   ].join("\n");
-                  try {
-                    // CP-1: guarded so a rejecting session sink cannot escape.
-                    Promise.resolve(c.session?.synthetic?.({ sessionID, text: nudge, description: "context-pruner nudge", delivery: "queue" })).catch(() => {
+                  // Never inject into a reasoning turn: bank the nudge and
+                  // surface it on the next receipt instead of voice-ing it as
+                  // a synthetic turn (which strict providers reject).
+                  if (hasReasoningContent(messages)) {
+                    st.pendingNotes.push(nudge.length > 200 ? `${nudge.slice(0, 200).trimEnd()}.` : nudge);
+                    while (st.pendingNotes.length > 20) st.pendingNotes.shift();
+                  } else {
+                    try {
+                      // CP-1: guarded so a rejecting session sink cannot escape.
+                      Promise.resolve(c.session?.synthetic?.({ sessionID, text: nudge, description: "context-pruner nudge", delivery: "queue" })).catch(() => {
+                        /* ignore */
+                      });
+                    } catch {
                       /* ignore */
-                    });
-                  } catch {
-                    /* ignore */
+                    }
                   }
                   st.iterationsSinceCompress = 0;
                 }
