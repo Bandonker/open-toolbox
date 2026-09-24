@@ -133,6 +133,87 @@ assert.ok(
 const quiet = await drive("ses_receipt_quiet", { ...base, notifyMinTokens: 10_000_000 });
 assert.equal(quiet.length, 0, `expected no receipt below the floor, got ${quiet.length}`);
 
+// Single-digest receipts: one turn emits at most one receipt line, and
+// async/manual summary notes ride the next turn's digest.
+{
+  t.resetSessions();
+  const notes = [];
+  const hooks = {};
+  const toolDefs = {};
+  const ctx = stubCtx({
+    options: {
+      ...base,
+      notify: "minimal",
+      notifyMinTokens: 0,
+      autoSummarize: true,
+      autoSummarizeMinTokens: 100,
+      nudgeEnabled: false,
+    },
+    session: {
+      hook: async (name, cb) => {
+        hooks[name] = cb;
+        return { dispose: async () => {} };
+      },
+      synthetic: async (input) => {
+        notes.push(input);
+        return {};
+      },
+      generate: async () => ({ text: "DIGEST-SUMMARY" }),
+    },
+    model: { list: () => [{ id: "m", providerID: "p", limit: { context: 1000, output: 100 } }] },
+    tool: {
+      transform: async (cb) => {
+        cb({ add: (def) => { toolDefs[def.name] = def; } });
+        return { dispose: async () => {} };
+      },
+    },
+  });
+  cleanups.push(await modDefault.setup(ctx));
+  const bigDigest = "B".repeat(20000);
+  const makeDigestMsgs = () => [1, 2].map((n) => ({
+    role: "tool",
+    content: [{ type: "tool-result", id: `g${n}`, name: "read", result: { type: "text", value: bigDigest } }],
+  }));
+  const digestInput = (sessionID) => ({
+    messages: makeDigestMsgs(), system: [], tools: {}, sessionID,
+    model: { providerID: "p", modelID: "m" }, agent: "build",
+  });
+  const settle = () => new Promise((r) => setTimeout(r, 100));
+
+  // Auto-summarise completes after the turn flushed: still one receipt.
+  hooks.context(digestInput("ses_digest"));
+  await settle();
+  assert.equal(notes.length, 1, `one turn emits one receipt, got ${notes.length}`);
+  assert.ok(notes[0].text.startsWith("[context-pruner]"), "digest keeps the plugin prefix");
+  assert.ok(notes[0].text.includes("session total"), "digest keeps the session total");
+
+  // The banked auto-summarise note surfaces on the next turn's digest.
+  hooks.context(digestInput("ses_digest"));
+  await settle();
+  assert.equal(notes.length, 2, `next turn emits one digest, got ${notes.length}`);
+  assert.ok(notes[1].text.includes("auto-summarised"), "digest carries the banked auto note");
+  assert.ok(notes[1].text.includes("topic:"), "digest keeps the topic element");
+
+  // The compress tool banks its note instead of notifying on its own.
+  const beforeCompress = notes.length;
+  const compressRes = await toolDefs.compress.execute({ topic: "auth refactor", last: 2 }, { sessionID: "ses_digest" });
+  assert.ok(
+    /Summarised \d+ tool result/.test(compressRes.content),
+    `compress summarises, got: ${compressRes.content}`,
+  );
+  assert.equal(notes.length, beforeCompress, "compress tool emits no receipt of its own");
+
+  // ...and the next turn carries it in its single digest with the topic.
+  hooks.context(digestInput("ses_digest"));
+  await settle();
+  assert.equal(notes.length, beforeCompress + 1, `compress turn emits one digest, got ${notes.length}`);
+  assert.ok(notes[beforeCompress].text.includes("compress:"), "digest carries the banked compress note");
+  assert.ok(
+    notes[beforeCompress].text.includes("topic: auth refactor"),
+    `digest names the compress topic: ${notes[beforeCompress].text}`,
+  );
+}
+
 t.resetSessions();
 for (const cleanup of cleanups) await cleanup();
 console.log("verify-pruner-receipts: all assertions passed");

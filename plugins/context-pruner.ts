@@ -246,6 +246,12 @@ type SessionState = {
   collapseSpans: number;
   collapseMessages: number;
   collapseSavedTokens: number;
+  /**
+   * Receipt fragments banked by async/out-of-turn completions (auto-summarise,
+   * compress tool, checkpoint). Flushed as part of the next turn's single
+   * digest so one request never emits more than one receipt line.
+   */
+  pendingNotes: string[];
 };
 
 type ModelInfo = {
@@ -1384,6 +1390,7 @@ function stateFor(sessionID: string): SessionState {
       collapseSpans: 0,
       collapseMessages: 0,
       collapseSavedTokens: 0,
+      pendingNotes: [],
     };
     sessions.set(sessionID, st);
     // C18: epoch/decisions reload lazily (fire-and-forget, like summaries) —
@@ -1489,6 +1496,7 @@ export const __test__ = {
   },
   hasModelKey: (sid: string): boolean => sessionModelKey.has(sid),
   latestTopic,
+  topicLedger,
 };
 
 /** Calibration is keyed per model string when the context hook has seen one. */
@@ -1992,6 +2000,28 @@ function sanitizeLabel(raw: unknown): string {
   return s;
 }
 
+/**
+ * Per-turn auto-prune tally. The context hook hands one to
+ * maybeAutoSummarize so the synchronous auto-stub work accumulates into the
+ * turn's single digest instead of notifying on its own.
+ */
+type TurnTally = { stubbed: number; stubSaved: number };
+
+/** Cap for banked receipt fragments (each is one short clause). */
+const MAX_PENDING_NOTES = 4;
+
+/**
+ * Bank a receipt fragment for the next turn's single digest. Out-of-turn
+ * completions (async auto-summarise, compress tool, checkpoint) report here
+ * so they never emit a second receipt line for a request.
+ */
+function bankNote(st: SessionState, note: string): void {
+  const text = note.replace(/\s+/g, " ").trim();
+  if (!text) return;
+  st.pendingNotes.push(text.length > 200 ? `${text.slice(0, 200).trimEnd()}…` : text);
+  while (st.pendingNotes.length > MAX_PENDING_NOTES) st.pendingNotes.shift();
+}
+
 /** Most recently created summary topic ("": none). Receipts reuse it. */
 function latestTopic(st: SessionState): string {
   let topic = "";
@@ -2074,6 +2104,27 @@ function effectiveInputPrice(st: SessionState): number {
   return st.inputCost;
 }
 
+/** Per-topic savings ledger: display-only rollup of the tracked summary records. */
+function topicLedger(st: SessionState, cfg: Config): Array<{ topic: string; summaries: number; units: number; saved: number }> {
+  if (st.summaries.size === 0) return [];
+  const byKey = new Map(st.compressible.map((r) => [r.key, r]));
+  const groups = new Map<string, { topic: string; summaries: number; units: number; saved: number }>();
+  for (const record of st.summaries.values()) {
+    const topic = record.topic || "(general)";
+    let group = groups.get(topic);
+    if (!group) {
+      group = { topic, summaries: 0, units: 0, saved: 0 };
+      groups.set(topic, group);
+    }
+    group.summaries++;
+    group.units += record.covers.length;
+    const present = record.covers.map((key) => byKey.get(key)).filter((r) => r !== undefined);
+    const original = present.reduce((sum, r) => sum + r.tokens, 0);
+    group.saved += Math.max(0, original - estimateTokens(record.text, cfg, st.ratio));
+  }
+  return [...groups.values()].sort((a, b) => b.saved - a.saved);
+}
+
 function renderReport(sessionID: string | undefined, cfg: Config): string {
   const st = sessionID ? sessions.get(sessionID) : undefined;
   const lines: string[] = ["context-pruner — context compiler", ""];
@@ -2115,6 +2166,13 @@ function renderReport(sessionID: string | undefined, cfg: Config): string {
   lines.push(
     `active summaries: ${st.summaries.size} (covering ${coveredKeys(st).size} units, ~${st.summarySavedTokens} tokens saved${proseSummaries ? `, ${proseSummaries} prose` : ""})`,
   );
+  const ledger = topicLedger(st, cfg);
+  if (ledger.length > 0) {
+    lines.push("savings by topic:");
+    for (const row of ledger) {
+      lines.push(`  · ${row.topic} — ${row.summaries} summaries, ${row.units} units, ~${row.saved} tokens saved`);
+    }
+  }
   lines.push(`nudges sent: ${st.nudges}  tool calls since last summary: ${st.iterationsSinceCompress}`);
   lines.push(
     `span collapse: ${cfg.collapseRanges ? "on" : "off"}${cfg.collapseStubs ? "+stubs" : ""}  last request: ${st.collapseSpans} span(s), ${st.collapseMessages} message(s), ~${st.collapseSavedTokens} tokens`,
@@ -2242,7 +2300,8 @@ export default Plugin.define({
 
     const notify = (sessionID: string, summaryLine: string, detail: string): void => {
       if (cfg.notify === "off") return;
-      const text = cfg.notify === "minimal" ? summaryLine : detail;
+      // Minimal stays a single line; detailed is that line plus the detail.
+      const text = cfg.notify === "minimal" ? summaryLine : `${summaryLine}\n${detail}`;
       if (cfg.notifyType === "chat") {
         try {
           // CP-1: guarded so a rejecting session sink cannot escape.
@@ -2357,7 +2416,7 @@ export default Plugin.define({
      * times per session, and the summary is applied on the next request.
      * Default budget is 5 calls; 0 opts out into unlimited.
      */
-    async function maybeAutoSummarize(sessionID: string, st: SessionState, estimate: number): Promise<void> {
+    async function maybeAutoSummarize(sessionID: string, st: SessionState, estimate: number, turn?: TurnTally): Promise<void> {
       if (!cfg.autoSummarize || !cfg.compressEnabled || st.autoSummarizing) return;
       // 0 = opt-out unlimited; default 5 bounds `session.generate` spend on stuck sessions.
       if (cfg.autoSummarizeMaxCalls > 0 && st.autoSummarizeCalls >= cfg.autoSummarizeMaxCalls) return;
@@ -2418,11 +2477,14 @@ export default Plugin.define({
             totals.stubSavedTokens += savedStubs;
             st.savedTokensTotal += savedStubs;
             st.iterationsSinceCompress = 0;
-            notify(
-              sessionID,
-              `stubbed ${appliedStubs.count} result(s), ~${savedStubs} tokens saved`,
-              `auto-stub: ${appliedStubs.count} result(s) below the summary floor (saved ~${savedStubs})`,
-            );
+            // Folded into the turn's single digest (or banked when there is
+            // no turn to attach to) — never a receipt of its own.
+            if (turn) {
+              turn.stubbed += appliedStubs.count;
+              turn.stubSaved += savedStubs;
+            } else {
+              bankNote(st, `stubbed ${appliedStubs.count} result(s), ~${savedStubs} tokens saved`);
+            }
             debug(`auto-stub applied for ${sessionID}: ${appliedStubs.count} results, ~${savedStubs} tokens`);
           }
         }
@@ -2480,11 +2542,9 @@ export default Plugin.define({
         totals.summaries++;
         totals.summarySavedTokens += saved;
         st.iterationsSinceCompress = 0;
-        notify(
-          sessionID,
-          `auto-summarised ${chosen.length} result(s), ~${saved} tokens saved`,
-          `auto-compress: ${chosen.length} result(s) -> ${tokens} tokens (saved ~${saved})`,
-        );
+        // Banked for the next turn's single digest: this completion lands
+        // after the triggering turn already flushed its receipt.
+        bankNote(st, `auto-summarised ${chosen.length} result(s), ~${saved} tokens saved`);
         debug(`auto-summarise applied for ${sessionID}: ${chosen.length} results, ~${saved} tokens`);
       } catch (err) {
         debug(`auto-summarise failed: ${String(err)}`);
@@ -2659,7 +2719,11 @@ export default Plugin.define({
             // low steady target, but a digest of the stubbed units is smaller
             // still. The record is stored now and applied on the next request.
             const rawEstimate = sentTokens(results, overhead, new Map(), 0);
-            if (!cfg.manualMode.enabled) void maybeAutoSummarize(sessionID, st, rawEstimate).catch(() => {});
+            // Single-digest receipts: auto-stub counts accumulate into this
+            // turn's receipt instead of notifying separately; async
+            // completions bank a note for the next turn's digest.
+            const turnAuto: TurnTally = { stubbed: 0, stubSaved: 0 };
+            if (!cfg.manualMode.enabled) void maybeAutoSummarize(sessionID, st, rawEstimate, turnAuto).catch(() => {});
 
             const summaryApplied = applySummaries(results, st);
             const applied = applyDecisions(results, decisions, cfg, ratio, covered, st);
@@ -2708,17 +2772,22 @@ export default Plugin.define({
             // subsequent request.
             st.savedTokensTotal += applied.savedTokens + collapsed.savedTokens;
 
-            if ((applied.count > 0 || summaryApplied > 0 || collapsed.spans > 0) && cfg.notify !== "off") {
-              const saved = applied.savedTokens + stats.saved + collapsed.savedTokens;
+            // One receipt per turn: prune, stub, summary, collapse and any
+            // banked notes share a single digest through notify().
+            const banked = st.pendingNotes.length > 0 ? [...st.pendingNotes] : [];
+            if ((applied.count > 0 || summaryApplied > 0 || collapsed.spans > 0 || turnAuto.stubbed > 0 || banked.length > 0) && cfg.notify !== "off") {
+              const saved = applied.savedTokens + stats.saved + collapsed.savedTokens + turnAuto.stubSaved;
               const sessionTotal = st.savedTokensTotal + st.summarySavedTokens;
               const topic = latestTopic(st);
               // Throttled receipt: meaningful saves always report; a freshly
-              // applied summary reports too so the new topic is visible in chat.
-              if (saved >= cfg.notifyMinTokens || (summaryApplied > 0 && cfg.notifyOnTopic)) {
-                const receipt = `saved ~${saved} tokens this turn · ~${sessionTotal} session total${topic ? ` · topic: ${topic}` : ""}`;
+              // applied summary — or a banked note from an async/manual
+              // summarise or checkpoint — reports too so nothing is lost.
+              if (saved >= cfg.notifyMinTokens || (summaryApplied > 0 && cfg.notifyOnTopic) || (banked.length > 0 && cfg.notifyOnTopic)) {
+                st.pendingNotes.length = 0;
+                const receipt = `saved ~${saved} tokens this turn · ~${sessionTotal} session total${topic ? ` · topic: ${topic}` : ""}${banked.length > 0 ? ` · ${banked.join(" · ")}` : ""}`;
                 notify(
                   sessionID,
-                  `pruned ${applied.count} result(s)${summaryApplied ? `, ${summaryApplied} summarised` : ""}${collapsed.spans > 0 ? `, ${collapsed.messages} message(s) collapsed` : ""} — ${receipt} (epoch ${st.epoch})`,
+                  `pruned ${applied.count} result(s)${summaryApplied ? `, ${summaryApplied} summarised` : ""}${turnAuto.stubbed > 0 ? `, ${turnAuto.stubbed} stubbed` : ""}${collapsed.spans > 0 ? `, ${collapsed.messages} message(s) collapsed` : ""} — ${receipt} (epoch ${st.epoch})`,
                   `epoch ${st.epoch}: pruned ${applied.count}/${results.length}, summaries ${st.summaries.size}, ${receipt}` +
                   (collapsed.spans > 0
                     ? `\n  span collapse: ${collapsed.spans} span(s), ${collapsed.messages} message(s), ~${collapsed.savedTokens} tokens`
@@ -3172,11 +3241,9 @@ export default Plugin.define({
       totals.summarySavedTokens += savedTokens;
       st.iterationsSinceCompress = 0;
 
-      notify(
-        sessionID,
-        `summarised ${targets.length} result(s) into ~${record.tokens} tokens (saved ~${savedTokens})`,
-        `compress: ${targets.length} result(s) → ${record.tokens} tokens (saved ~${savedTokens}). topic: ${topic || "general"}`,
-      );
+      // Banked for the next turn's single digest: the digest names the
+      // summary and its topic when it applies the record.
+      bankNote(st, `compress: ${targets.length} result(s) → ${record.tokens} tokens (saved ~${savedTokens})`);
 
       return {
         content: [
@@ -3206,7 +3273,8 @@ export default Plugin.define({
             // cache.read/write). A bare number crashes compaction on `cache.read`.
             record.result = { summary, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } };
             totals.checkpoints++;
-            notify(sessionID, `context checkpoint written (${summary.length} chars)`, `compaction: checkpoint ${summary.length} chars`);
+            // Banked for the next turn's single digest, not a receipt of its own.
+            bankNote(stateFor(sessionID), `checkpoint written (${summary.length} chars)`);
             debug(`checkpoint for ${sessionID}: ${summary.length} chars`);
           } catch (err) {
             debug(`compaction hook failed: ${String(err)}`);
