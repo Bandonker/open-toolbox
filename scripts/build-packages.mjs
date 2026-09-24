@@ -121,6 +121,7 @@ const PACKAGES = [
       ["OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS", "true", "Summarise automatically when the token target is exceeded"],
       ["OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX", "3", "Max automatic summariser calls per session"],
       ["OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MIN", "4000", "Minimum tokens a range must hold to be auto-summarised"],
+      ["OPENCODE_CONTEXT_PRUNER_MAX_AUTO_SUMMARIES", "12", "Max stale units covered per proactive summary"],
       ["OPENCODE_CONTEXT_PRUNER_COMPRESS", "true", "Enable the model-callable compress tool"],
       ["OPENCODE_CONTEXT_PRUNER_COMPRESS_MAX_CHARS", "24000", "Max characters sent to the summariser per compress call"],
       ["OPENCODE_CONTEXT_PRUNER_PROTECT_TAGS", "true", "Preserve <protect>...</protect> blocks during summarisation"],

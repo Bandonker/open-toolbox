@@ -95,6 +95,8 @@ type Config = {
   autoSummarize: boolean;
   autoSummarizeMaxCalls: number;
   autoSummarizeMinTokens: number;
+  /** Per-request cap on auto-summarised units (top tokens first); 0 = unlimited. */
+  maxAutoSummaries: number;
   /** Stub prose without a model call when past `autoSummarizeRatio` of budget. */
   autoSummarizeStub: boolean;
   autoSummarizeRatio: number;
@@ -622,6 +624,7 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
     autoSummarize: asBool(compressValue("autoSummarize", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS", "autoSummarize"), true),
     autoSummarizeMaxCalls: asInt(compressValue("autoSummarizeMaxCalls", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX", "autoSummarizeMaxCalls"), 5, 0, 1000),
     autoSummarizeMinTokens: asInt(compressValue("autoSummarizeMinTokens", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MIN", "autoSummarizeMinTokens"), 4000, 0, 10_000_000),
+    maxAutoSummaries: asInt(compressValue("maxAutoSummaries", "OPENCODE_CONTEXT_PRUNER_MAX_AUTO_SUMMARIES", "maxAutoSummaries"), 12, 0, 1000),
     // DCP has no cap on compression. The cap stays for the conservative
     // profile, but any profile can set it to 0 (unlimited); the model-call
     // budget is what actually gates the decision, and past
@@ -2413,7 +2416,9 @@ export default Plugin.define({
      * Guaranteed token relief: when the projected request exceeds the target,
      * summarise the largest compressible results immediately instead of waiting
      * for the model to act on a nudge. Runs at most `autoSummarizeMaxCalls`
-     * times per session, and the summary is applied on the next request.
+     * model calls per session (cache hits are free), covers at most
+     * `maxAutoSummaries` units per request (largest first; 0 = unlimited),
+     * and the summary is applied on the next request.
      * Default budget is 5 calls; 0 opts out into unlimited.
      */
     async function maybeAutoSummarize(sessionID: string, st: SessionState, estimate: number, turn?: TurnTally): Promise<void> {
@@ -2442,11 +2447,14 @@ export default Plugin.define({
       const shortfall = estimate - st.target;
       const chosen: CollectedResult[] = [];
       let sum = 0;
+      // Per-request cap: the pool is sorted by tokens desc, so this keeps the
+      // top-N biggest wins. 0 = unlimited (no count cap).
+      const cap = cfg.maxAutoSummaries > 0 ? cfg.maxAutoSummaries : pool.length;
       for (const r of pool) {
         if (chosen.length > 0 && sum >= shortfall) break;
         chosen.push(r);
         sum += r.tokens;
-        if (chosen.length >= 12) break;
+        if (chosen.length >= cap) break;
       }
 
       // Present the summary at the earliest covered unit so the model reads it
@@ -2494,7 +2502,6 @@ export default Plugin.define({
       if (typeof session?.generate !== "function") return;
 
       st.autoSummarizing = true;
-      st.autoSummarizeCalls++;
       try {
         const raw = chosen.map((r) => `### ${r.name}\n${r.text}`).join("\n\n");
         let blocks: string[] = [];
@@ -2511,6 +2518,10 @@ export default Plugin.define({
         const cached = await readStore(cacheKey);
         if (isPlainObject(cached) && typeof cached.text === "string" && cached.text) body = cached.text;
         if (!body) {
+          // Cache misses spend the session model-call budget; cache hits are
+          // free so repeat requests covering the same units don't re-spend.
+          st.autoSummarizeCalls++;
+          if (cfg.autoSummarizeMaxCalls > 0 && st.autoSummarizeCalls > cfg.autoSummarizeMaxCalls) return;
           const prompt = summaryPrompt(source, "what future work needs", "context budget", blocks);
           try {
             const response = await session.generate({ sessionID, prompt });

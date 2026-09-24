@@ -205,6 +205,7 @@ nudges. It reads optional config from
 | `autoSummarize` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS` | `true` | Summarise automatically when the token target is exceeded |
 | `autoSummarizeMaxCalls` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX` | `0` | Max automatic summariser calls per session (`0` = unlimited) |
 | `autoSummarizeMinTokens` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MIN` | `4000` | Minimum tokens a range must hold to be auto-summarised |
+| `maxAutoSummaries` | `OPENCODE_CONTEXT_PRUNER_MAX_AUTO_SUMMARIES` | `12` | Max stale units covered per proactive summary (`0` = unlimited; lower trades coverage for fewer calls) |
 | `proactiveSummarize` | `OPENCODE_CONTEXT_PRUNER_PROACTIVE` | `true` | Keep the request near the steady ceiling even when the window is wide |
 | `steadyTargetRatio` | `OPENCODE_CONTEXT_PRUNER_STEADY_RATIO` | `0.06` | Steady ceiling as a fraction of the window (`0` disables) |
 | `steadyTargetMinTokens` | `OPENCODE_CONTEXT_PRUNER_STEADY_MIN` | `1500` | Floor for the steady ceiling |
