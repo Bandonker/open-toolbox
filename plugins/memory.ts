@@ -277,6 +277,31 @@ function toMatch(query: string, mode: "all" | "any"): string {
   return mode === "any" ? quoted.split(" ").join(" OR ") : quoted;
 }
 
+/**
+ * ME-9: fetch-more loop for isolation-filtered reads. `visible()` can reject
+ * rows after SQL LIMIT applied, so a single over-fetch under-fills under a
+ * restrictive scope. Fetch progressively larger windows (up to 4 rounds)
+ * until `limit` visible rows are filled or the fetch stops growing
+ * (exhausted), then slice.
+ */
+function pageVisible(
+  fetch: (n: number) => MemoryRow[],
+  limit: number,
+  project: string,
+  sessionID: string | null,
+  all: boolean,
+): MemoryRow[] {
+  let want = limit * 3;
+  let out: MemoryRow[] = [];
+  for (let round = 0; round < 4; round++) {
+    const got = fetch(want);
+    out = got.filter((r) => visible(r, project, sessionID, all)).slice(0, limit);
+    if (out.length >= limit || got.length < want) return out;
+    want = Math.min(want * 2 + 1, 500);
+  }
+  return out;
+}
+
 function search(database: AnyDatabase, match: string, limit: number, minScore: number, scope: Scope | null): MemoryRow[] {
   if (!match) return [];
   const params: unknown[] = [match];
@@ -410,9 +435,13 @@ export default Plugin.define({
             const limit = clampLimit(args.limit ?? cfg.topK, cfg.topK, 100);
             const all = args.all === true || cfg.recallAll;
             const sessionID = toolCtx?.sessionID ?? null;
-            const rows = search(requireDb(), toMatch(args.query, "all"), Math.max(limit * 3, limit), cfg.minScore, scope)
-              .filter((row) => visible(row, project, sessionID, all))
-              .slice(0, limit);
+            const rows = pageVisible(
+              (n) => search(requireDb(), toMatch(args.query, "all"), n, cfg.minScore, scope),
+              limit,
+              project,
+              sessionID,
+              all,
+            );
             if (rows.length === 0) return { content: "No memories matched." };
             return { content: rows.map(formatRow).join("\n") };
           } catch (err) {
@@ -427,13 +456,19 @@ export default Plugin.define({
         input: z.object({
           id: z.number().int().positive().optional().describe("Exact memory id."),
           query: z.string().min(1).optional().describe("Delete every FTS match."),
+          all: z.boolean().optional().describe("Allow deleting memories from other projects/sessions (default false)."),
         }),
-        execute: async (args) => {
+        execute: async (args, toolCtx) => {
           try {
             const database = requireDb();
+            // ME-1: every delete path is filtered through visible() so one
+            // project/session cannot wipe global or sibling-project memories.
+            const sessionID = toolCtx?.sessionID ?? null;
+            // recallAll deliberately does not widen forget: deletion stays explicit per call.
+            const all = (args as { all?: boolean }).all === true;
             if (typeof args.id === "number") {
-              const existing = database.prepare("SELECT id FROM memories WHERE id = ?").get(args.id) as { id: number } | null;
-              if (!existing) return { content: `No memory #${args.id}.` };
+              const existing = database.prepare("SELECT * FROM memories WHERE id = ?").get(args.id) as MemoryRow | null;
+              if (!existing || !visible(existing, project, sessionID, all)) return { content: `No memory #${args.id}.` };
               database.prepare("DELETE FROM memories WHERE id = ?").run(args.id);
               dropSeenIds([args.id]);
               return { content: `Forgot #${args.id}.` };
@@ -441,9 +476,9 @@ export default Plugin.define({
             if (typeof args.query === "string") {
               const match = quoteFtsQuery(args.query);
               if (!match) return { content: "Nothing to forget." };
-              const rows = database
-                .prepare("SELECT m.id FROM memories m JOIN memories_fts ON m.id = memories_fts.rowid WHERE memories_fts MATCH ?")
-                .all(match) as Array<{ id: number }>;
+              const rows = (database
+                .prepare("SELECT m.* FROM memories m JOIN memories_fts ON m.id = memories_fts.rowid WHERE memories_fts MATCH ?")
+                .all(match) as MemoryRow[]).filter((row) => visible(row, project, sessionID, all));
               if (rows.length === 0) return { content: "No memories matched." };
               const del = database.prepare("DELETE FROM memories WHERE id = ?");
               for (const row of rows) del.run(row.id);
@@ -463,16 +498,32 @@ export default Plugin.define({
         input: z.object({
           scope: scopeSchema.optional().describe("Restrict to one scope."),
           limit: z.number().int().min(1).max(100).optional().describe("Max rows (default 20)."),
+          all: z.boolean().optional().describe("Include memories from other projects/sessions (default false)."),
         }),
-        execute: async (args) => {
+        execute: async (args, toolCtx) => {
           try {
             const database = requireDb();
             const scope = args.scope ? resolveScope(args.scope) : null;
             // Shared clampLimit: trunc + finite guard before LIMIT.
             const limit = clampLimit(args.limit ?? 20, 20, 100);
-            const rows = scope
-              ? (database.prepare("SELECT * FROM memories WHERE scope = ? ORDER BY created_at DESC, id DESC LIMIT ?").all(scope, limit) as MemoryRow[])
-              : (database.prepare("SELECT * FROM memories ORDER BY created_at DESC, id DESC LIMIT ?").all(limit) as MemoryRow[]);
+            // ME-2: apply visible() so cross-session memories do not leak;
+            // ME-9: over-fetch in a fetch-more loop so the filter still
+            // fills `limit` under restrictive isolation.
+            const sessionID = toolCtx?.sessionID ?? null;
+            // recallAll deliberately does not widen list: broadening stays explicit per call.
+            const all = args.all === true;
+            const rows = pageVisible(
+              (n) => {
+                const fetched = scope
+                  ? (database.prepare("SELECT * FROM memories WHERE scope = ? ORDER BY created_at DESC, id DESC LIMIT ?").all(scope, n) as MemoryRow[])
+                  : (database.prepare("SELECT * FROM memories ORDER BY created_at DESC, id DESC LIMIT ?").all(n) as MemoryRow[]);
+                return fetched;
+              },
+              limit,
+              project,
+              sessionID,
+              all,
+            );
             if (rows.length === 0) return { content: "No memories stored." };
             return { content: rows.map(formatRow).join("\n") };
           } catch (err) {

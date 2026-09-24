@@ -230,7 +230,7 @@ export default Plugin.define({
           };
           const out = withRetry(() => {
             const database = getDb();
-            const tags = JSON.stringify(args.tags || []);
+            const tags = JSON.stringify(args.tags ?? []);
             const result = database.prepare(
               "INSERT INTO snippets (title, code, language, description, tags) VALUES (?, ?, ?, ?, ?)"
               // P5: title/description are free text; `code` is deliberately
@@ -238,7 +238,7 @@ export default Plugin.define({
               // snippets the user asked to store (secret-shield's redact/block
               // mode still covers them when enabled).
             // CR-4: cap unbounded inputs (title 300, code 100k, description 5k).
-            ).run(truncateStored(scrubStore(args.title), STORE_CAPS.snippetTitle), truncateStored(args.code, STORE_CAPS.snippetCode), args.language || "", args.description ? truncateStored(scrubStore(args.description), STORE_CAPS.snippetDescription) : "", tags) as { lastInsertRowid: number | bigint };
+            ).run(truncateStored(scrubStore(args.title), STORE_CAPS.snippetTitle), truncateStored(args.code, STORE_CAPS.snippetCode), args.language ?? "", args.description ? truncateStored(scrubStore(args.description), STORE_CAPS.snippetDescription) : "", tags) as { lastInsertRowid: number | bigint };
             return `Saved snippet #${result.lastInsertRowid}: "${args.title}"`;
           }, true);
           return { content: out };
@@ -262,7 +262,7 @@ export default Plugin.define({
           const out = withRetry(() => {
             const database = getDb();
             // SN-6: trunc + finite guard via shared clampLimit.
-            const limit = clampLimit(args.limit || 10, 10, 50);
+            const limit = clampLimit(args.limit ?? 10, 10, 50);
             const q = quoteFtsQuery(args.query);
             if (q === null) return "No snippets found matching query.";
             let sql = `SELECT s.* FROM snippets s JOIN snippets_fts f ON s.id = f.rowid WHERE snippets_fts MATCH ?`;
@@ -303,7 +303,7 @@ export default Plugin.define({
           const out = withRetry(() => {
             const database = getDb();
             // SN-6: trunc + finite guard via shared clampLimit.
-            const limit = clampLimit(args.limit || 20, 20, 100);
+            const limit = clampLimit(args.limit ?? 20, 20, 100);
 
             let sql = "SELECT * FROM snippets WHERE 1=1";
             const params: unknown[] = [];

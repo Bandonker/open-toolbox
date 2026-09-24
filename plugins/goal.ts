@@ -159,6 +159,10 @@ interface GoalConfig {
 
 const STORE_PREFIX = "goal.v1.";
 const MARK = "[goal-plugin]";
+/** GO-6: unique sentinel marking reminders this plugin injected, so the
+ * context hook only strips its own output — never user/system text that
+ * merely mentions the plugin. */
+const REMINDER_SENTINEL = "[goal-plugin:reminder:v1]";
 const MAX_PROGRESS = 20;
 const HELP = [
   "goal — keep working until an objective is reached.",
@@ -213,7 +217,8 @@ function resolveConfig(options: Record<string, unknown> | undefined): GoalConfig
   return {
     enabled: toBool(pick("enabled", "OPENCODE_GOAL_ENABLED"), true),
     maxIterations: toInt(pick("maxIterations", "OPENCODE_GOAL_MAX_ITERATIONS"), 30, 1, 100000),
-    maxMinutes: toInt(pick("maxMinutes", "OPENCODE_GOAL_MAX_MINUTES"), 180, 1, 100000),
+    // GO-10: 0 = no wall-clock deadline (deadlineAt stays null).
+    maxMinutes: toInt(pick("maxMinutes", "OPENCODE_GOAL_MAX_MINUTES"), 180, 0, 100000),
     stallLimit: toInt(pick("stallLimit", "OPENCODE_GOAL_STALL_LIMIT"), 3, 1, 1000),
     maxFailures: toInt(pick("maxFailures", "OPENCODE_GOAL_MAX_FAILURES"), 3, 1, 1000),
     requireEvidence: toBool(pick("requireEvidence", "OPENCODE_GOAL_REQUIRE_EVIDENCE"), true),
@@ -238,8 +243,21 @@ function truncate(text: string, max: number): string {
 function textOf(message: RawMessage | undefined): string {
   const parts = Array.isArray(message?.content) ? message.content : [];
   return parts
-    .filter((p) => p?.type === "text" && typeof p.text === "string")
-    .map((p) => p.text as string)
+    .map((p) => {
+      if (p?.type === "text" && typeof p.text === "string") return p.text;
+      // GO-8: non-text parts (image/tool/file) fall back to a capped
+      // stringify so the turn is never an "empty signature" stall
+      // false-positive just because it carried no text.
+      if (p && typeof p === "object") {
+        try {
+          return `[part type=${String(p.type ?? "unknown")}: ${truncate(JSON.stringify(p), 200)}]`;
+        } catch {
+          return `[part type=${String(p.type ?? "unknown")}: unstringifiable]`;
+        }
+      }
+      return "";
+    })
+    .filter(Boolean)
     .join("\n");
 }
 
@@ -352,13 +370,15 @@ function statusText(st: GoalState, cfg: GoalConfig): string {
   const elapsedMin = Math.max(0, Math.round((now - st.startedAt) / 60000));
   const budgetMin = st.deadlineAt
     ? Math.max(0, Math.round((st.deadlineAt - now) / 60000))
-    : Math.max(0, cfg.maxMinutes - elapsedMin);
+    : cfg.maxMinutes > 0
+      ? Math.max(0, cfg.maxMinutes - elapsedMin)
+      : null;
   const lines = [`${MARK} Goal (${STATUS_LABEL[st.status]})`, `Objective: ${st.objective}`];
   if (st.criteria.length > 0) {
     lines.push(`Success criteria:\n${st.criteria.map((c, i) => `  ${i + 1}. ${c}`).join("\n")}`);
   }
   lines.push(
-    `Attempts: ${st.iterations}/${st.maxIterations} (${remaining} left) · ${elapsedMin} min elapsed · ~${budgetMin} min budget left`,
+    `Attempts: ${st.iterations}/${st.maxIterations} (${remaining} left) · ${elapsedMin} min elapsed · ${budgetMin === null ? "no wall-clock deadline" : `~${budgetMin} min budget left`}`,
   );
   if (st.progress.length > 0) {
     lines.push(
@@ -399,6 +419,31 @@ export default Plugin.define({
     const loading = new Map<string, Promise<GoalState | undefined>>();
     const inFlight = new Set<string>();
     const toolActivity = new Set<string>();
+    /** GO-3/CR-5: session-keyed state is capped with oldest-first (FIFO)
+     * eviction so a long-lived process cannot grow it without bound.
+     * Related entries are evicted together to avoid half-state. */
+    const MAX_SESSION_STATES = 500;
+    const evictSessionStateIfFull = (): void => {
+      while (live.size >= MAX_SESSION_STATES) {
+        const oldest = live.keys().next();
+        if (oldest.done) break;
+        const sid = oldest.value as string;
+        live.delete(sid);
+        loading.delete(sid);
+        inFlight.delete(sid);
+        toolActivity.delete(sid);
+      }
+      while (loading.size > MAX_SESSION_STATES) {
+        const oldest = loading.keys().next();
+        if (oldest.done) break;
+        loading.delete(oldest.value as string);
+      }
+      while (toolActivity.size > MAX_SESSION_STATES) {
+        const oldest = toolActivity.values().next();
+        if (oldest.done) break;
+        toolActivity.delete(oldest.value);
+      }
+    };
     const disposers: Array<() => void | Promise<void>> = [];
     const track = (registration: Disposable | undefined): void => {
       if (registration && typeof registration.dispose === "function") {
@@ -420,11 +465,23 @@ export default Plugin.define({
     };
 
     const save = async (st: GoalState): Promise<void> => {
+      evictSessionStateIfFull();
       live.set(st.sessionID, st);
       try {
         await c.storage?.set?.(STORE_PREFIX + st.sessionID, st);
       } catch (err) {
-        log(`failed to persist goal for ${st.sessionID}: ${describeError(err)}`);
+        // GO-7: persistence loss must never be silent — the goal would look
+        // set and vanish on reload. Always error, and surface it in the note
+        // when notifications are on.
+        const message = `failed to persist goal for ${st.sessionID}: ${describeError(err)}`;
+        console.error(`[goal] ${message}`);
+        if (cfg.notify) {
+          try {
+            await c.session?.synthetic?.({ sessionID: st.sessionID, text: `[goal-plugin] Warning: ${message}` });
+          } catch {
+            /* note is best-effort */
+          }
+        }
       }
     };
 
@@ -437,6 +494,16 @@ export default Plugin.define({
         try {
           const raw = (await c.storage?.get?.(STORE_PREFIX + sessionID)) as GoalState | undefined;
           if (raw && typeof raw === "object" && typeof raw.objective === "string" && raw.status) {
+            // GO-4: lastHandledMessageID compared both by value and by type
+            // (dedupe/evaluate). Normalise to a string on load so a stored
+            // number can never disagree with a string message id.
+            raw.lastHandledMessageID =
+              typeof raw.lastHandledMessageID === "string"
+                ? raw.lastHandledMessageID
+                : typeof raw.lastHandledMessageID === "number"
+                  ? String(raw.lastHandledMessageID)
+                  : "";
+            evictSessionStateIfFull();
             live.set(sessionID, raw);
             return raw;
           }
@@ -473,7 +540,8 @@ export default Plugin.define({
         createdAt: now,
         updatedAt: now,
         startedAt: now,
-        deadlineAt: now + cfg.maxMinutes * 60_000,
+        // GO-10: maxMinutes 0 means no wall-clock deadline.
+        deadlineAt: cfg.maxMinutes > 0 ? now + cfg.maxMinutes * 60_000 : null,
         maxIterations: cfg.maxIterations,
         iterations: 0,
         failures: 0,
@@ -677,242 +745,280 @@ export default Plugin.define({
 
     /* --------------------------------------------------------- registration */
 
+    // GO-11: each registration is guarded so one failure is logged and
+    // setup continues with the rest instead of aborting the plugin.
     if (c.tool?.transform) {
-      track(
-        await c.tool.transform((editor) => {
-          editor.add({
-            name: "goal_complete",
-            description:
-              "Declare the active goal complete. Only call this when the objective and every success criterion is genuinely achieved and verified; include the checks you ran and their observed results as evidence.",
-            input: z.object({
-              summary: z.string().min(1).describe("One-line summary of what was accomplished."),
-              evidence: z
-                .string()
-                .optional()
-                .describe("The exact commands/tests you ran and their results."),
-            }),
-            execute: (async (
-              args: { summary: string; evidence?: string },
-              toolCtx: { sessionID?: string },
-            ) => {
-              const sessionID = toolCtx?.sessionID ?? "";
-              const st = await load(sessionID);
-              if (!st) return { content: "No goal is set for this session." };
-              if (st.status !== "active") {
-                return { content: `The goal is already ${STATUS_LABEL[st.status]}; nothing to complete.` };
-              }
-              const evidence = (args.evidence ?? "").trim();
-              if (cfg.requireEvidence && !evidence) {
+      try {
+        track(
+          await c.tool.transform((editor) => {
+            editor.add({
+              name: "goal_complete",
+              description:
+                "Session-scoped: no-ops without an active goal in this session. Declare the active goal complete. Only call this when the objective and every success criterion is genuinely achieved and verified; include the checks you ran and their observed results as evidence.",
+              input: z.object({
+                summary: z.string().min(1).describe("One-line summary of what was accomplished."),
+                evidence: z
+                  .string()
+                  .optional()
+                  .describe("The exact commands/tests you ran and their results."),
+              }),
+              execute: (async (
+                args: { summary: string; evidence?: string },
+                toolCtx: { sessionID?: string },
+              ) => {
+                const sessionID = toolCtx?.sessionID ?? "";
+                const st = await load(sessionID);
+                if (!st) return { content: "No goal is set for this session." };
+                if (st.status !== "active") {
+                  return { content: `The goal is already ${STATUS_LABEL[st.status]}; nothing to complete.` };
+                }
+                const evidence = (args.evidence ?? "").trim();
+                if (cfg.requireEvidence && !evidence) {
+                  return {
+                    content:
+                      "Refused: `goal_complete` needs `evidence` — the exact commands/tests you ran and their observed results. Verify the goal first, then call again.",
+                  };
+                }
+                st.status = "complete";
+                st.lastSummary = args.summary.trim();
+                if (evidence) st.evidence = evidence;
+                st.updatedAt = Date.now();
+                await save(st);
                 return {
                   content:
-                    "Refused: `goal_complete` needs `evidence` — the exact commands/tests you ran and their observed results. Verify the goal first, then call again.",
+                    "Goal marked complete; the goal loop has stopped. Give the user a concise final summary now.",
                 };
-              }
-              st.status = "complete";
-              st.lastSummary = args.summary.trim();
-              if (evidence) st.evidence = evidence;
-              st.updatedAt = Date.now();
-              await save(st);
-              return {
-                content:
-                  "Goal marked complete; the goal loop has stopped. Give the user a concise final summary now.",
-              };
-            }) as AnyToolDef["execute"],
-          });
+              }) as AnyToolDef["execute"],
+            });
 
-          editor.add({
-            name: "goal_blocked",
-            description:
-              "Declare that the active goal cannot be completed without the user. Explains why the loop should stop.",
-            input: z.object({
-              reason: z.string().min(1).describe("Why you cannot proceed."),
-              needs: z.string().optional().describe("What you need from the user to continue."),
-            }),
-            execute: (async (
-              args: { reason: string; needs?: string },
-              toolCtx: { sessionID?: string },
-            ) => {
-              const sessionID = toolCtx?.sessionID ?? "";
-              const st = await load(sessionID);
-              if (!st) return { content: "No goal is set for this session." };
-              if (st.status !== "active") {
-                return { content: `The goal is already ${STATUS_LABEL[st.status]}; nothing to block.` };
-              }
-              st.status = "blocked";
-              st.blockedReason = [args.reason.trim(), args.needs ? `Needs: ${args.needs.trim()}` : ""]
-                .filter(Boolean)
-                .join(" — ");
-              st.updatedAt = Date.now();
-              await save(st);
-              return {
-                content:
-                  "Goal marked blocked; the goal loop has stopped. Tell the user the reason and what you need from them.",
-              };
-            }) as AnyToolDef["execute"],
-          });
+            editor.add({
+              name: "goal_blocked",
+              description:
+                "Session-scoped: no-ops without an active goal in this session. Declare that the active goal cannot be completed without the user. Explains why the loop should stop.",
+              input: z.object({
+                reason: z.string().min(1).describe("Why you cannot proceed."),
+                needs: z.string().optional().describe("What you need from the user to continue."),
+              }),
+              execute: (async (
+                args: { reason: string; needs?: string },
+                toolCtx: { sessionID?: string },
+              ) => {
+                const sessionID = toolCtx?.sessionID ?? "";
+                const st = await load(sessionID);
+                if (!st) return { content: "No goal is set for this session." };
+                if (st.status !== "active") {
+                  return { content: `The goal is already ${STATUS_LABEL[st.status]}; nothing to block.` };
+                }
+                st.status = "blocked";
+                st.blockedReason = [args.reason.trim(), args.needs ? `Needs: ${args.needs.trim()}` : ""]
+                  .filter(Boolean)
+                  .join(" — ");
+                st.updatedAt = Date.now();
+                await save(st);
+                return {
+                  content:
+                    "Goal marked blocked; the goal loop has stopped. Tell the user the reason and what you need from them.",
+                };
+              }) as AnyToolDef["execute"],
+            });
 
-          editor.add({
-            name: "goal_progress",
-            description:
-              "Record a milestone while working toward the active goal. Keeps the user informed and tells the goal loop that real progress is happening.",
-            input: z.object({
-              note: z.string().min(1).describe("What you just accomplished or learned."),
-            }),
-            execute: (async (args: { note: string }, toolCtx: { sessionID?: string }) => {
-              const sessionID = toolCtx?.sessionID ?? "";
-              const st = await load(sessionID);
-              if (!st) return { content: "No goal is set for this session." };
-              if (st.status !== "active") {
-                return { content: `The goal is ${STATUS_LABEL[st.status]}; progress was not recorded.` };
-              }
-              st.progress.push({ at: Date.now(), text: args.note.trim() });
-              if (st.progress.length > MAX_PROGRESS) {
-                st.progress.splice(0, st.progress.length - MAX_PROGRESS);
-              }
-              st.updatedAt = Date.now();
-              await save(st);
-              return {
-                content: `Progress recorded (attempt ${st.iterations}/${st.maxIterations}). Keep going.`,
-              };
-            }) as AnyToolDef["execute"],
-          });
-        }),
-      );
+            editor.add({
+              name: "goal_progress",
+              description:
+                "Session-scoped: no-ops without an active goal in this session. Record a milestone while working toward the active goal. Keeps the user informed and tells the goal loop that real progress is happening.",
+              input: z.object({
+                note: z.string().min(1).describe("What you just accomplished or learned."),
+              }),
+              execute: (async (args: { note: string }, toolCtx: { sessionID?: string }) => {
+                const sessionID = toolCtx?.sessionID ?? "";
+                const st = await load(sessionID);
+                if (!st) return { content: "No goal is set for this session." };
+                if (st.status !== "active") {
+                  return { content: `The goal is ${STATUS_LABEL[st.status]}; progress was not recorded.` };
+                }
+                st.progress.push({ at: Date.now(), text: args.note.trim() });
+                if (st.progress.length > MAX_PROGRESS) {
+                  st.progress.splice(0, st.progress.length - MAX_PROGRESS);
+                }
+                st.updatedAt = Date.now();
+                await save(st);
+                return {
+                  content: `Progress recorded (attempt ${st.iterations}/${st.maxIterations}). Keep going.`,
+                };
+              }) as AnyToolDef["execute"],
+            });
+          }),
+        );
+      } catch (err) {
+        console.error(`[goal] tool.transform registration failed: ${describeError(err)}`);
+      }
     }
 
     if (c.tool?.hook) {
-      track(
-        await c.tool.hook("execute.before", (event) => {
-          const sessionID = typeof event?.sessionID === "string" ? event.sessionID : "";
-          if (!sessionID) return;
-          const tool = typeof event?.tool === "string" ? event.tool : "";
-          // G11: goal's own tools are not "progress" — counting them made
-          // every turn look like tool activity and hid stalls.
-          if (tool === "goal_complete" || tool === "goal_blocked" || tool === "goal_progress") {
-            return;
-          }
-          toolActivity.add(sessionID);
-        }),
-      );
+      try {
+        track(
+          await c.tool.hook("execute.before", (event) => {
+            const sessionID = typeof event?.sessionID === "string" ? event.sessionID : "";
+            if (!sessionID) return;
+            const tool = typeof event?.tool === "string" ? event.tool : "";
+            // G11: goal's own tools are not "progress" — counting them made
+            // every turn look like tool activity and hid stalls.
+            if (tool === "goal_complete" || tool === "goal_blocked" || tool === "goal_progress") {
+              return;
+            }
+            // GO-3/CR-5: cap toolActivity with the same FIFO eviction.
+            evictSessionStateIfFull();
+            toolActivity.add(sessionID);
+          }),
+        );
+      } catch (err) {
+        console.error(`[goal] tool.hook registration failed: ${describeError(err)}`);
+      }
     }
 
     if (c.session.hook) {
-      track(
-        await c.session.hook("context", (event) => {
-          if (!cfg.enabled) return;
-          const sessionID = typeof event?.sessionID === "string" ? event.sessionID : "";
-          if (!sessionID) return;
-          const messages = Array.isArray(event.messages) ? event.messages : [];
-          // G4: ALWAYS strip stale goal reminders first — a paused, cleared,
-          // or completed goal must not keep steering the model from context.
-          for (let i = messages.length - 1; i >= 0; i--) {
-            if (messages[i]?.role === "system" && textOf(messages[i]).includes(MARK)) {
-              messages.splice(i, 1);
+      // GO-11: a failed registration must not abort setup - log and continue.
+      try {
+        track(
+          await c.session.hook("context", (event) => {
+            if (!cfg.enabled) return;
+            const sessionID = typeof event?.sessionID === "string" ? event.sessionID : "";
+            if (!sessionID) return;
+            const messages = Array.isArray(event.messages) ? event.messages : [];
+            // G4: ALWAYS strip stale goal reminders first — a paused, cleared,
+            // or completed goal must not keep steering the model from context.
+            // GO-6: strip only our own stale reminders — the unique sentinel
+            // this hook injects, or a system message opening with the MARK
+            // line (the legacy reminder format). Non-system text is never
+            // inspected, so user text that merely mentions the plugin
+            // survives.
+            for (let i = messages.length - 1; i >= 0; i--) {
+              const text = messages[i]?.role === "system" ? textOf(messages[i]) : "";
+              if (
+                text.includes(REMINDER_SENTINEL) ||
+                text === MARK ||
+                text.startsWith(MARK + "\n")
+              ) {
+                messages.splice(i, 1);
+              }
             }
-          }
-          const st = live.get(sessionID);
-          if (!st) {
-            if (!live.has(sessionID)) void load(sessionID);
-            return;
-          }
-          if (st.status !== "active") return;
-          messages.push({
-            role: "system",
-            content: [{ type: "text", text: `${MARK}\n${buildReminder(st, cfg)}` }],
-          });
-        }),
-      );
+            const st = live.get(sessionID);
+            if (!st) {
+              // GO-5: the first context call after a reload misses the reminder
+              // by design — live state is empty until the storage read above
+              // resolves, so this miss pre-warms it and the NEXT request
+              // injects. A goal is never lost, just one request late.
+              if (!live.has(sessionID)) void load(sessionID).catch((err) => log(`pre-warm load failed for ${sessionID}: ${describeError(err)}`));
+              return;
+            }
+            if (st.status !== "active") return;
+            messages.push({
+              role: "system",
+              content: [{ type: "text", text: `${REMINDER_SENTINEL}\n${MARK}\n${buildReminder(st, cfg)}` }],
+            });
+          }),
+        );
+      } catch (err) {
+        console.error(`[goal] session.hook registration failed: ${describeError(err)}`);
+      }
     }
 
     if (c.command?.transform) {
-      track(
-        await c.command.transform((editor) => {
-          editor.add({
-            name: "goal",
-            description: "Set and manage an objective the model works toward until it is reached.",
-            execute: async ({ sessionID, prompt }) => {
-              if (!cfg.enabled) {
-                await note(sessionID, `${MARK} The goal plugin is disabled (enabled=false).`);
-                return;
-              }
-              const { verb, arg } = parseCommand(prompt?.text ?? "");
-              switch (verb) {
-                case "help":
-                  await note(sessionID, HELP);
-                  return;
-                case "status": {
-                  const st = await load(sessionID);
-                  await note(sessionID, st ? statusText(st, cfg) : NO_GOAL);
+      // GO-11: a failed registration must not abort setup - log and continue.
+      try {
+        track(
+          await c.command.transform((editor) => {
+            editor.add({
+              name: "goal",
+              description: "Set and manage an objective the model works toward until it is reached.",
+              execute: async ({ sessionID, prompt }) => {
+                if (!cfg.enabled) {
+                  await note(sessionID, `${MARK} The goal plugin is disabled (enabled=false).`);
                   return;
                 }
-                case "pause": {
-                  const st = await load(sessionID);
-                  if (!st) return void (await note(sessionID, NO_GOAL));
-                  if (st.status !== "active") {
-                    return void (await note(sessionID, `${MARK} Goal is already ${STATUS_LABEL[st.status]}.`));
+                const { verb, arg } = parseCommand(prompt?.text ?? "");
+                switch (verb) {
+                  case "help":
+                    await note(sessionID, HELP);
+                    return;
+                  case "status": {
+                    const st = await load(sessionID);
+                    await note(sessionID, st ? statusText(st, cfg) : NO_GOAL);
+                    return;
                   }
-                  st.status = "paused";
-                  st.pausedAt = Date.now();
-                  st.updatedAt = Date.now();
-                  await save(st);
-                  await note(
-                    sessionID,
-                    `${MARK} Paused. The current turn will finish but the loop will not continue. Use \`/goal resume\` to keep going.`,
-                  );
-                  return;
-                }
-                case "resume": {
-                  const st = await load(sessionID);
-                  if (!st) return void (await note(sessionID, NO_GOAL));
-                  // G3: extend the wall-clock budget by the paused span so a
-                  // long pause doesn't instantly trip the timeout on resume.
-                  if (st.deadlineAt) {
-                    const pausedAt = st.pausedAt ?? st.updatedAt;
-                    st.deadlineAt += Math.max(0, Date.now() - pausedAt);
+                  case "pause": {
+                    const st = await load(sessionID);
+                    if (!st) return void (await note(sessionID, NO_GOAL));
+                    if (st.status !== "active") {
+                      return void (await note(sessionID, `${MARK} Goal is already ${STATUS_LABEL[st.status]}.`));
+                    }
+                    st.status = "paused";
+                    st.pausedAt = Date.now();
+                    st.updatedAt = Date.now();
+                    await save(st);
+                    await note(
+                      sessionID,
+                      `${MARK} Paused. The current turn will finish but the loop will not continue. Use \`/goal resume\` to keep going.`,
+                    );
+                    return;
                   }
-                  st.pausedAt = undefined;
-                  st.status = "active";
-                  st.failures = 0;
-                  st.stallCount = 0;
-                  st.userTookOver = false;
-                  st.updatedAt = Date.now();
-                  await save(st);
-                  await note(sessionID, `${MARK} Resumed.`);
-                  await kick(st, "The goal was resumed by the user.", false);
-                  return;
+                  case "resume": {
+                    const st = await load(sessionID);
+                    if (!st) return void (await note(sessionID, NO_GOAL));
+                    // G3: extend the wall-clock budget by the paused span so a
+                    // long pause doesn't instantly trip the timeout on resume.
+                    if (st.deadlineAt) {
+                      const pausedAt = st.pausedAt ?? st.updatedAt;
+                      st.deadlineAt += Math.max(0, Date.now() - pausedAt);
+                    }
+                    // GO-9: remove the key instead of assigning undefined, so
+                    // persisted state never carries a pausedAt field.
+                    delete st.pausedAt;
+                    st.status = "active";
+                    st.failures = 0;
+                    st.stallCount = 0;
+                    st.userTookOver = false;
+                    st.updatedAt = Date.now();
+                    await save(st);
+                    await note(sessionID, `${MARK} Resumed.`);
+                    await kick(st, "The goal was resumed by the user.", false);
+                    return;
+                  }
+                  case "done": {
+                    const st = await load(sessionID);
+                    if (!st) return void (await note(sessionID, NO_GOAL));
+                    st.status = "complete";
+                    st.lastSummary = "Marked complete by the user.";
+                    st.updatedAt = Date.now();
+                    await save(st);
+                    await note(sessionID, `${MARK} Goal marked complete; the loop is stopped.`);
+                    return;
+                  }
+                  case "clear": {
+                    await clear(sessionID);
+                    await note(sessionID, `${MARK} Goal cleared.`);
+                    return;
+                  }
+                  default: {
+                    const goal = parseGoalText(arg);
+                    if (!goal.objective) return void (await note(sessionID, HELP));
+                    const st = newGoal(sessionID, goal.objective, goal.criteria);
+                    await save(st);
+                    await note(
+                      sessionID,
+                      `${MARK} Goal set.\nObjective: ${st.objective}\nBudget: ${st.maxIterations} attempts${cfg.maxMinutes > 0 ? ` / ${cfg.maxMinutes} min` : " (no wall-clock deadline)"}.`,
+                    );
+                    await kick(st, "", true);
+                    return;
+                  }
                 }
-                case "done": {
-                  const st = await load(sessionID);
-                  if (!st) return void (await note(sessionID, NO_GOAL));
-                  st.status = "complete";
-                  st.lastSummary = "Marked complete by the user.";
-                  st.updatedAt = Date.now();
-                  await save(st);
-                  await note(sessionID, `${MARK} Goal marked complete; the loop is stopped.`);
-                  return;
-                }
-                case "clear": {
-                  await clear(sessionID);
-                  await note(sessionID, `${MARK} Goal cleared.`);
-                  return;
-                }
-                default: {
-                  const goal = parseGoalText(arg);
-                  if (!goal.objective) return void (await note(sessionID, HELP));
-                  const st = newGoal(sessionID, goal.objective, goal.criteria);
-                  await save(st);
-                  await note(
-                    sessionID,
-                    `${MARK} Goal set.\nObjective: ${st.objective}\nBudget: ${st.maxIterations} attempts / ${cfg.maxMinutes} min.`,
-                  );
-                  await kick(st, "", true);
-                  return;
-                }
-              }
-            },
-          });
-        }),
-      );
+              },
+            });
+          }),
+        );
+      } catch (err) {
+        console.error(`[goal] command registration failed: ${describeError(err)}`);
+      }
     }
 
     if (cfg.log) {
@@ -936,15 +1042,15 @@ export default Plugin.define({
             // G5: branch on the interrupt reason so superseded/inactivity
             // interrupts are visible in the pause note and logs.
             const reason = typeof data.reason === "string" ? data.reason : "";
-            void interrupt(sessionID, reason);
+            void interrupt(sessionID, reason).catch((err) => console.error(`[goal] interrupt failed for ${sessionID}: ${describeError(err)}`));
           } else if (type === "session.idle" || type === "session.execution.succeeded") {
-            void evaluate(sessionID, false);
+            void evaluate(sessionID, false).catch((err) => console.error(`[goal] evaluate failed for ${sessionID}: ${describeError(err)}`));
           } else if (type === "session.execution.failed") {
-            void evaluate(sessionID, true);
+            void evaluate(sessionID, true).catch((err) => console.error(`[goal] evaluate failed for ${sessionID}: ${describeError(err)}`));
           }
         }
       } catch (err) {
-        if (!abort.signal.aborted) log(`event stream ended: ${describeError(err)}`);
+        if (!abort.signal.aborted) console.error(`[goal] event stream ended: ${describeError(err)}`);
       }
     })();
 

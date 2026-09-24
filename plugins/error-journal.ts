@@ -242,7 +242,7 @@ export default Plugin.define({
           try {
             const out = withRetry(() => {
               const database = getDb();
-              const tagsJson = JSON.stringify(args.tags || []);
+              const tagsJson = JSON.stringify(args.tags ?? []);
               const stmt = database.prepare(
                 "INSERT INTO errors (error_text, context, tags, project) VALUES (?, ?, ?, ?)"
               );
@@ -251,7 +251,7 @@ export default Plugin.define({
                 truncateStored(scrubStore(args.error_text), STORE_CAPS.errorField),
                 args.context ? truncateStored(scrubStore(args.context), STORE_CAPS.errorField) : null,
                 tagsJson,
-                args.project || null
+                args.project ?? null
               ) as { lastInsertRowid: number | bigint };
               return `Logged error #${result.lastInsertRowid}`;
             }, true);
@@ -279,7 +279,9 @@ export default Plugin.define({
               .get(args.id) as { id: number; resolution: string | null } | null;
             if (!row) return `Error #${args.id} not found`;
             // EJ-6: surface a prior resolution instead of silently overwriting.
-            const prior = row.resolution ? ` (prior resolution: "${row.resolution}")` : "";
+            // Cap the echo at 500 chars so a huge stored resolution cannot
+            // blow up tool output.
+            const prior = row.resolution ? ` (prior resolution: "${truncateStored(row.resolution, 500)}")` : "";
             database
               .prepare("UPDATE errors SET resolution = ?, resolved_at = datetime('now') WHERE id = ?")
               // CR-4: cap unbounded inputs into DB/FTS (20k).
@@ -305,7 +307,7 @@ export default Plugin.define({
             const q = quoteFtsQuery(args.query);
             if (q === null) return "No errors found. (empty query)";
             // Shared clampLimit: trunc + finite guard.
-            const limit = clampLimit(args.limit || 10, 10, 50);
+            const limit = clampLimit(args.limit ?? 10, 10, 50);
             const rows = database
               .query(
                 `SELECT e.* FROM errors e
@@ -361,7 +363,7 @@ export default Plugin.define({
 
             const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
             // Shared clampLimit: trunc + finite guard.
-            const limit = clampLimit(args.limit || 20, 20, 100);
+            const limit = clampLimit(args.limit ?? 20, 20, 100);
 
             const rows = database
               .query(`SELECT * FROM errors ${where} ORDER BY created_at DESC LIMIT ?`)

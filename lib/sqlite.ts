@@ -320,8 +320,8 @@ export function truncateStored(text: string, max: number): string {
 
 /**
  * DL-6/SN-6: coerce a user-supplied `limit` into a safe integer for LIMIT.
- * Non-numbers, NaN, Infinity, and out-of-range values fall back to `def`;
- * fractional values are truncated. Result is always in [1, max].
+ * Non-numbers, NaN, and Infinity fall back to `def`; finite values are
+ * truncated and clamped into [1, max].
  */
 export function clampLimit(value: unknown, def: number, max: number): number {
   const n = typeof value === "number" ? value : Number(value);
