@@ -36,7 +36,22 @@ const DEFAULT_EXTS = new Set([
   ".html", ".htm", ".xml", ".json", ".yaml", ".yml", ".toml",
   ".md", ".sql", ".graphql", ".proto",
   ".sh", ".bash", ".zsh",
-  ".dockerfile", ".tf", ".hcl",
+  ".tf", ".hcl",
+]);
+
+/**
+ * CI-5: `extname("Dockerfile")` is `""`, so extensionless well-known files
+ * never matched DEFAULT_EXTS (the old ".dockerfile" entry was dead). Match
+ * them by lowercase basename instead.
+ */
+const BASENAME_ALLOW = new Set([
+  "dockerfile",
+  "makefile",
+  "gemfile",
+  "rakefile",
+  "vagrantfile",
+  "jenkinsfile",
+  "cmakelists.txt",
 ]);
 
 const SKIP_DIRS = new Set([
@@ -68,10 +83,23 @@ const MAX_FILE_SIZE = 512_000;
  */
 function normalizeRoot(p: string): string {
   let out = p.trim().replace(/[\\/]+$/, "").replace(/\\/g, "/");
+  // CI-8: only the drive letter is lowercased — the old whole-path
+  // toLowerCase() mangled display/storage of case-sensitive segments.
   if (process.platform === "win32" && /^[A-Za-z]:/.test(out)) {
-    out = out.toLowerCase();
+    out = out[0].toLowerCase() + out.slice(1);
   }
   return out;
+}
+
+/** CI-7: escape LIKE metacharacters so `filter` matches literally. */
+function escapeLike(s: string): string {
+  return s.replace(/([%_\\])/g, "\\$1");
+}
+
+/** CI-10: dot-directories are skipped by default; opt in with INDEX_DOT_DIRS=1. */
+function dotDirsAllowed(): boolean {
+  const v = (process.env.INDEX_DOT_DIRS ?? "").toLowerCase();
+  return v === "1" || v === "true" || v === "yes";
 }
 
 let db: AnyDatabase | null = null;
@@ -267,68 +295,98 @@ function getLatestBackup(): string | null {
   return latestValidBackup(BACKUP_DIR);
 }
 
-function tryRestore(): boolean {
-  if ((tryRestore as any)._active) return false;
-  (tryRestore as any)._active = true;
-  try {
-    const backup = getLatestBackup();
-    if (!backup) return false;
-    if (db) {
-      try { db.close(); } catch {}
-      db = null;
-    }
-    // CR-7/CR-8: shared helper — wrapped I/O with context; also drops
-    // -wal/-shm/-journal so they cannot be replayed on the restored snapshot.
-    copyBackupIntoPlace(DB_PATH, backup);
-    getDb();
-    // J1: verify the restored copy — open/schema succeed lazily on corrupt
-    // files, so a bad restore must be rejected, never served silently.
-    if (!db || !checkOpenDb(db)) {
-      try { db?.close(); } catch {}
-      db = null;
+/**
+ * CI-11: promise-join restore — concurrent callers await the same in-flight
+ * restore instead of colliding on the old sync `_active` flag.
+ */
+let restorePromise: Promise<boolean> | null = null;
+function tryRestoreAsync(): Promise<boolean> {
+  if (restorePromise) return restorePromise;
+  restorePromise = (async (): Promise<boolean> => {
+    try {
+      const backup = getLatestBackup();
+      if (!backup) return false;
+      if (db) {
+        try { db.close(); } catch {}
+        db = null;
+      }
+      // CR-7/CR-8: shared helper — wrapped I/O with context; also drops
+      // -wal/-shm/-journal so they cannot be replayed on the restored snapshot.
+      copyBackupIntoPlace(DB_PATH, backup);
+      getDb();
+      // J1: verify the restored copy — open/schema succeed lazily on corrupt
+      // files, so a bad restore must be rejected, never served silently.
+      if (!db || !checkOpenDb(db)) {
+        try { db?.close(); } catch {}
+        db = null;
+        return false;
+      }
+      return true;
+    } catch {
       return false;
     }
-    return true;
-  } catch {
-    return false;
+  })();
+  const inFlight = restorePromise;
+  const clear = () => { if (restorePromise === inFlight) restorePromise = null; };
+  inFlight.then(clear, clear);
+  return inFlight;
+}
+
+/**
+ * CI-3: single-writer promise mutex — index (which drops triggers and
+ * rebuilds FTS) and search never interleave within this process, so a
+ * concurrent search cannot hit a half-rebuilt FTS table.
+ */
+let dbMutex: Promise<void> = Promise.resolve();
+async function withDbMutex<T>(fn: () => T | Promise<T>): Promise<T> {
+  const prev = dbMutex;
+  let release!: () => void;
+  dbMutex = new Promise<void>((res) => { release = res; });
+  await prev;
+  try {
+    return await fn();
   } finally {
-    (tryRestore as any)._active = false;
+    release();
   }
 }
 
-function writeDb<T>(fn: () => T): T {
-  try {
-    const result = fn();
-    try { backupDb(); } catch {}
-    return result;
-  } catch (err) {
-    if (isCorruption(err) && tryRestore()) {
-      try {
-        const result = fn();
-        try { backupDb(); } catch {}
-        return result;
-      } catch {}
-    }
-    // CR-3: never throw storage failures out of tools — every caller uses
-    // the result as tool `content`, so surface a readable message instead.
-    return dbUnavailable(err) as T;
-  }
-}
-
-function readDb<T>(fn: () => T): T {
-  try {
-    return fn();
-  } catch (err) {
-    if (isCorruption(err) && tryRestore()) {
-      try {
-        return fn();
-      } catch (restoreErr) {
-        return dbUnavailable(restoreErr) as T;
+async function writeDb<T>(fn: () => T | Promise<T>): Promise<T> {
+  return withDbMutex(async () => {
+    try {
+      const result = await fn();
+      try { backupDb(); } catch {}
+      return result;
+    } catch (err) {
+      if (isCorruption(err) && await tryRestoreAsync()) {
+        try {
+          const result = await fn();
+          try { backupDb(); } catch {}
+          return result;
+        } catch {}
       }
+      // CR-3: never throw storage failures out of tools — every caller uses
+      // the result as tool `content`, so surface a readable message instead.
+      return dbUnavailable(err) as T;
     }
-    // CR-3: never throw storage failures out of tools.
-    return dbUnavailable(err) as T;
-  }
+  });
+}
+
+async function readDb<T>(fn: () => T | Promise<T>): Promise<T> {
+  return withDbMutex(async () => {
+    try {
+      return await fn();
+    } catch (err) {
+      if (isCorruption(err) && await tryRestoreAsync()) {
+        try {
+          return await fn();
+        } catch (restoreErr) {
+          return dbUnavailable(restoreErr) as T;
+        }
+      }
+      // CR-3: never throw storage failures out of tools.
+      return dbUnavailable(err) as T;
+    }
+  });
 }
 
 // --- File scanning & chunking ---
@@ -340,12 +398,15 @@ function* walkDir(dir: string): Generator<string> {
       const fullPath = join(dir, entry.name);
       if (entry.isDirectory()) {
         if (SKIP_DIRS.has(entry.name)) continue;
-        if (entry.name.startsWith(".")) continue;
+        // CI-10: dot-directories are skipped by default; INDEX_DOT_DIRS=1
+        // opts in (SKIP_DIRS such as .git still always skipped).
+        if (entry.name.startsWith(".") && !dotDirsAllowed()) continue;
         yield* walkDir(fullPath);
       } else if (entry.isFile()) {
         if (SKIP_FILES.has(entry.name)) continue;
         const ext = extname(entry.name).toLowerCase();
-        if (!DEFAULT_EXTS.has(ext)) continue;
+        // CI-5: extensionless well-known files via basename allowlist.
+        if (!DEFAULT_EXTS.has(ext) && (ext !== "" || !BASENAME_ALLOW.has(entry.name.toLowerCase()))) continue;
         yield fullPath;
       }
     }
@@ -380,6 +441,9 @@ function chunkFile(absPath: string, rootPath: string, fs: FsLike = { statSync, r
     // CI-1: locked/unreadable file — skip it instead of aborting the index.
     return [];
   }
+  // CI-9: binary-as-text guard + BOM strip (BOM would otherwise be indexed).
+  if (content.includes("\0")) return [];
+  if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
   const lines = content.split("\n");
   if (lines.length === 0) return [];
 
@@ -406,6 +470,7 @@ function chunkFile(absPath: string, rootPath: string, fs: FsLike = { statSync, r
 function indexProject(rootPath: string): {
   files: number; chunks: number; skipped: number;
   updated: number; unchanged: number; removed: number;
+  emptySkipped?: boolean;
 } {
   const database = getDb();
   const resolvedPath = normalizeRoot(rootPath);
@@ -432,6 +497,9 @@ function indexProject(rootPath: string): {
       };
     }
     const projectId = project.id;
+    const oldCounts = database
+      .query("SELECT file_count, chunk_count FROM projects WHERE id = ?")
+      .get(projectId) as { file_count: number; chunk_count: number } | null;
 
     const prevRows = database
       .query("SELECT rel_path, mtime_ms, size_bytes FROM indexed_files WHERE project_id = ?")
@@ -534,6 +602,22 @@ function indexProject(rootPath: string): {
     const fileCount = Number(totals.files);
     const chunkCount = Number(totals.chunks);
 
+    // CI-4: a scan that finds zero files (e.g. the root was deleted between
+    // the existsSync check and the walk) must not commit an empty index over
+    // a good one — roll back and keep the previous index instead.
+    if (fileCount === 0 && prev.size > 0) {
+      database.exec("ROLLBACK");
+      return {
+        files: Number(oldCounts?.file_count ?? 0),
+        chunks: Number(oldCounts?.chunk_count ?? 0),
+        skipped,
+        updated: 0,
+        unchanged: 0,
+        removed: 0,
+        emptySkipped: true,
+      };
+    }
+
     database.query(`
       UPDATE projects SET file_count = ?, chunk_count = ?, last_indexed_at = datetime('now')
       WHERE id = ?
@@ -564,7 +648,8 @@ export default Plugin.define({
         }),
         execute: async (input, toolCtx) => {
           const args = input as { path?: string };
-          const out = writeDb(() => {
+          // CI-3: writeDb/readDb are async and mutex-guarded — callers await.
+          const out = await writeDb(() => {
             const rootPath = args.path || defaultDirectory;
             if (!rootPath || !existsSync(rootPath)) {
               return JSON.stringify({ error: `Path not found: ${rootPath}` });
@@ -579,6 +664,10 @@ export default Plugin.define({
               updated: result.updated,
               unchanged: result.unchanged,
               removed: result.removed,
+              // CI-4: surface the refused empty commit so it is not silent.
+              ...(result.emptySkipped
+                ? { warning: "No indexable files found — kept the previous index." }
+                : {}),
             });
           });
           return { content: out };
@@ -599,99 +688,114 @@ export default Plugin.define({
           const args = input as {
             query: string; path?: string; filter?: string; limit?: number;
           };
-          const out = readDb(() => {
-          const targetPath = normalizeRoot(args.path || defaultDirectory || "");
-          if (targetPath && targetPath.length > 0) {
-            const isIndexed = readDb(() => {
-              const database = getDb();
+          const out = await readDb(() => {
+            const database = getDb();
+            // CI-2: the indexed check applies only when a path is explicitly
+            // given. An omitted path searches all indexed projects — the old
+            // fallback to defaultDirectory produced a wrong "not indexed"
+            // error for the global search mode.
+            let projectWhere = "";
+            const scopeParams: unknown[] = [];
+            if (args.path) {
+              const targetPath = normalizeRoot(args.path);
               const row = database
                 .query("SELECT id FROM projects WHERE root_path = ?")
                 .get(targetPath) as { id: number } | null;
-              return row !== null;
-            });
-            if (!isIndexed && existsSync(targetPath)) {
-              return `Project at "${targetPath}" is not indexed. Run codebase_index first.`;
+              if (!row && existsSync(targetPath)) {
+                return `Project at "${targetPath}" is not indexed. Run codebase_index first.`;
+              }
+              projectWhere = "AND p.root_path = ?";
+              scopeParams.push(targetPath);
             }
-          }
-          return readDb(() => {
-            const database = getDb();
-            const ftsQuery = quoteFtsQuery(args.query);
+            const tokens = args.query.trim().split(/\s+/).filter(Boolean);
             // I2/S4: an empty/whitespace query must not reach MATCH — an
             // empty MATCH string throws an FTS5 syntax error.
-            if (ftsQuery === null) return "No results (empty query).";
-            // P7/trigram: terms shorter than 3 chars cannot match a trigram
-            // index — tell the caller instead of returning an engine error.
-            if (args.query.trim().split(/\s+/).some((t) => t.length < 3)) {
-              return "No results — use search terms of at least 3 characters.";
-            }
+            if (tokens.length === 0) return "No results (empty query).";
             // Shared clampLimit: trunc + finite guard.
             const limit = clampLimit(args.limit ?? 15, 15, 50);
-            const params: unknown[] = [ftsQuery];
-
-            let projectWhere = "";
-            if (args.path) {
-              projectWhere = "AND p.root_path = ?";
-              params.push(targetPath);
-            }
-
+            // CI-7: filter is a literal substring — escape LIKE wildcards.
             let filterWhere = "";
+            const filterParams: unknown[] = [];
             if (args.filter) {
-              filterWhere = "AND c.rel_path LIKE ?";
-              params.push(`%${args.filter}%`);
+              filterWhere = "AND c.rel_path LIKE ? ESCAPE '\\'";
+              filterParams.push(`%${escapeLike(args.filter)}%`);
             }
 
-            params.push(limit);
+            type SearchRow = {
+              id: number;
+              rel_path: string;
+              start_line: number;
+              end_line: number;
+              content: string;
+              root_path: string;
+              project: string;
+              rank: number;
+            };
+            let rows: SearchRow[];
+            try {
+              // CI-6: trigram needs 3+ chars — drop short tokens and search
+              // the remainder instead of rejecting the whole query; when
+              // every token is short, fall back to a LIKE scan.
+              const long = tokens.filter((t) => t.length >= 3);
+              if (long.length > 0) {
+                const ftsQuery = quoteFtsQuery(long.join(" "));
+                if (ftsQuery === null) return "No results (empty query).";
+                rows = database.query(`
+                  SELECT c.id, c.rel_path, c.start_line, c.end_line, c.content, p.root_path, p.name as project, rank
+                  FROM code_chunks_fts
+                  JOIN code_chunks c ON c.id = code_chunks_fts.rowid
+                  JOIN projects p ON c.project_id = p.id
+                  WHERE code_chunks_fts MATCH ?
+                    ${projectWhere}
+                    ${filterWhere}
+                  ORDER BY rank
+                  LIMIT ?
+                `).all(ftsQuery, ...scopeParams, ...filterParams, limit) as SearchRow[];
+              } else {
+                rows = database.query(`
+                  SELECT c.id, c.rel_path, c.start_line, c.end_line, c.content, p.root_path, p.name as project, 0 AS rank
+                  FROM code_chunks c
+                  JOIN projects p ON c.project_id = p.id
+                  WHERE c.content LIKE ? ESCAPE '\\'
+                    ${projectWhere}
+                    ${filterWhere}
+                  ORDER BY c.file_path, c.start_line
+                  LIMIT ?
+                `).all(`%${escapeLike(args.query)}%`, ...scopeParams, ...filterParams, limit) as SearchRow[];
+              }
+            } catch (err) {
+              return JSON.stringify({
+                error: `Search failed: ${(err as Error).message}`,
+              });
+            }
 
-      const sql = `
-        SELECT c.id, c.rel_path, c.start_line, c.end_line, c.content, p.root_path, p.name as project, rank
-        FROM code_chunks_fts
-        JOIN code_chunks c ON c.id = code_chunks_fts.rowid
-        JOIN projects p ON c.project_id = p.id
-        WHERE code_chunks_fts MATCH ?
-          ${projectWhere}
-          ${filterWhere}
-        ORDER BY rank
-        LIMIT ?
-      `;
+            // CI-12: nested-Map grouping — no JSON.stringify/parse churn per group.
+            const grouped = new Map<string, Map<string, SearchRow[]>>();
+            for (const r of rows) {
+              let byFile = grouped.get(r.root_path);
+              if (!byFile) {
+                byFile = new Map<string, SearchRow[]>();
+                grouped.set(r.root_path, byFile);
+              }
+              const list = byFile.get(r.rel_path);
+              if (list) list.push(r);
+              else byFile.set(r.rel_path, [r]);
+            }
 
-      try {
-        const rows = database.query(sql).all(...params) as Array<{
-          id: number;
-          rel_path: string;
-          start_line: number;
-          end_line: number;
-          content: string;
-          root_path: string;
-          project: string;
-          rank: number;
-        }>;
+            const parts: string[] = [];
+            for (const byFile of grouped.values()) {
+              for (const [filePath, chunks] of byFile) {
+                parts.push(`## \`${filePath}\` (${chunks[0].project})`);
+                for (const c of chunks) {
+                  parts.push(
+                    `**Chunk** (lines ${c.start_line}-${c.end_line}, score: ${c.rank.toFixed(2)})\n\`\`\`\n${c.content}\n\`\`\``
+                  );
+                }
+                parts.push("---");
+              }
+            }
 
-        // I1: JSON-pair keys — a `:` separator broke on Windows drive
-        // letters (C:\...), mangling every grouped path.
-        const grouped: Record<string, typeof rows> = {};
-        for (const r of rows) {
-          const key = JSON.stringify([r.root_path, r.rel_path]);
-          if (!grouped[key]) grouped[key] = [];
-          grouped[key].push(r);
-        }
-
-        const parts = Object.entries(grouped).flatMap(([key, chunks]) => {
-          const [, filePath] = JSON.parse(key) as [string, string];
-          const header = `## \`${filePath}\` (${chunks[0].project})`;
-          const items = chunks.map(
-            (c) =>
-              `**Chunk** (lines ${c.start_line}-${c.end_line}, score: ${c.rank.toFixed(2)})\n\`\`\`\n${c.content}\n\`\`\``
-          );
-          return [header, ...items, "---"];
-        });
-
-        return `Found ${rows.length} result${rows.length === 1 ? "" : "s"}:\n\n${parts.slice(0, -1).join("\n\n")}`;
-      } catch (err) {
-        return JSON.stringify({
-          error: `Search failed: ${(err as Error).message}`,
-        });
-      }
-    });
+            return `Found ${rows.length} result${rows.length === 1 ? "" : "s"}:\n\n${parts.slice(0, -1).join("\n\n")}`;
           });
           return { content: out };
         },
@@ -706,7 +810,7 @@ export default Plugin.define({
         }),
         execute: async (input) => {
           const args = input as { path?: string };
-          const out = readDb(() => {
+          const out = await readDb(() => {
             const database = getDb();
 
             if (args.path) {
@@ -762,7 +866,7 @@ export default Plugin.define({
         }),
         execute: async (input) => {
           const args = input as { path: string };
-          const out = writeDb(() => {
+          const out = await writeDb(() => {
             const database = getDb();
             const resolved = normalizeRoot(args.path);
             const project = database
@@ -786,5 +890,5 @@ export default Plugin.define({
   },
 });
 
-/** Test hooks (CI-1): unit access to chunkFile without a database. */
-export const __test__ = { chunkFile };
+/** Test hooks: unit access without a database. */
+export const __test__ = { chunkFile, normalizeRoot, escapeLike };
