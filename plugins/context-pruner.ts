@@ -2225,6 +2225,11 @@ export default Plugin.define({
   async setup(ctx) {
     const c = ctx as unknown as LooseCtx;
     let cfg = resolveConfig(c.location?.directory, c.options);
+    if (!cfg.enabled) {
+      // Keep the plugin file loadable for easy re-enabling, but do not register
+      // any hooks, tools, or background work while explicitly disabled.
+      return async () => {};
+    }
     refreshModels(c);
     const disposers: Array<() => void | Promise<void>> = [];
     const track = (registration: unknown): void => {
