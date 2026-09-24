@@ -2566,8 +2566,9 @@ export default Plugin.define({
 
     // ---------------------------------------------------------------- context
     if (typeof c.session?.hook === "function") {
-      track(
-        await c.session.hook("context", (event) => {
+      try {
+          track(
+            await c.session.hook("context", (event) => {
           try {
             if (!cfg.enabled) return;
             const sessionID = String((event as AnyRecord).sessionID ?? "unknown");
@@ -2856,8 +2857,14 @@ export default Plugin.define({
           } catch (err) {
             debug(`context hook failed: ${String(err)}`);
           }
-        }),
-      );
+            }),
+          );
+        } catch (err) {
+          // A failed registration must not take down the host session. Leave
+          // context untouched and expose a safe diagnostic for debugging.
+          log(`context hook registration failed; continuing without pruning: ${String(err)}`);
+          debug(`context hook registration failed: ${String(err)}`);
+        }
     }
 
     // ----------------------------------------------------------------- usage
