@@ -225,6 +225,8 @@ const PACKAGES = [
     config: [
       ["OPENCODE_FINISH_GUARD_ENABLED", "true", "Turn stream normalisation off without uninstalling"],
       ["OPENCODE_FINISH_GUARD_LOG", "false", "Log each normalised stream to stderr"],
+      ["OPENCODE_FINISH_GUARD_RETRY", "true", "Retry a turn whose provider stream was malformed"],
+      ["OPENCODE_FINISH_GUARD_RETRY_MAX", "3", "Maximum retry attempts before the turn is allowed to fail"],
     ],
   },
   {

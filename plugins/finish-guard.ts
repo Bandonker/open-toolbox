@@ -18,6 +18,11 @@ import { Plugin } from "@opencode/plugin";
  * in effect (their finish chunk is already last), non-SSE bodies are passed
  * through untouched, and any failure here leaves the original response in
  * place.
+ *
+ * If a provider still aborts a stream mid-flight — an `InvalidProviderOutput`
+ * such as "content after the finish reason" or a stream that ends without a
+ * finish reason — the `session.hook("retry")` seam asks opencode to retry the
+ * request a bounded number of times instead of failing and wedging the session.
  */
 
 type AnyRecord = Record<string, unknown>;
@@ -33,6 +38,18 @@ function asBool(value: unknown, fallback: boolean): boolean {
   return fallback;
 }
 
+function asInt(value: unknown, fallback: number, min: number, max: number): number {
+  let n: number;
+  if (typeof value === "number") n = value;
+  else if (typeof value === "string") {
+    const text = value.trim();
+    if (text === "") return fallback;
+    n = Number(text);
+  } else return fallback;
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
 function isPlainObject(value: unknown): value is AnyRecord {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -43,6 +60,8 @@ export default Plugin.define({
     const options = (ctx?.options ?? {}) as AnyRecord;
     const enabled = asBool(options.enabled ?? process.env.OPENCODE_FINISH_GUARD_ENABLED, true);
     const debug = asBool(options.log ?? process.env.OPENCODE_FINISH_GUARD_LOG, false);
+    const retry = asBool(options.retry ?? process.env.OPENCODE_FINISH_GUARD_RETRY, true);
+    const retryMax = asInt(options.retryMax ?? process.env.OPENCODE_FINISH_GUARD_RETRY_MAX, 3, 0, 10);
     const log = (message: string): void => {
       if (!debug) return;
       try {
@@ -55,29 +74,89 @@ export default Plugin.define({
     if (!enabled) return () => {};
     if (typeof ctx?.session?.hook !== "function") return () => {};
 
-    let registration: { dispose?: () => unknown } | undefined;
+    const registrations: Array<{ dispose?: () => unknown }> = [];
+
     try {
-      registration = await ctx.session.hook("http.response", (event) => {
-        try {
-          normaliseResponse(event, log);
-        } catch (err) {
-          log(`response left untouched: ${String(err)}`);
-        }
-      });
+      registrations.push(
+        await ctx.session.hook("http.response", (event) => {
+          try {
+            normaliseResponse(event, log);
+          } catch (err) {
+            log(`response left untouched: ${String(err)}`);
+          }
+        }),
+      );
     } catch (err) {
       log(`http.response hook unavailable; provider streams are not normalised: ${String(err)}`);
-      return () => {};
+    }
+
+    if (retry) {
+      try {
+        registrations.push(
+          await ctx.session.hook("retry", (event) => {
+            try {
+              applyRetry(event as unknown as AnyRecord, retryMax, log);
+            } catch (err) {
+              log(`retry decision left to opencode: ${String(err)}`);
+            }
+          }),
+        );
+      } catch (err) {
+        log(`retry hook unavailable; malformed streams are not retried: ${String(err)}`);
+      }
     }
 
     return async () => {
-      try {
-        await registration?.dispose?.();
-      } catch {
-        /* dispose is best-effort */
+      for (const registration of registrations) {
+        try {
+          await registration?.dispose?.();
+        } catch {
+          /* dispose is best-effort */
+        }
       }
     };
   },
 });
+
+/**
+ * The strict OpenAI-chat driver raises these when a provider stream is
+ * malformed: content delivered after the finish reason, or a stream that ends
+ * without one. Both are worth a bounded retry — the next stream is normally
+ * well-formed.
+ */
+const RETRY_MATCH = /content after the finish reason|invalidprovideroutput|stream ended without finish_reason/i;
+
+function providerStreamErrorText(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (!isPlainObject(error)) return "";
+  const parts: string[] = [];
+  for (const key of ["type", "message", "name", "reason", "detail"]) {
+    const value = error[key];
+    if (typeof value === "string") parts.push(value);
+  }
+  try {
+    parts.push(JSON.stringify(error));
+  } catch {
+    /* circular errors are matched on their string fields alone */
+  }
+  return parts.join(" ");
+}
+
+function applyRetry(event: AnyRecord, retryMax: number, log: (message: string) => void): void {
+  if (!RETRY_MATCH.test(providerStreamErrorText(event.error))) return;
+  const decision = event.decision as { retry?: boolean } | undefined;
+  // opencode may already have decided to retry; never shorten an existing one.
+  if (decision?.retry === true) return;
+  const attempt = typeof event.attempt === "number" && Number.isFinite(event.attempt) ? event.attempt : 0;
+  if (attempt >= retryMax) {
+    event.decision = { retry: false };
+    log(`provider stream error not retried: attempt ${attempt} reached the limit of ${retryMax}`);
+    return;
+  }
+  const delay = Math.min(2000, 300 * Math.max(1, attempt));
+  event.decision = { retry: true, delay };
+  log(`retrying a malformed provider stream (attempt ${attempt + 1} in ${delay}ms)`);
+}
 
 function normaliseResponse(event: { response: Response }, log: (message: string) => void): void {
   const response = event?.response;

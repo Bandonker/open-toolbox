@@ -45,6 +45,7 @@ const ctx = {
 
 const cleanup = await mod.default.setup(ctx);
 check("registers an http.response hook", typeof hooks["http.response"] === "function");
+check("registers a retry hook", typeof hooks["retry"] === "function");
 
 const encoder = new TextEncoder();
 
@@ -158,7 +159,55 @@ function payloads(body) {
   check("stream without finish reason keeps its content", body.includes("only"));
 }
 
-// Case 5: disabled via options registers no hook.
+// Case 5: malformed streams are retried, bounded by the attempt limit.
+{
+  const retryEvent = (error, attempt, decision) => ({
+    sessionID: "ses_test",
+    agent: "build",
+    model: { providerID: "opencode-go", modelID: "deepseek-v4.1-flash" },
+    error,
+    attempt,
+    decision,
+  });
+
+  const late = retryEvent(
+    { type: "AI.Error.InvalidProviderOutput", message: "OpenAI Chat received content after the finish reason" },
+    0,
+    { retry: false },
+  );
+  await hooks["retry"](late);
+  check("late-content error is retried", late.decision?.retry === true && Number.isFinite(late.decision.delay), JSON.stringify(late.decision));
+
+  const unterminated = retryEvent(
+    { type: "AI.Error.InvalidProviderOutput", message: "OpenAI Chat stream ended without a finish reason" },
+    0,
+    { retry: false },
+  );
+  await hooks["retry"](unterminated);
+  check("unterminated-stream error is retried", unterminated.decision?.retry === true, JSON.stringify(unterminated.decision));
+
+  const exhausted = retryEvent(
+    { type: "AI.Error.InvalidProviderOutput", message: "OpenAI Chat received content after the finish reason" },
+    3,
+    { retry: false },
+  );
+  await hooks["retry"](exhausted);
+  check("retry stops at the attempt limit", exhausted.decision?.retry === false);
+
+  const unrelated = retryEvent({ type: "SomeOtherError", message: "rate limited" }, 0, { retry: false });
+  await hooks["retry"](unrelated);
+  check("unrelated errors are left to opencode", unrelated.decision?.retry === false);
+
+  const already = retryEvent(
+    { type: "AI.Error.InvalidProviderOutput", message: "OpenAI Chat received content after the finish reason" },
+    0,
+    { retry: true, delay: 10 },
+  );
+  await hooks["retry"](already);
+  check("an existing retry decision is not overridden", already.decision?.delay === 10);
+}
+
+// Case 6: disabled via options registers no hook.
 {
   const disabledHooks = {};
   await mod.default.setup({
@@ -169,9 +218,9 @@ function payloads(body) {
   check("disabled plugin registers no hook", Object.keys(disabledHooks).length === 0);
 }
 
-// Case 6: the setup cleanup disposes the registration.
+// Case 7: the setup cleanup disposes both registrations.
 await cleanup();
-check("cleanup disposes the hook registration", disposed === 1, `disposed=${disposed}`);
+check("cleanup disposes the hook registrations", disposed === 2, `disposed=${disposed}`);
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\nverify-finish-guard: ${results.length - failed.length}/${results.length} checks passed`);
