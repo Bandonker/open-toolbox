@@ -2041,13 +2041,15 @@ const toolCtx = {
     );
 
     // Relocated XDG_CONFIG_HOME must be honoured, and searched before the
-    // legacy path so a moved config actually wins.
+    // legacy path so a moved config actually wins. On macOS the
+    // ~/Library/Application Support entry is still ahead of it, so only the
+    // relative order of XDG vs. the legacy ~/.config path is asserted here.
     const xdgHome = join(sandbox, "xdg-config");
     process.env.XDG_CONFIG_HOME = xdgHome;
     const withXdg = globalConfigDirs();
     check(
       "config lookup honors XDG_CONFIG_HOME",
-      withXdg[0] === join(xdgHome, "opencode"),
+      withXdg.includes(join(xdgHome, "opencode")),
       withXdg.join(" | "),
     );
     check(
@@ -2056,6 +2058,19 @@ const toolCtx = {
         withXdg.indexOf(join(home, ".config", "opencode")),
       withXdg.join(" | "),
     );
+    if (process.platform === "darwin") {
+      check(
+        "macOS searches ~/Library/Application Support/opencode first",
+        withXdg[0] === join(home, "Library", "Application Support", "opencode"),
+        withXdg.join(" | "),
+      );
+    } else {
+      check(
+        "Linux/Windows put the XDG path first",
+        withXdg[0] === join(xdgHome, "opencode"),
+        withXdg.join(" | "),
+      );
+    }
 
     // An empty/whitespace XDG_CONFIG_HOME must not produce a bogus relative
     // path like "opencode/context-pruner.jsonc".

@@ -7,7 +7,15 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The plugins resolve paths, databases and config through os.homedir()
+        # and process.platform, so a green run on one OS says nothing about the
+        # others. macOS runners are case-insensitive by default and Linux is not,
+        # which is exactly the divergence these jobs exist to catch.
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
