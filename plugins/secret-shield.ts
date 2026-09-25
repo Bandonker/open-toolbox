@@ -573,10 +573,37 @@ export default Plugin.define({
       /(?:^|[_-])(?:key|token|secret|password|passwd|pwd|credential|auth)(?:$|[_-])|api[_-]?key|apikey|private[_-]?key|access[_-]?key|client[_-]?secret/i;
 
     // Values we never rewrite, even in redact/block mode: clobbering these would
-    // break the child process (PATH is the classic footgun).
+    // break the child process (PATH is the classic footgun). Looked up
+    // lower-cased, so entries must be lower-case.
+    //
+    // This list used to be Windows-only apart from PATH/HOME/TMP/SHELL/TERM, so
+    // on Linux and macOS a rewrite could strip the dynamic-loader or session
+    // variables a child needs to start at all. Findings are still audited
+    // above this check; this only governs whether the value is replaced.
     const CRITICAL_ENV = new Set([
-      "path", "pathext", "systemroot", "windir", "comspec", "home", "userprofile",
-      "temp", "tmp", "shell", "term", "lang", "pwd", "oldpwd", "psmodulepath",
+      // Portable / POSIX shell
+      "path", "home", "pwd", "oldpwd", "shell", "term", "term_size", "colorterm",
+      "lang", "lc_all", "lc_ctype", "tmpdir", "temp", "tmp", "tz",
+      // Linux/BSD dynamic loader — a child cannot exec without these
+      "ld_preload", "ld_library_path", "ld_audit", "libpath",
+      // Linux/BSD session, display and IPC
+      "xdg_config_home", "xdg_data_home", "xdg_state_home", "xdg_cache_home",
+      "xdg_runtime_dir", "xdg_config_dirs", "xdg_data_dirs", "xdg_session_type",
+      "xdg_session_id", "xdg_session_class", "xdg_session_desktop",
+      "display", "wayland_display", "xauthority", "session_manager",
+      "dbus_session_bus_address", "dbus_system_bus_address",
+      "virtual_desktop", "desktop_session", "ssh_auth_sock", "gpg_tty",
+      // macOS dynamic loader (same hazard as LD_*) and Homebrew prefix
+      "dyld_insert_libraries", "dyld_library_path", "dyld_fallback_library_path",
+      "dyld_frameworks_path", "homebrew_prefix", "homebrew_cellar",
+      // Toolchain roots: clobbering these breaks the very commands we guard
+      "java_home", "sdkman_root", "gradle_home", "nvm_dir", "pnpm_home",
+      "volta_home", "cargo_home", "rustup_home", "goroot", "gopath",
+      // Windows shell and system locations
+      "pathext", "systemroot", "windir", "comspec", "userprofile",
+      "systemdrive", "psmodulepath", "number_of_processors",
+      "programfiles", "programfiles(x86)", "programw6432",
+      "commonprogramfiles", "commonprogramfiles(x86)", "allusersprofile", "public",
     ]);
 
     await ctx.shell.hook("create.before", (event) => {

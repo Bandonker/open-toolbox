@@ -187,6 +187,36 @@ try {
       event.env.PATH.startsWith("ghp_"),
       event.env.PATH.slice(0, 12) + "...",
     );
+
+    // Linux/macOS regression: the critical list was Windows-only apart from
+    // PATH/HOME/TMP/SHELL/TERM, so a rewrite could strip the dynamic-loader or
+    // session vars a child needs to exec at all. Each of these must survive,
+    // including the mixed-case Path form used on Windows.
+    const platformEvent = {
+      command: "printenv",
+      cwd: ".",
+      timeout: 0,
+      shell: "bash",
+      env: {
+        LD_PRELOAD: `ghp_${"Q".repeat(36)}`,
+        LD_LIBRARY_PATH: `ghp_${"Q".repeat(36)}`,
+        DYLD_INSERT_LIBRARIES: `ghp_${"Q".repeat(36)}`,
+        XDG_RUNTIME_DIR: `ghp_${"Q".repeat(36)}`,
+        DISPLAY: `ghp_${"Q".repeat(36)}`,
+        DBUS_SESSION_BUS_ADDRESS: `ghp_${"Q".repeat(36)}`,
+        ProgramFiles: `ghp_${"Q".repeat(36)}`,
+        SSH_AUTH_SOCK: `ghp_${"Q".repeat(36)}`,
+      },
+    };
+    await hooks.shell["create.before"](platformEvent);
+    const clobbered = Object.entries(platformEvent.env).filter(
+      ([, v]) => !String(v).startsWith("ghp_"),
+    );
+    check(
+      "shell.hook never clobbers Linux/macOS loader or session env vars",
+      clobbered.length === 0,
+      clobbered.map(([k]) => k).join(", ") || "all preserved",
+    );
   }
   {
     const { hooks } = await boot({ OPENCODE_SECRET_SHIELD_MODE: "redact" });
