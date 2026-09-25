@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import { rmSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, isAbsolute } from "node:path";
 
 // The SQLite plugins resolve their database under os.homedir() at import time.
 // Point that at a throwaway sandbox so these checks never touch the real
@@ -1952,6 +1952,70 @@ const toolCtx = {
   );
   if (typeof cleanup === "function") await cleanup();
   check("opencode-sessions cleanup is callable", true);
+}
+
+// ------------------------------------------- context-pruner: XDG config lookup
+{
+  const mod = await import(new URL("../plugins/context-pruner.ts", import.meta.url));
+  const { globalConfigDirs, configCandidatePaths } = mod.__test__;
+  const savedXdg = process.env.XDG_CONFIG_HOME;
+  const home = process.env.HOME;
+
+  try {
+    // Default Linux/macOS box with XDG_CONFIG_HOME unset: the legacy
+    // ~/.config path must still be searched or existing installs break.
+    delete process.env.XDG_CONFIG_HOME;
+    const base = globalConfigDirs();
+    check(
+      "config lookup falls back to ~/.config/opencode with XDG_CONFIG_HOME unset",
+      base.includes(join(home, ".config", "opencode")),
+      base.join(" | "),
+    );
+
+    // Relocated XDG_CONFIG_HOME must be honoured, and searched before the
+    // legacy path so a moved config actually wins.
+    const xdgHome = join(sandbox, "xdg-config");
+    process.env.XDG_CONFIG_HOME = xdgHome;
+    const withXdg = globalConfigDirs();
+    check(
+      "config lookup honors XDG_CONFIG_HOME",
+      withXdg[0] === join(xdgHome, "opencode"),
+      withXdg.join(" | "),
+    );
+    check(
+      "XDG path is searched before the legacy ~/.config path",
+      withXdg.indexOf(join(xdgHome, "opencode")) <
+        withXdg.indexOf(join(home, ".config", "opencode")),
+      withXdg.join(" | "),
+    );
+
+    // An empty/whitespace XDG_CONFIG_HOME must not produce a bogus relative
+    // path like "opencode/context-pruner.jsonc".
+    process.env.XDG_CONFIG_HOME = "   ";
+    check(
+      "blank XDG_CONFIG_HOME is ignored, not turned into a relative path",
+      !globalConfigDirs().some((d) => !isAbsolute(d)),
+      globalConfigDirs().join(" | "),
+    );
+
+    // Every candidate must be absolute and de-duplicated, or the plugin would
+    // resolve config relative to the process cwd.
+    process.env.XDG_CONFIG_HOME = xdgHome;
+    const cands = configCandidatePaths(undefined);
+    check(
+      "all config candidates are absolute paths",
+      cands.every((c) => isAbsolute(c)),
+      cands.filter((c) => !isAbsolute(c)).join(" | "),
+    );
+    check(
+      "config candidates are de-duplicated",
+      new Set(cands).size === cands.length,
+      cands.join(" | "),
+    );
+  } finally {
+    if (savedXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = savedXdg;
+  }
 }
 
 // The SQLite plugins keep their module-level DB handles open, so on Windows the

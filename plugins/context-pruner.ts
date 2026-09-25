@@ -422,17 +422,49 @@ function readConfigFile(path: string): AnyRecord | undefined {
   }
 }
 
+/**
+ * Global opencode config directories, most-specific first.
+ *
+ * opencode honors XDG_CONFIG_HOME on Linux/BSD (default ~/.config) and uses
+ * ~/Library/Application Support on macOS. Windows has no XDG equivalent, so it
+ * stays on ~/.config. We previously hardcoded ~/.config/opencode, which
+ * silently missed the config for anyone who relocated XDG_CONFIG_HOME.
+ *
+ * The legacy ~/.config path is kept as a fallback rather than replaced, so an
+ * existing install never loses its settings. Paths are de-duplicated because on
+ * a default Linux box the XDG entry resolves back to the same directory.
+ */
+function globalConfigDirs(): string[] {
+  const home = homedir();
+  const dirs: string[] = [];
+
+  if (process.platform === "darwin") {
+    dirs.push(join(home, "Library", "Application Support", "opencode"));
+  }
+
+  const xdg = process.env.XDG_CONFIG_HOME;
+  if (xdg && xdg.trim()) dirs.push(join(xdg, "opencode"));
+
+  dirs.push(join(home, ".config", "opencode"));
+
+  return [...new Set(dirs)];
+}
+
 /** Collect config from (in order): global file, project file, legacy dcp file. */
 function configCandidatePaths(directory: string | undefined): string[] {
   const candidates: string[] = [];
   const explicit = process.env.OPENCODE_CONTEXT_PRUNER_CONFIG;
   if (explicit) candidates.push(explicit);
-  const globalDir = join(homedir(), ".config", "opencode");
-  candidates.push(join(globalDir, "context-pruner.jsonc"));
+  const globalDirs = globalConfigDirs();
+  for (const dir of globalDirs) {
+    candidates.push(join(dir, "context-pruner.jsonc"));
+  }
   if (directory) {
     candidates.push(join(directory, ".opencode", "context-pruner.jsonc"));
   }
-  candidates.push(join(globalDir, "dcp.jsonc"));
+  for (const dir of globalDirs) {
+    candidates.push(join(dir, "dcp.jsonc"));
+  }
   if (directory) {
     candidates.push(join(directory, ".opencode", "dcp.jsonc"));
   }
@@ -1520,6 +1552,8 @@ export const __test__ = {
   summaryCacheKey,
   // CP-1..CP-11 verification seams.
   resolveConfig,
+  globalConfigDirs,
+  configCandidatePaths,
   guardedSet,
   valueToText,
   statelessTest,
