@@ -11,3 +11,6 @@ packages/
 
 ISSUES.md
 .superpowers/
+
+# Personal working notes, not part of the published plugin pack.
+PLUGIN-*.md
