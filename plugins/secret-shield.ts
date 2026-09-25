@@ -19,6 +19,7 @@ import {
   buildAllowList,
   collectFindings,
   isScanTruncated,
+  scanGaps,
   readAllowFile,
   applyFindings,
   type AllowList,
@@ -287,6 +288,54 @@ const PATH_KEYS = new Set([
   "dir", "directory",
 ]);
 
+// SS-8: tool parameters that carry shell one-liners rather than paths
+// (`command: "cat .env"`). Scanned for protected basenames in block mode.
+const COMMAND_KEYS = new Set(["command", "script", "cmd", "commands"]);
+
+function commandMentionsProtected(cmd: string): string | null {
+  for (const tok of cmd.split(/[\s;&|'"`$(){}<>\[\],=]+/)) {
+    const t = tok.trim().replace(/^[^\w.~-]+|[^\w.~-]+$/g, "");
+    if (!t) continue;
+    if (isProtectedPath(t)) return t;
+    const b = basename(t.replace(/\\/g, "/"));
+    if (b && b !== t && isProtectedPath(b)) return t;
+  }
+  return null;
+}
+
+/** SS-8: find the first shell one-liner token naming a protected file. */
+function findCommandHit(value: unknown, depth = 0, seen?: WeakSet<object>): string | null {
+  if (depth > 6 || value === null || typeof value !== "object") return null;
+  const s = seen ?? new WeakSet<object>();
+  if (s.has(value)) return null;
+  s.add(value);
+  try {
+    if (Array.isArray(value)) {
+      for (const v of value) {
+        const hit = findCommandHit(v, depth + 1, s);
+        if (hit) return hit;
+      }
+      return null;
+    }
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (COMMAND_KEYS.has(k)) {
+        const strs = typeof v === "string" ? [v] : Array.isArray(v) ? v : [];
+        for (const item of strs) {
+          if (typeof item !== "string") continue;
+          const hit = commandMentionsProtected(item);
+          if (hit) return hit;
+        }
+      } else if (v !== null && typeof v === "object") {
+        const hit = findCommandHit(v, depth + 1, s);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  } finally {
+    s.delete(value);
+  }
+}
+
 /**
  * H2: tools that may receive original placeholder values back. Restoring a
  * placeholder puts the raw secret into the tool call — that must never reach
@@ -345,31 +394,49 @@ export default Plugin.define({
     // original value for trusted local tools when the agent echoes it back.
     const nonce = randomBytes(4).toString("hex");
     const originals = new Map<string, string>();
+    // SS-3: cap the restore map — every redacted secret was retained for the
+    // process lifetime. FIFO-evict the oldest placeholder past the cap.
+    const MAX_ORIGINALS = 5000;
     const placeholderRe = new RegExp(`\\[SS:${nonce}:([A-Za-z0-9_\\-]+)\\]`, "g");
     let seq = 0;
     const makePlaceholder = (rule: string, value: string): string => {
       const p = `[SS:${nonce}:${rule}-${seq++}]`;
+      if (originals.size >= MAX_ORIGINALS) {
+        const oldest = originals.keys().next();
+        if (!oldest.done) originals.delete(oldest.value);
+      }
       originals.set(p, value);
       return p;
     };
 
     /** Detect and (in redact/block) rewrite a text blob. */
-    const processText = (text: string, location: string, action: string): string => {
-      // H5: oversize input is scanned head-only (see lib/redact.ts) — say so
-      // instead of silently covering just the prefix.
+    const processText = (
+      text: string,
+      location: string,
+      action: string,
+      counter?: { redacted: number },
+    ): string => {
+      // SS-5: oversize input is scanned in head/tail windows (see
+      // lib/redact.ts) — report the skipped middle instead of silently
+      // covering just the prefix.
       if (isScanTruncated(text)) {
-        log(`scan truncated to 2M chars at ${location} (input ${text.length} chars)`);
+        log(`scan truncated to head/tail windows at ${location} (input ${text.length} chars, skipped ${JSON.stringify(scanGaps(text))})`);
       }
       const findings = collectFindings(text, location, cfg, allow);
       if (!findings.length) return text;
       audit.record(findings, location, cfg.mode === "observe" ? "detected" : action);
       if (cfg.mode === "observe") return text;
+      if (counter) counter.redacted += findings.length;
       return applyFindings(text, findings, makePlaceholder);
     };
 
     /** Restore plugin placeholders, then redact any remaining raw secrets. */
-    const processRestoreThenRedact = (text: string, location: string): string => {
-      if (!originals.size) return processText(text, location, "redacted");
+    const processRestoreThenRedact = (
+      text: string,
+      location: string,
+      counter?: { redacted: number },
+    ): string => {
+      if (!originals.size) return processText(text, location, "redacted", counter);
       const parts = text.split(placeholderRe);
       let out = "";
       for (let i = 0; i < parts.length; i++) {
@@ -377,26 +444,55 @@ export default Plugin.define({
           const full = `[SS:${nonce}:${parts[i]}]`;
           out += originals.get(full) ?? full;
         } else {
-          out += processText(parts[i], location, "redacted");
+          out += processText(parts[i], location, "redacted", counter);
         }
       }
       return out;
     };
 
-    const scrub = (node: unknown, location: string, useRestore: boolean): unknown => {
+    // SS-1: depth-capped (20) cycle-safe walker, mirroring extractPaths' cap.
+    // Objects/arrays are scrubbed in place; the counter reports how many
+    // findings were redacted (see SS-2 at the execute.before call site).
+    const SCRUB_MAX_DEPTH = 20;
+    const scrub = (
+      node: unknown,
+      location: string,
+      useRestore: boolean,
+      depth = 0,
+      seen?: WeakSet<object>,
+      counter?: { redacted: number },
+    ): unknown => {
       if (typeof node === "string") {
         return useRestore
-          ? processRestoreThenRedact(node, location)
-          : processText(node, location, "redacted");
+          ? processRestoreThenRedact(node, location, counter)
+          : processText(node, location, "redacted", counter);
       }
+      if (depth >= SCRUB_MAX_DEPTH) return node;
+      const s = seen ?? new WeakSet<object>();
       if (Array.isArray(node)) {
-        for (let i = 0; i < node.length; i++) node[i] = scrub(node[i], location, useRestore);
+        if (s.has(node)) return node;
+        s.add(node);
+        try {
+          for (let i = 0; i < node.length; i++) {
+            node[i] = scrub(node[i], location, useRestore, depth + 1, s, counter);
+          }
+        } finally {
+          s.delete(node);
+        }
         return node;
       }
       if (node && typeof node === "object") {
-        const obj = node as Record<string, unknown>;
-        for (const k of Object.keys(obj)) obj[k] = scrub(obj[k], location, useRestore);
-        return obj;
+        if (s.has(node)) return node;
+        s.add(node);
+        try {
+          const obj = node as Record<string, unknown>;
+          for (const k of Object.keys(obj)) {
+            obj[k] = scrub(obj[k], location, useRestore, depth + 1, s, counter);
+          }
+        } finally {
+          s.delete(node);
+        }
+        return node;
       }
       return node;
     };
@@ -432,11 +528,30 @@ export default Plugin.define({
         const headers = new Headers(req.headers);
         headers.delete("content-length");
         headers.set("content-length", String(Buffer.byteLength(redacted, "utf8")));
-        event.request = new Request(req.url, {
-          method: req.method,
-          headers,
-          body: redacted,
-        });
+        // SS-6: preserve the request semantics the old minimal rebuild
+        // dropped; fall back to the minimal shape if the runtime rejects
+        // any propagated property (e.g. mode "navigate").
+        try {
+          event.request = new Request(req.url, {
+            method: req.method,
+            headers,
+            body: redacted,
+            redirect: req.redirect,
+            credentials: req.credentials,
+            integrity: req.integrity,
+            keepalive: req.keepalive,
+            cache: req.cache,
+            mode: req.mode,
+            // Runtime-supported (undici) but absent from TS 5.8's DOM lib.
+            ...{ duplex: "half" as const },
+          } as RequestInit);
+        } catch {
+          event.request = new Request(req.url, {
+            method: req.method,
+            headers,
+            body: redacted,
+          });
+        }
       } catch (err) {
         log(`http.request hook skipped: ${String(err)}`);
       }
@@ -508,11 +623,19 @@ export default Plugin.define({
           const paths: string[] = [];
           extractPaths(event.input, paths);
           const hit = paths.find(isProtectedPath);
-          if (hit) {
+          // SS-8: PATH_KEYS alone missed shell one-liners like
+          // `command: "cat .env"` — scan command-style strings too.
+          const cmdHit = hit ? null : findCommandHit(event.input);
+          const blocked = hit ?? cmdHit;
+          if (blocked) {
             throw new Error(
-              `[secret-shield] blocked access to protected secret file "${hit}" (block mode). ` +
-                `Use secret_shield_shape or secret_shield_keys to inspect it without exposing ` +
-                `values, or secret_shield_scan to check a specific value.`,
+              hit
+                ? `[secret-shield] blocked access to protected secret file "${hit}" (block mode). ` +
+                  `Use secret_shield_shape or secret_shield_keys to inspect it without exposing ` +
+                  `values, or secret_shield_scan to check a specific value.`
+                : `[secret-shield] blocked shell command referencing protected secret "${blocked}" (block mode). ` +
+                  `Use secret_shield_shape or secret_shield_keys to inspect the file without exposing ` +
+                  `values, or secret_shield_scan to check a specific value.`,
             );
           }
         }
@@ -523,15 +646,22 @@ export default Plugin.define({
       try {
         if (!cfg.enabled) return;
         const before = event.input;
+        // SS-2: scrub() mutates objects/arrays in place and returns the same
+        // reference, so `after !== before` could never be true — gate the
+        // assignment on the redaction count instead.
         // H2: fail closed — only allow-listed local file tools get the raw
         // values back; shells (and unknown tools) keep the placeholders so
         // secrets never hit argv/env/logs.
+        const counter = { redacted: 0 };
         const after = scrub(
           before,
           `tool.execute.before:${event.tool}`,
           RESTORE_SAFE_TOOLS.has(event.tool),
+          0,
+          undefined,
+          counter,
         );
-        if (after !== before) event.input = after;
+        if (counter.redacted > 0) event.input = after;
       } catch (err) {
         log(`execute.before redaction skipped: ${String(err)}`);
       }
@@ -541,21 +671,9 @@ export default Plugin.define({
       try {
         if (!cfg.enabled || event.status !== "completed") return;
         const location = `tool.execute.after:${event.tool}`;
-        const result = event.result as unknown as { content?: unknown; output?: unknown };
-        if (typeof result.content === "string") {
-          result.content = processText(result.content, location, "redacted");
-        } else if (Array.isArray(result.content)) {
-          for (const part of result.content as Array<Record<string, unknown>>) {
-            for (const key of ["text", "value"]) {
-              if (typeof part[key] === "string") {
-                part[key] = processText(part[key] as string, location, "redacted");
-              }
-            }
-          }
-        }
-        if (typeof result.output === "string") {
-          result.output = processText(result.output, location, "redacted");
-        }
+        // SS-4: scrub the whole result — the old top-level content/output
+        // handling missed nested structures.
+        scrub(event.result, location, false);
       } catch (err) {
         log(`execute.after hook skipped: ${String(err)}`);
       }
@@ -586,6 +704,7 @@ export default Plugin.define({
         `entropy: ${cfg.entropy}`,
         `rules: ${RULES.length}`,
         `allow entries: ${cfg.allow.length + readAllowFile().length}`,
+        `originals: ${originals.size}`,
         `audit: ${cfg.auditPath}`,
         `findings: ${audit.stats.findings}`,
         `by rule: ${fmt(audit.stats.byRule)}`,

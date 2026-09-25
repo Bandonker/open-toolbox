@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
-import { mkdirSync, existsSync, copyFileSync, rmSync } from "fs";
+import { mkdirSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import {
@@ -13,6 +13,11 @@ import {
   parseStringArray,
   quoteFtsQuery,
   dbUnavailable,
+  clampLimit,
+  copyBackupIntoPlace,
+  hasTriggers,
+  truncateStored,
+  STORE_CAPS,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
 import { redactSecrets } from "../lib/redact.ts";
@@ -22,9 +27,13 @@ const DB_PATH = join(DB_DIR, "error-journal.db");
 const BACKUP_DIR = join(DB_DIR, "backups");
 const MAX_BACKUPS = 5;
 /** P5: redact obvious secrets before they hit the pack's own store (opt-out via env). */
-const STORE_REDACT = process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+// Lazy read (call time, not module load) so toggles take effect without a re-import.
+function storeRedactOn(): boolean {
+  return process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+}
+
 function scrubStore(text: string): string {
-  return STORE_REDACT ? redactSecrets(text) : text;
+  return storeRedactOn() ? redactSecrets(text) : text;
 }
 
 let db: AnyDatabase | null = null;
@@ -32,10 +41,12 @@ let lastBackupTime = 0;
 
 function getDb(): AnyDatabase {
   if (!db) {
-    if (!existsSync(DB_DIR)) {
-      mkdirSync(DB_DIR, { recursive: true });
-    }
+    // DL-2: mkdir inside try so a creation failure routes to backup-restore
+    // instead of escaping as an unhandled throw.
     try {
+      if (!existsSync(DB_DIR)) {
+        mkdirSync(DB_DIR, { recursive: true });
+      }
       db = openDatabase(DB_PATH);
       applyPragmas(db);
       initSchema(db);
@@ -83,9 +94,8 @@ function initSchema(database: AnyDatabase): void {
   // E1: triggers are ensured on every open, not only when the FTS table was
   // just created — a dropped/desynced trigger must not silently stop making
   // new errors searchable.
-  const hadTriggers = !!database
-    .query("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='errors_ai'")
-    .get();
+  // CR-9: verify all three triggers (ai/ad/au), not just the insert one.
+  const hadTriggers = hasTriggers(database, ["errors_ai", "errors_ad", "errors_au"]);
 
   database.exec(`
     CREATE TRIGGER IF NOT EXISTS errors_ai AFTER INSERT ON errors BEGIN
@@ -143,10 +153,9 @@ function tryRestore(): AnyDatabase | null {
     try { db.close(); } catch { /* ignore */ }
     db = null;
   }
-  for (const suffix of ["-wal", "-shm"]) {
-    try { rmSync(DB_PATH + suffix, { force: true }); } catch { /* ignore */ }
-  }
-  copyFileSync(latest, DB_PATH);
+  // CR-8: I/O wrapped with context (copyBackupIntoPlace); it also drops
+  // -wal/-shm/-journal so they cannot be replayed on the restored snapshot.
+  copyBackupIntoPlace(DB_PATH, latest);
   const restored = openDatabase(DB_PATH);
   applyPragmas(restored);
   initSchema(restored);
@@ -170,9 +179,15 @@ function withRetry<T>(fn: () => T, isWrite = false): T {
       db = null;
       db = tryRestore();
       if (db) {
-        const result = fn();
-        if (isWrite) { try { backup(); } catch {} }
-        return result;
+        // CR-3: the retried call can fail too — route it to dbUnavailable
+        // instead of throwing out of the tool.
+        try {
+          const result = fn();
+          if (isWrite) { try { backup(); } catch {} }
+          return result;
+        } catch (retryErr) {
+          return dbUnavailable(retryErr) as T;
+        }
       }
     }
     // CR-3: never throw storage failures out of tools — every caller uses
@@ -211,8 +226,9 @@ export default Plugin.define({
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "error_log",
+        // EJ-5: document that the journal is manual-only (opt-in logging).
         description:
-          "Log a new error to the journal. Record the error message/stack, what was happening, and optional tags/project for categorization.",
+          "Log a new error to the journal. Record the error message/stack, what was happening, and optional tags/project for categorization. Manual-only: errors are recorded only when this tool is called explicitly; nothing is captured automatically.",
         input: z.object({
           error_text: z.string().describe("The error message or stack trace"),
           context: z.string().optional().describe("What was happening when the error occurred (file, command, action)"),
@@ -226,15 +242,16 @@ export default Plugin.define({
           try {
             const out = withRetry(() => {
               const database = getDb();
-              const tagsJson = JSON.stringify(args.tags || []);
+              const tagsJson = JSON.stringify(args.tags ?? []);
               const stmt = database.prepare(
                 "INSERT INTO errors (error_text, context, tags, project) VALUES (?, ?, ?, ?)"
               );
               const result = stmt.run(
-                scrubStore(args.error_text),
-                args.context ? scrubStore(args.context) : null,
+                // CR-4: cap unbounded inputs into DB/FTS (20k each).
+                truncateStored(scrubStore(args.error_text), STORE_CAPS.errorField),
+                args.context ? truncateStored(scrubStore(args.context), STORE_CAPS.errorField) : null,
                 tagsJson,
-                args.project || null
+                args.project ?? null
               ) as { lastInsertRowid: number | bigint };
               return `Logged error #${result.lastInsertRowid}`;
             }, true);
@@ -258,13 +275,18 @@ export default Plugin.define({
           const out = withRetry(() => {
             const database = getDb();
             const row = database
-              .query("SELECT id FROM errors WHERE id = ?")
-              .get(args.id) as { id: number } | null;
+              .query("SELECT id, resolution FROM errors WHERE id = ?")
+              .get(args.id) as { id: number; resolution: string | null } | null;
             if (!row) return `Error #${args.id} not found`;
+            // EJ-6: surface a prior resolution instead of silently overwriting.
+            // Cap the echo at 500 chars so a huge stored resolution cannot
+            // blow up tool output.
+            const prior = row.resolution ? ` (prior resolution: "${truncateStored(row.resolution, 500)}")` : "";
             database
               .prepare("UPDATE errors SET resolution = ?, resolved_at = datetime('now') WHERE id = ?")
-              .run(scrubStore(args.resolution), args.id);
-            return `Resolved error #${args.id}`;
+              // CR-4: cap unbounded inputs into DB/FTS (20k).
+              .run(truncateStored(scrubStore(args.resolution), STORE_CAPS.errorField), args.id);
+            return `Resolved error #${args.id}${prior}`;
           }, true);
           return { content: out };
         },
@@ -284,7 +306,8 @@ export default Plugin.define({
             const database = getDb();
             const q = quoteFtsQuery(args.query);
             if (q === null) return "No errors found. (empty query)";
-            const limit = Math.min(Math.max(args.limit || 10, 1), 50);
+            // Shared clampLimit: trunc + finite guard.
+            const limit = clampLimit(args.limit ?? 10, 10, 50);
             const rows = database
               .query(
                 `SELECT e.* FROM errors e
@@ -339,7 +362,8 @@ export default Plugin.define({
             }
 
             const where = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
-            const limit = Math.min(Math.max(args.limit || 20, 1), 100);
+            // Shared clampLimit: trunc + finite guard.
+            const limit = clampLimit(args.limit ?? 20, 20, 100);
 
             const rows = database
               .query(`SELECT * FROM errors ${where} ORDER BY created_at DESC LIMIT ?`)

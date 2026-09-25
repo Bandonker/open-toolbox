@@ -89,7 +89,7 @@ const PACKAGES = [
       ["OPENCODE_CONTEXT_PRUNER_ENABLED", "true", "Turn pruning off without uninstalling"],
       ["OPENCODE_CONTEXT_PRUNER_KEEP_RECENT", "6", "Most-recent tool results to leave untouched"],
       ["OPENCODE_CONTEXT_PRUNER_MIN_CHARS", "2000", "Only prune results longer than this"],
-      ["OPENCODE_CONTEXT_PRUNER_KEEP_HEAD", "400", "Chars of the result kept as a preview"],
+      ["OPENCODE_CONTEXT_PRUNER_KEEP_HEAD", "200", "Chars of the result kept as a preview"],
       ["OPENCODE_CONTEXT_PRUNER_KEEP_ERRORS", "true", "Never prune error results"],
       ["OPENCODE_CONTEXT_PRUNER_IGNORE", "context_pruner_stats", "Comma-separated tools to never prune"],
       ["OPENCODE_CONTEXT_PRUNER_LOG", "false", "Log each prune to stderr"],
@@ -103,7 +103,12 @@ const PACKAGES = [
       ["OPENCODE_CONTEXT_PRUNER_CHARS_PER_TOKEN", "3.6", "Seed estimator before calibration"],
       ["OPENCODE_CONTEXT_PRUNER_PROTECTED_TOOLS", "task,skill,compress,context_report", "Tools never pruned"],
       ["OPENCODE_CONTEXT_PRUNER_PROTECTED_PATTERNS", "(none)", "Regexes of tools never pruned"],
-      ["OPENCODE_CONTEXT_PRUNER_NOTIFY", "true", "One-line stderr summary when pruning"],
+      ["OPENCODE_CONTEXT_PRUNER_NOTIFY", "true", "Receipt verbosity: off | minimal | detailed"],
+      ["OPENCODE_CONTEXT_PRUNER_NOTIFY_TYPE", "toast", "chat posts the receipt inline, toast logs to stderr"],
+      ["OPENCODE_CONTEXT_PRUNER_NOTIFY_MIN_TOKENS", "500", "Turn savings needed to trigger a receipt"],
+      ["OPENCODE_CONTEXT_PRUNER_NOTIFY_ON_TOPIC", "true", "Receipt on applied summaries even below the floor"],
+      ["OPENCODE_CONTEXT_PRUNER_COLLAPSE", "true", "Collapse fully-pruned message spans"],
+      ["OPENCODE_CONTEXT_PRUNER_COLLAPSE_STUBS", "true", "Also collapse spans that are only stubbed"],
       ["OPENCODE_CONTEXT_PRUNER_COMPACTION", "true", "Replace native compaction with a deterministic checkpoint"],
       ["OPENCODE_CONTEXT_PRUNER_RETRY", "true", "Recover from context-limit errors by trimming harder and retrying"],
       ["OPENCODE_CONTEXT_PRUNER_TITLE", "false", "Short-circuit model title generation"],
@@ -116,6 +121,7 @@ const PACKAGES = [
       ["OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS", "true", "Summarise automatically when the token target is exceeded"],
       ["OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX", "3", "Max automatic summariser calls per session"],
       ["OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MIN", "4000", "Minimum tokens a range must hold to be auto-summarised"],
+      ["OPENCODE_CONTEXT_PRUNER_MAX_AUTO_SUMMARIES", "12", "Max stale units covered per proactive summary"],
       ["OPENCODE_CONTEXT_PRUNER_COMPRESS", "true", "Enable the model-callable compress tool"],
       ["OPENCODE_CONTEXT_PRUNER_COMPRESS_MAX_CHARS", "24000", "Max characters sent to the summariser per compress call"],
       ["OPENCODE_CONTEXT_PRUNER_PROTECT_TAGS", "true", "Preserve <protect>...</protect> blocks during summarisation"],
@@ -136,8 +142,8 @@ const PACKAGES = [
     dir: "session-export",
     name: `${SCOPE}/opencode-session-export`,
     source: "plugins/session-export.ts",
-    helpers: [],
-    rewrites: {},
+    helpers: [{ src: "lib/redact.ts", dest: "lib/redact.js" }],
+    rewrites: { "../lib/redact.ts": "./lib/redact.js" },
     description:
       "Export a session transcript to markdown, json, jsonl or text with reasoning/tool filtering, secret redaction, home-path rewriting and non-overwriting filenames.",
     keywords: ["session", "export", "transcript", "redaction"],
@@ -159,8 +165,11 @@ const PACKAGES = [
     dir: "memory",
     name: `${SCOPE}/opencode-memory`,
     source: "plugins/memory.ts",
-    helpers: [{ src: "lib/sqlite.ts", dest: "lib/sqlite.js" }],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js" },
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/redact.ts", dest: "lib/redact.js" },
+    ],
+    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
     description:
       "Local-first long-term memory: store and BM25-recall fragments with SQLite FTS5. No embedding API, no cloud. Auto-injects relevant memories into each request within a hard character budget.",
     keywords: ["memory", "recall", "sqlite", "fts5", "local-first"],
@@ -186,8 +195,8 @@ const PACKAGES = [
     dir: "secret-shield",
     name: `${SCOPE}/opencode-secret-shield`,
     source: "plugins/secret-shield.ts",
-    helpers: [],
-    rewrites: {},
+    helpers: [{ src: "lib/redact.ts", dest: "lib/redact.js" }],
+    rewrites: { "../lib/redact.ts": "./lib/redact.js" },
     description:
       "v2-native secret detector/redactor: scrubs the outbound HTTP body (title/compaction/generate), prompt, tool args/results and child-process env; observe/redact/block modes with entropy detection, allowlist precedence and a hashed JSONL audit.",
     keywords: ["secrets", "redaction", "security", "guardrails"],
@@ -204,6 +213,23 @@ const PACKAGES = [
       ["OPENCODE_SECRET_SHIELD_ALLOW", "(none)", "Comma-separated literals, /regex/, globs or rule ids"],
       ["OPENCODE_SECRET_SHIELD_BLOCK_ENV_READS", "true", "Block-mode deny of protected secret files"],
       ["OPENCODE_SECRET_SHIELD_LOG", "false", "Emit diagnostics to stderr"],
+    ],
+  },
+  {
+    dir: "finish-guard",
+    name: `${SCOPE}/opencode-finish-guard`,
+    source: "plugins/finish-guard.ts",
+    helpers: [],
+    rewrites: {},
+    description:
+      "Normalises OpenAI-compatible SSE streams so a content or reasoning delta that arrives after the finish reason cannot kill a session (\"OpenAI Chat received content after the finish reason\").",
+    keywords: ["stream", "sse", "provider", "openai", "compatibility"],
+    tools: [],
+    config: [
+      ["OPENCODE_FINISH_GUARD_ENABLED", "true", "Turn stream normalisation off without uninstalling"],
+      ["OPENCODE_FINISH_GUARD_LOG", "false", "Log each normalised stream to stderr"],
+      ["OPENCODE_FINISH_GUARD_RETRY", "true", "Retry a turn whose provider stream was malformed"],
+      ["OPENCODE_FINISH_GUARD_RETRY_MAX", "3", "Maximum retry attempts before the turn is allowed to fail"],
     ],
   },
   {
@@ -237,8 +263,11 @@ const PACKAGES = [
     dir: "decision-log",
     name: `${SCOPE}/opencode-decision-log`,
     source: "plugins/decision-log.ts",
-    helpers: [{ src: "lib/sqlite.ts", dest: "lib/sqlite.js" }],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js" },
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/redact.ts", dest: "lib/redact.js" },
+    ],
+    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
     description:
       "Record and search architectural decisions in a local SQLite FTS5 database.",
     keywords: ["decisions", "adr", "memory", "sqlite", "fts5"],
@@ -255,8 +284,11 @@ const PACKAGES = [
     dir: "error-journal",
     name: `${SCOPE}/opencode-error-journal`,
     source: "plugins/error-journal.ts",
-    helpers: [{ src: "lib/sqlite.ts", dest: "lib/sqlite.js" }],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js" },
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/redact.ts", dest: "lib/redact.js" },
+    ],
+    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
     description:
       "Log errors with context, search past ones, and record resolutions so you stop re-debugging the same failure.",
     keywords: ["errors", "journal", "debugging", "sqlite", "fts5"],
@@ -273,8 +305,11 @@ const PACKAGES = [
     dir: "snippet-library",
     name: `${SCOPE}/opencode-snippet-library`,
     source: "plugins/snippet-library.ts",
-    helpers: [{ src: "lib/sqlite.ts", dest: "lib/sqlite.js" }],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js" },
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/redact.ts", dest: "lib/redact.js" },
+    ],
+    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
     description:
       "Save reusable code snippets and search them by language, tag or full text.",
     keywords: ["snippets", "library", "sqlite", "fts5"],
@@ -344,8 +379,8 @@ const PACKAGES = [
     dir: "strip-skills-catalog",
     name: `${SCOPE}/opencode-strip-skills-catalog`,
     source: "plugins/strip-skills-catalog.ts",
-    helpers: [],
-    rewrites: {},
+    helpers: [{ src: "opencode-sessions/helpers.ts", dest: "lib/helpers.js" }],
+    rewrites: { "../opencode-sessions/helpers.ts": "./lib/helpers.js" },
     description:
       "Strips the <available_skills> catalog from the system prompt to save tokens; the skill tool still works on demand.",
     keywords: ["context", "tokens", "skills", "prompt"],
@@ -565,8 +600,8 @@ for (const pkg of PACKAGES) {
     const mod = await import(entryUrl);
     const keys = Object.keys(mod);
     const ok =
-      keys.length === 1 &&
-      keys[0] === "default" &&
+      keys.includes("default") &&
+      keys.every((k) => k === "default" || k === "__test__") &&
       typeof mod.default?.id === "string" &&
       typeof mod.default?.setup === "function";
     if (!ok) {

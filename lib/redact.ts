@@ -13,7 +13,7 @@
  * H3) catches unlabelled high-entropy tokens.
  */
 
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
 export type Rule = {
@@ -257,15 +257,33 @@ export function buildAllowList(entries: ReadonlyArray<string>): AllowList {
 }
 
 /** Optional project allow file: `<cwd>/.secret-shield-allow`. */
+// SS-7: cached — the file is read+parsed once and only re-read when its
+// path or mtime changes, instead of on every invocation.
+let allowFileCache: { path: string; mtimeMs: number; entries: string[] } | null = null;
+
+function parseAllowFile(text: string): string[] {
+  return text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter((l) => l && !l.startsWith("#") && !l.startsWith("//"));
+}
+
 export function readAllowFile(): string[] {
   const path = join(process.cwd(), ".secret-shield-allow");
-  if (!existsSync(path)) return [];
   try {
-    return readFileSync(path, "utf8")
-      .split(/\r?\n/)
-      .map((l) => l.trim())
-      .filter((l) => l && !l.startsWith("#") && !l.startsWith("//"));
+    if (!existsSync(path)) {
+      allowFileCache = { path, mtimeMs: -1, entries: [] };
+      return [];
+    }
+    const mtimeMs = statSync(path).mtimeMs;
+    if (allowFileCache && allowFileCache.path === path && allowFileCache.mtimeMs === mtimeMs) {
+      return [...allowFileCache.entries];
+    }
+    const entries = parseAllowFile(readFileSync(path, "utf8"));
+    allowFileCache = { path, mtimeMs, entries };
+    return [...entries];
   } catch {
+    if (allowFileCache && allowFileCache.path === path) return [...allowFileCache.entries];
     return [];
   }
 }
@@ -306,6 +324,18 @@ export function isScanTruncated(text: string): boolean {
   return text.length > MAX_SCAN;
 }
 
+/**
+ * SS-5: byte ranges of `text` that collectFindings does NOT scan. Oversize
+ * input is covered by head/tail windows; the middle is skipped and reported
+ * here so callers can surface it (log/audit) instead of silently covering
+ * just the prefix. Empty for input within MAX_SCAN.
+ */
+export function scanGaps(text: string): Array<[number, number]> {
+  if (!isScanTruncated(text)) return [];
+  const half = Math.floor(MAX_SCAN / 2);
+  return [[half, text.length - half]];
+}
+
 export function collectFindings(
   text: string,
   location: string,
@@ -316,60 +346,74 @@ export function collectFindings(
   const taken: Array<[number, number]> = [];
   const overlaps = (s: number, e: number): boolean =>
     taken.some(([a, b]) => s < b && e > a);
-  // H5: never silently skip oversize input — scan the head so secrets near
-  // the start are still caught. Callers use isScanTruncated() to surface the
-  // truncation instead of dropping everything.
-  const haystack = isScanTruncated(text) ? text.slice(0, MAX_SCAN) : text;
+  // SS-5: oversize input is scanned in head/tail windows (absolute offsets
+  // are preserved so applyFindings still applies to the original text) and
+  // the skipped middle is exposed via scanGaps(). Callers use
+  // isScanTruncated()/scanGaps() to surface the truncation.
+  const half = Math.floor(MAX_SCAN / 2);
+  const windows: Array<{ text: string; base: number }> = isScanTruncated(text)
+    ? [
+        { text: text.slice(0, half), base: 0 },
+        { text: text.slice(text.length - half), base: text.length - half },
+      ]
+    : [{ text, base: 0 }];
 
-  const lower = haystack.toLowerCase();
+  const lower = text.toLowerCase();
   const hasKeyword = KEYWORDS.some((k) => lower.includes(k));
 
-  for (const rule of RULES) {
-    if (rule.keyword && !hasKeyword) continue;
-    rule.re.lastIndex = 0;
-    let m: RegExpExecArray | null;
-    while ((m = rule.re.exec(haystack)) !== null) {
-      if (m[0] === "") rule.re.lastIndex += 1;
-      const range = groupRange(m, rule.group);
-      if (!range) continue;
-      const [s, e] = range;
-      if (e <= s || overlaps(s, e)) continue;
-      findings.push({
-        rule: rule.id,
-        category: rule.category,
-        start: s,
-        end: e,
-        value: haystack.slice(s, e),
-      });
-      taken.push([s, e]);
+  for (const { text: haystack, base } of windows) {
+    const local: Finding[] = [];
+    for (const rule of RULES) {
+      if (rule.keyword && !hasKeyword) continue;
+      rule.re.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = rule.re.exec(haystack)) !== null) {
+        if (m[0] === "") rule.re.lastIndex += 1;
+        const range = groupRange(m, rule.group);
+        if (!range) continue;
+        const [s, e] = range;
+        if (e <= s || overlaps(s + base, e + base)) continue;
+        local.push({
+          rule: rule.id,
+          category: rule.category,
+          start: s + base,
+          end: e + base,
+          value: haystack.slice(s, e),
+        });
+        taken.push([s + base, e + base]);
+      }
+    }
+
+    if (opts.entropy) {
+      const gapRe = /[A-Za-z0-9+/=_\-]{24,}/g;
+      let g: RegExpExecArray | null;
+      while ((g = gapRe.exec(haystack)) !== null) {
+        const s = g.index;
+        const e = s + g[0].length;
+        if (overlaps(s + base, e + base)) continue;
+        const value = g[0];
+        const lv = value.toLowerCase();
+        if (STOPWORDS.some((w) => lv.includes(w))) continue;
+        if (shannonEntropy(value) < 3.3) continue;
+        // H3: skip shapes that are high-entropy by construction (hex digests,
+        // UUIDs, paths, URLs, digit runs) — flagging them corrupted ordinary
+        // content in redact mode.
+        if (looksLikeBenignShape(value)) continue;
+        local.push({ rule: "SS_ENTROPY", category: "entropy", start: s + base, end: e + base, value });
+        taken.push([s + base, e + base]);
+      }
+    }
+
+    const keep = inlineKeepFilter(haystack);
+    for (const f of local) {
+      // Inline markers are window-relative; absolutized offsets above.
+      if (keep({ ...f, start: f.start - base, end: f.end - base }) && !isAllowed(f, allow, location)) {
+        findings.push(f);
+      }
     }
   }
 
-  if (opts.entropy) {
-    const gapRe = /[A-Za-z0-9+/=_\-]{24,}/g;
-    let g: RegExpExecArray | null;
-    while ((g = gapRe.exec(haystack)) !== null) {
-      const s = g.index;
-      const e = s + g[0].length;
-      if (overlaps(s, e)) continue;
-      const value = g[0];
-      const lv = value.toLowerCase();
-      if (STOPWORDS.some((w) => lv.includes(w))) continue;
-      if (shannonEntropy(value) < 3.3) continue;
-      // H3: skip shapes that are high-entropy by construction (hex digests,
-      // UUIDs, paths, URLs, digit runs) — flagging them corrupted ordinary
-      // content in redact mode.
-      if (looksLikeBenignShape(value)) continue;
-      findings.push({ rule: "SS_ENTROPY", category: "entropy", start: s, end: e, value });
-      taken.push([s, e]);
-    }
-  }
-
-  const keep = inlineKeepFilter(haystack);
-  return findings
-    .filter((f) => !isAllowed(f, allow, location))
-    .filter(keep)
-    .sort((a, b) => a.start - b.start);
+  return findings.sort((a, b) => a.start - b.start);
 }
 
 /** Replace each finding (in reverse order) with a placeholder. */

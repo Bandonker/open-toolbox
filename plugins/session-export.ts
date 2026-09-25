@@ -2,7 +2,7 @@ import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
 import { existsSync, mkdirSync, statSync, writeFileSync } from "fs";
 import { homedir } from "os";
-import { dirname, extname, join } from "path";
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from "path";
 import { redactSecrets } from "../lib/redact.ts";
 
 /**
@@ -27,6 +27,7 @@ type ExportConfig = {
   includeToolCalls: boolean;
   includeToolResults: boolean;
   maxCharsPerPart: number;
+  maxMessages: number;
   redact: boolean;
   dir: string | undefined;
 };
@@ -40,6 +41,7 @@ type ExportArgs = {
   tools?: string[];
   roles?: string[];
   maxCharsPerPart?: number;
+  maxMessages?: number;
   redact?: boolean;
   dest?: string;
   inline?: boolean;
@@ -88,7 +90,7 @@ type LooseMessage = {
 };
 
 type OutPart = {
-  kind: "text" | "reasoning" | "tool";
+  kind: "text" | "reasoning" | "tool" | "note";
   text?: string;
   name?: string;
   status?: string;
@@ -131,6 +133,7 @@ type ExportMeta = {
   tokens?: TokenSummary;
   cost?: number;
   redacted: boolean;
+  truncated: boolean;
 };
 
 type LastExport = {
@@ -180,9 +183,10 @@ function resolveConfig(options: Record<string, unknown> | undefined): ExportConf
     enabled: asBool(pick("enabled", "OPENCODE_SESSION_EXPORT_ENABLED"), true),
     format: asFormat(pick("format", "OPENCODE_SESSION_EXPORT_FORMAT"), "markdown"),
     includeReasoning: asBool(pick("includeReasoning", "OPENCODE_SESSION_EXPORT_INCLUDE_REASONING"), false),
-    includeToolCalls: asBool(o.includeToolCalls, true),
+    includeToolCalls: asBool(pick("includeToolCalls", "OPENCODE_SESSION_EXPORT_INCLUDE_TOOL_CALLS"), true),
     includeToolResults: asBool(pick("includeToolResults", "OPENCODE_SESSION_EXPORT_INCLUDE_TOOL_RESULTS"), true),
     maxCharsPerPart: asInt(pick("maxCharsPerPart", "OPENCODE_SESSION_EXPORT_MAX_PART_CHARS"), 4000, 1),
+    maxMessages: asInt(pick("maxMessages", "OPENCODE_SESSION_EXPORT_MAX_MESSAGES"), 2000, 0),
     redact: asBool(pick("redact", "OPENCODE_SESSION_EXPORT_REDACT"), true),
     dir: (pick("dir", "OPENCODE_SESSION_EXPORT_DIR") as string | undefined) || undefined,
   };
@@ -335,6 +339,8 @@ function normalize(msg: LooseMessage, index: number, args: ExportArgs, cfg: Expo
         }
         parts.push(rendered);
         toolCalls += 1;
+      } else {
+        parts.push({ kind: "note", text: `[part type=${part.type ?? "unknown"} omitted]` });
       }
     }
     out.parts = parts;
@@ -351,6 +357,8 @@ function buildExport(
   cfg: ExportConfig,
   sessionID: string,
 ): { messages: OutMessage[]; meta: ExportMeta } {
+  const limit = args.maxMessages ?? cfg.maxMessages;
+  const windowed = limit > 0 && messages.length > limit ? messages.slice(-limit) : messages;
   const out: OutMessage[] = [];
   const countsByRole: Record<string, number> = {};
   let toolCalls = 0;
@@ -358,8 +366,9 @@ function buildExport(
   let cost: number | undefined;
   let model: string | undefined;
   let agent: string | undefined;
+  const truncated = windowed.length !== messages.length;
 
-  for (const msg of messages) {
+  for (const msg of windowed) {
     const { out: entry, toolCalls: calls } = normalize(msg, out.length + 1, args, cfg);
     if (!entry) continue;
     out.push(entry);
@@ -381,13 +390,14 @@ function buildExport(
   }
 
   const meta: ExportMeta = {
-    sessionID: sanitize(sessionID, cfg),
+    sessionID, // Raw on purpose: the session id is the export's primary key, not a secret.
     exportedAt: new Date().toISOString(),
     format: cfg.format,
     messageCount: out.length,
     countsByRole,
     toolCalls,
     redacted: cfg.redact,
+    truncated,
   };
   if (model) meta.model = model;
   if (agent) meta.agent = agent;
@@ -433,6 +443,8 @@ function renderMarkdown(meta: ExportMeta, messages: OutMessage[]): string {
         lines.push(part.text ?? "", "");
       } else if (part.kind === "reasoning") {
         lines.push("### reasoning", "", part.text ?? "", "");
+      } else if (part.kind === "note") {
+        lines.push(part.text ?? "", "");
       } else {
         lines.push(`### tool: ${part.name} (${part.status ?? "unknown"})`, "");
         if (part.input) lines.push("input:", "", part.input, "");
@@ -472,7 +484,7 @@ function renderText(meta: ExportMeta, messages: OutMessage[]): string {
 
 function render(meta: ExportMeta, messages: OutMessage[], format: ExportFormat): string {
   if (format === "json") return JSON.stringify({ meta, messages }, null, 2) + "\n";
-  if (format === "jsonl") return messages.map((m) => JSON.stringify(m)).join("\n") + "\n";
+  if (format === "jsonl") return messages.length ? messages.map((m) => JSON.stringify(m)).join("\n") + "\n" : "";
   if (format === "text") return renderText(meta, messages);
   return renderMarkdown(meta, messages);
 }
@@ -487,6 +499,9 @@ const EXT_BY_FORMAT: Record<ExportFormat, string> = {
 };
 
 const KNOWN_EXTS = new Set([".md", ".markdown", ".json", ".jsonl", ".txt", ".text"]);
+
+/** Cap for inline responses; longer exports spill to a file with a pointer. */
+const INLINE_MAX_CHARS = 100_000;
 
 function fileStamp(date: Date): string {
   return date.toISOString().replace(/[-:.]/g, "");
@@ -509,17 +524,37 @@ function uniquePath(path: string): string {
   return `${stem}-${Date.now()}${ext}`;
 }
 
-/** Resolve `dest` (file or directory) to a concrete, non-colliding file path. */
-function resolveDestPath(dest: string, format: ExportFormat, sessionID: string, date: Date): string {
+/**
+ * Resolve `dest` (file or directory) to a concrete, non-colliding file path.
+ * Confined to `rootDir` (the project): absolute or relative destinations that
+ * resolve outside the project are refused, so a crafted `dest` cannot write
+ * elsewhere on disk. Throws on escape.
+ */
+function resolveDestPath(dest: string, format: ExportFormat, sessionID: string, date: Date, rootDir: string): string {
   const looksDir = /[\\/]$/.test(dest);
   let asDir: boolean;
   if (looksDir) asDir = true;
-  else if (existsSync(dest)) asDir = statSync(dest).isDirectory();
-  else asDir = !KNOWN_EXTS.has(extname(dest).toLowerCase());
+  else {
+    let isDir = false;
+    try {
+      // exists + stat in one guarded attempt; the calls below re-check anyway,
+      // so a path that vanishes in between just falls through to file handling.
+      if (existsSync(dest)) isDir = statSync(dest).isDirectory();
+    } catch {
+      isDir = false;
+    }
+    asDir = existsSync(dest) ? isDir : !KNOWN_EXTS.has(extname(dest).toLowerCase());
+  }
   const target = asDir
     ? join(dest, `${fileStamp(date)}-${safeSessionID(sessionID)}.${EXT_BY_FORMAT[format]}`)
     : dest;
-  return uniquePath(target);
+  const resolved = resolve(target);
+  const root = resolve(rootDir);
+  const rel = relative(root, resolved);
+  if (rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel)) {
+    throw new Error(`Refusing to export outside the project directory (${root}): ${dest}`);
+  }
+  return uniquePath(resolved);
 }
 
 // --------------------------------------------------------------- plugin
@@ -541,6 +576,7 @@ export default Plugin.define({
       tools: args.tools,
       roles: args.roles,
       maxCharsPerPart: args.maxCharsPerPart ?? cfg.maxCharsPerPart,
+      maxMessages: args.maxMessages ?? cfg.maxMessages,
       redact: args.redact ?? cfg.redact,
       dest: args.dest,
       inline: args.inline,
@@ -562,8 +598,9 @@ export default Plugin.define({
           tools: z.array(z.string()).optional().describe("Only include tool calls with these names."),
           roles: z.array(z.string()).optional().describe("Only include messages of these types."),
           maxCharsPerPart: z.number().int().positive().optional().describe("Truncate each part to this many chars."),
+          maxMessages: z.number().int().min(0).optional().describe("Export at most this many trailing messages (0 = no limit)."),
           redact: z.boolean().optional().describe("Scrub secrets and home paths."),
-          dest: z.string().optional().describe("Output file or directory (default: <cwd>/.opencode-exports/)."),
+          dest: z.string().optional().describe("Output file or directory (default: <cwd>/.opencode-exports/). Confined to the project directory — paths outside it are refused."),
           inline: z.boolean().optional().describe("Return the rendered text instead of writing a file."),
         }),
         execute: async (input, toolCtx) => {
@@ -580,6 +617,7 @@ export default Plugin.define({
             includeToolCalls: args.includeToolCalls ?? cfg.includeToolCalls,
             includeToolResults: args.includeToolResults ?? cfg.includeToolResults,
             maxCharsPerPart: args.maxCharsPerPart ?? cfg.maxCharsPerPart,
+            maxMessages: args.maxMessages ?? cfg.maxMessages,
             redact: args.redact ?? cfg.redact,
           };
 
@@ -594,19 +632,58 @@ export default Plugin.define({
           meta.format = format;
           const rendered = render(meta, messages, format);
 
-          if (args.inline) return { content: rendered };
+          if (args.inline) {
+            if (rendered.length <= INLINE_MAX_CHARS) return { content: rendered };
+            // SE-2: inline responses are capped — spill the full text to a file and return a pointer.
+            let spill: string;
+            try {
+              spill = resolveDestPath(defaultDir, format, sessionID, new Date(), baseDir);
+            } catch (err) {
+              return {
+                content:
+                  rendered.slice(0, INLINE_MAX_CHARS) +
+                  `\n\n…[truncated at ${INLINE_MAX_CHARS} chars; full export could not be written: ${String(err)}]`,
+              };
+            }
+            try {
+              mkdirSync(dirname(spill), { recursive: true });
+              // Mode 0o600 is POSIX-only; on Windows use the directory ACLs instead (see below).
+              writeFileSync(spill, rendered, { encoding: "utf8", mode: 0o600 });
+              const bytes = statSync(spill).size;
+              lastExport = { path: spill, format, time: new Date().toISOString(), bytes, messages: messages.length };
+              return {
+                content:
+                  rendered.slice(0, INLINE_MAX_CHARS) +
+                  `\n\n…[truncated at ${INLINE_MAX_CHARS} chars; full ${bytes}-byte ${format} export written to ${spill}]`,
+              };
+            } catch (err) {
+              return {
+                content:
+                  rendered.slice(0, INLINE_MAX_CHARS) +
+                  `\n\n…[truncated at ${INLINE_MAX_CHARS} chars; full export could not be written: ${String(err)}]`,
+              };
+            }
+          }
 
           const dest = args.dest ?? defaultDir;
           const date = new Date();
-          const path = resolveDestPath(dest, format, sessionID, date);
+          let path: string;
+          try {
+            path = resolveDestPath(dest, format, sessionID, date, baseDir);
+          } catch (err) {
+            return { content: `session_export: ${String(err)}` };
+          }
+          let bytes = 0;
           try {
             mkdirSync(dirname(path), { recursive: true });
             // X2: transcripts are sensitive — owner-readable/writable only.
+            // Note: `mode` applies on POSIX only; on Windows file privacy comes from the
+            // parent directory ACLs, so keep the export dir out of shared locations.
             writeFileSync(path, rendered, { encoding: "utf8", mode: 0o600 });
+            bytes = statSync(path).size;
           } catch (err) {
             return { content: `session_export could not write ${path}: ${String(err)}` };
           }
-          const bytes = statSync(path).size;
           lastExport = { path, format, time: new Date().toISOString(), bytes, messages: messages.length };
           return {
             content:

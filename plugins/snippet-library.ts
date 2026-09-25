@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
-import { mkdirSync, existsSync, copyFileSync, rmSync } from "fs";
+import { mkdirSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import {
@@ -13,6 +13,11 @@ import {
   parseStringArray,
   quoteFtsQuery,
   dbUnavailable,
+  clampLimit,
+  copyBackupIntoPlace,
+  hasTriggers,
+  truncateStored,
+  STORE_CAPS,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
 import { redactSecrets } from "../lib/redact.ts";
@@ -22,9 +27,13 @@ const DB_PATH = join(DB_DIR, "snippet-library.db");
 const BACKUP_DIR = join(DB_DIR, "backups");
 const MAX_BACKUPS = 5;
 /** P5: redact obvious secrets before they hit the pack's own store (opt-out via env). */
-const STORE_REDACT = process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+// Lazy read (call time, not module load) so toggles take effect without a re-import.
+function storeRedactOn(): boolean {
+  return process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+}
+
 function scrubStore(text: string): string {
-  return STORE_REDACT ? redactSecrets(text) : text;
+  return storeRedactOn() ? redactSecrets(text) : text;
 }
 
 let db: AnyDatabase | null = null;
@@ -32,8 +41,10 @@ let lastBackupTime = 0;
 
 function getDb(): AnyDatabase {
   if (!db) {
-    if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
+    // DL-2: mkdir inside try so a creation failure routes to backup-restore
+    // instead of escaping as an unhandled throw.
     try {
+      if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
       db = openDatabase(DB_PATH);
       applyPragmas(db);
       initSchema(db);
@@ -67,10 +78,9 @@ function initSchema(database: AnyDatabase): void {
     )
   `);
 
-  // Ensure triggers exist (rebuild FTS if missing)
-  const hasTrigger = database.prepare(
-    "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='snippets_ai'"
-  ).get();
+  // Ensure triggers exist (rebuild FTS if missing).
+  // CR-9: verify all three triggers (ai/ad/au), not just the insert one.
+  const hasTrigger = hasTriggers(database, ["snippets_ai", "snippets_ad", "snippets_au"]);
   if (!hasTrigger) {
     database.exec("INSERT INTO snippets_fts(snippets_fts) VALUES('rebuild')");
   }
@@ -113,10 +123,9 @@ function tryRestore(): AnyDatabase | null {
     try { db.close(); } catch { /* ignore */ }
     db = null;
   }
-  for (const suffix of ["-wal", "-shm"]) {
-    try { rmSync(DB_PATH + suffix, { force: true }); } catch { /* ignore */ }
-  }
-  copyFileSync(latest, DB_PATH);
+  // CR-8: I/O wrapped with context (copyBackupIntoPlace); it also drops
+  // -wal/-shm/-journal so they cannot be replayed on the restored snapshot.
+  copyBackupIntoPlace(DB_PATH, latest);
   const restored = openDatabase(DB_PATH);
   applyPragmas(restored);
   initSchema(restored);
@@ -140,9 +149,15 @@ function withRetry<T>(fn: () => T, isWrite = false): T {
       db = null;
       db = tryRestore();
       if (db) {
-        const result = fn();
-        if (isWrite) { try { backup(); } catch {} }
-        return result;
+        // CR-3: the retried call can fail too — route it to dbUnavailable
+        // instead of throwing out of the tool.
+        try {
+          const result = fn();
+          if (isWrite) { try { backup(); } catch {} }
+          return result;
+        } catch (retryErr) {
+          return dbUnavailable(retryErr) as T;
+        }
       }
     }
     // CR-3: never throw storage failures out of tools — every caller uses
@@ -165,20 +180,26 @@ interface SnippetRow {
 function formatSnippet(row: SnippetRow, full: boolean = false): string {
   const tags = parseStringArray(row.tags);
   const parts: string[] = [];
+  // SN-4: sanitize the language info string so a stored value cannot break
+  // out of the fence (allow word chars plus common language-name symbols).
+  const lang = (row.language || "").replace(/[^\w+#\-.]/g, "").slice(0, 32);
+  // SN-4: escape stored triple backticks so code cannot break the fence.
+  const safeCode = row.code.replace(/```/g, "`\u200b``");
   let header = `**#${row.id}** ${row.title}`;
-  if (row.language) header += ` (${row.language})`;
+  if (lang) header += ` (${lang})`;
   parts.push(header);
   if (row.description) parts.push(`  ${row.description}`);
   if (full) {
     parts.push("");
-    parts.push("```" + row.language);
-    parts.push(row.code);
+    parts.push("```" + lang);
+    parts.push(safeCode);
     parts.push("```");
   } else {
-    const preview = row.code.split("\n").slice(0, 3).join("\n");
-    const truncated = row.code.split("\n").length > 3 ? "\n  ..." : "";
+    // SN-5: cap the preview (~600 chars) as well as 3 lines.
+    const preview = truncateStored(safeCode.split("\n").slice(0, 3).join("\n"), STORE_CAPS.snippetPreview);
+    const truncated = safeCode.split("\n").length > 3 || safeCode.length > STORE_CAPS.snippetPreview ? "\n  ..." : "";
     parts.push("");
-    parts.push("```" + row.language);
+    parts.push("```" + lang);
     parts.push(preview + truncated);
     parts.push("```");
   }
@@ -194,7 +215,7 @@ export default Plugin.define({
       editor.add({
         name: "snippet_save",
         description:
-          "Save a code snippet to the project snippet library. Persists across sessions.",
+          "Save a code snippet to the project snippet library. Persists across sessions. Snippet code is stored verbatim (unredacted); title/description are secret-scrubbed. Snippets are immutable by design (no update tool — save a corrected copy instead; use snippet_delete to remove the old one).",
         input: z.object({
           title: z.string().describe("Short descriptive title"),
           code: z.string().describe("The code snippet"),
@@ -209,14 +230,15 @@ export default Plugin.define({
           };
           const out = withRetry(() => {
             const database = getDb();
-            const tags = JSON.stringify(args.tags || []);
+            const tags = JSON.stringify(args.tags ?? []);
             const result = database.prepare(
               "INSERT INTO snippets (title, code, language, description, tags) VALUES (?, ?, ?, ?, ?)"
               // P5: title/description are free text; `code` is deliberately
               // left raw — redacting code artifacts would corrupt the very
               // snippets the user asked to store (secret-shield's redact/block
               // mode still covers them when enabled).
-            ).run(scrubStore(args.title), args.code, args.language || "", args.description ? scrubStore(args.description) : "", tags) as { lastInsertRowid: number | bigint };
+            // CR-4: cap unbounded inputs (title 300, code 100k, description 5k).
+            ).run(truncateStored(scrubStore(args.title), STORE_CAPS.snippetTitle), truncateStored(args.code, STORE_CAPS.snippetCode), args.language ?? "", args.description ? truncateStored(scrubStore(args.description), STORE_CAPS.snippetDescription) : "", tags) as { lastInsertRowid: number | bigint };
             return `Saved snippet #${result.lastInsertRowid}: "${args.title}"`;
           }, true);
           return { content: out };
@@ -239,7 +261,8 @@ export default Plugin.define({
           };
           const out = withRetry(() => {
             const database = getDb();
-            const limit = Math.min(Math.max(args.limit || 10, 1), 50);
+            // SN-6: trunc + finite guard via shared clampLimit.
+            const limit = clampLimit(args.limit ?? 10, 10, 50);
             const q = quoteFtsQuery(args.query);
             if (q === null) return "No snippets found matching query.";
             let sql = `SELECT s.* FROM snippets s JOIN snippets_fts f ON s.id = f.rowid WHERE snippets_fts MATCH ?`;
@@ -279,7 +302,8 @@ export default Plugin.define({
           const args = input as { language?: string; tags?: string[]; limit?: number };
           const out = withRetry(() => {
             const database = getDb();
-            const limit = Math.min(Math.max(args.limit || 20, 1), 100);
+            // SN-6: trunc + finite guard via shared clampLimit.
+            const limit = clampLimit(args.limit ?? 20, 20, 100);
 
             let sql = "SELECT * FROM snippets WHERE 1=1";
             const params: unknown[] = [];

@@ -86,7 +86,8 @@ type Config = {
   // tier 3 — compression
   compressEnabled: boolean;
   compressText: boolean;
-  compressMode: "range" | "message";
+  // NOTE: a `compressMode` ("range" | "message") option existed historically but
+  // both branches behaved as "range"; it was removed — range behavior is the only mode.
   compressMaxSourceChars: number;
   protectTags: boolean;
   protectUserMessages: boolean;
@@ -94,6 +95,8 @@ type Config = {
   autoSummarize: boolean;
   autoSummarizeMaxCalls: number;
   autoSummarizeMinTokens: number;
+  /** Per-request cap on auto-summarised units (top tokens first); 0 = unlimited. */
+  maxAutoSummaries: number;
   /** Stub prose without a model call when past `autoSummarizeRatio` of budget. */
   autoSummarizeStub: boolean;
   autoSummarizeRatio: number;
@@ -148,6 +151,10 @@ type Config = {
   // reporting
   notify: NotifyLevel;
   notifyType: NotifyType;
+  /** Minimum turn savings that trigger an inline prune receipt (0 = every prune). */
+  notifyMinTokens: number;
+  /** Also send a receipt when a summary is applied, even below the token floor. */
+  notifyOnTopic: boolean;
   log: boolean;
   debug: boolean;
   configPath: string | undefined;
@@ -241,6 +248,12 @@ type SessionState = {
   collapseSpans: number;
   collapseMessages: number;
   collapseSavedTokens: number;
+  /**
+   * Receipt fragments banked by async/out-of-turn completions (auto-summarise,
+   * compress tool, checkpoint). Flushed as part of the next turn's single
+   * digest so one request never emits more than one receipt line.
+   */
+  pendingNotes: string[];
 };
 
 type ModelInfo = {
@@ -477,7 +490,9 @@ function compilePatterns(list: string[]): RegExp[] {
   const out: RegExp[] = [];
   for (const pattern of list) {
     try {
-      out.push(new RegExp(pattern));
+      const re = new RegExp(pattern);
+      const flags = re.flags.replace(/[gy]/g, "");
+      out.push(flags !== re.flags ? new RegExp(re.source, flags) : re);
     } catch {
       /* ignore malformed patterns */
     }
@@ -531,7 +546,7 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
   );
 
   const charsPerToken = num(pick("charsPerToken", "OPENCODE_CONTEXT_PRUNER_CHARS_PER_TOKEN"), 3.6);
-  const keepHeadChars = asInt(pick("keepHeadChars", "OPENCODE_CONTEXT_PRUNER_KEEP_HEAD"), 400, 0, 100000);
+  const keepHeadChars = asInt(pick("keepHeadChars", "OPENCODE_CONTEXT_PRUNER_KEEP_HEAD"), 200, 0, 100000);
   const keepRecent = asInt(pick("keepRecent", "OPENCODE_CONTEXT_PRUNER_KEEP_RECENT"), 6, 0, 10000);
   // Prose (assistant/user text) is only eligible when compressText is on; the
   // most recent N prose parts stay untouched so the live reasoning is kept.
@@ -549,6 +564,8 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
 
   const notifyTypeRaw = String(firstDefined(pick("notifyType", "OPENCODE_CONTEXT_PRUNER_NOTIFY_TYPE"), "toast")).toLowerCase();
   const notifyType: NotifyType = notifyTypeRaw === "chat" ? "chat" : "toast";
+  const notifyMinTokens = asInt(pick("notifyMinTokens", "OPENCODE_CONTEXT_PRUNER_NOTIFY_MIN_TOKENS"), 500, 0, 10_000_000);
+  const notifyOnTopic = asBool(pick("notifyOnTopic", "OPENCODE_CONTEXT_PRUNER_NOTIFY_ON_TOPIC"), true);
 
   const manualRaw = getPath(file, "manualMode");
   const manualMode: ManualMode = {
@@ -572,7 +589,6 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
   const dedupeFile = firstDefined(getPath(strategies, "deduplication"), getPath(file, "deduplication"));
   const purgeFile = firstDefined(getPath(strategies, "purgeErrors"), getPath(file, "purgeErrors"));
 
-  const modeRaw = String(firstDefined(compressValue("mode", "", "compressMode"), "range")).toLowerCase();
   const nudgeForceRaw = String(firstDefined(compressValue("nudgeForce", "", "nudgeForce"), "soft")).toLowerCase();
 
   return {
@@ -600,17 +616,17 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
     superseded: asBool(pick("superseded", "OPENCODE_CONTEXT_PRUNER_SUPERSEDED"), true),
     compressEnabled: asBool(compressValue("enabled", "OPENCODE_CONTEXT_PRUNER_COMPRESS", "compressEnabled"), true),
     compressText: asBool(compressValue("text", "OPENCODE_CONTEXT_PRUNER_COMPRESS_TEXT", "compressText"), true),
-    // C15: `message` mode was never implemented (dead config) — every
-    // accepted value now maps to `range`, while configs that still set
-    // "message" keep parsing without error.
-    compressMode: modeRaw === "message" ? "range" : "range",
+    // CP-6: the `compress.mode` option was dead config (every accepted value
+    // mapped to "range"); it is no longer read — range behavior always applies,
+    // and legacy configs that still set "mode" keep parsing without error.
     compressMaxSourceChars: asInt(compressValue("maxSourceChars", "OPENCODE_CONTEXT_PRUNER_COMPRESS_MAX_CHARS", "compressMaxSourceChars"), 24000, 500, 10_000_000),
     protectTags: asBool(compressValue("protectTags", "OPENCODE_CONTEXT_PRUNER_PROTECT_TAGS", "protectTags"), true),
     protectUserMessages: asBool(compressValue("protectUserMessages", "OPENCODE_CONTEXT_PRUNER_PROTECT_USER", "protectUserMessages"), false),
     summaryBuffer: asBool(compressValue("summaryBuffer", "OPENCODE_CONTEXT_PRUNER_SUMMARY_BUFFER", "summaryBuffer"), true),
     autoSummarize: asBool(compressValue("autoSummarize", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS", "autoSummarize"), true),
-    autoSummarizeMaxCalls: asInt(compressValue("autoSummarizeMaxCalls", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX", "autoSummarizeMaxCalls"), 0, 0, 1000),
+    autoSummarizeMaxCalls: asInt(compressValue("autoSummarizeMaxCalls", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX", "autoSummarizeMaxCalls"), 5, 0, 1000),
     autoSummarizeMinTokens: asInt(compressValue("autoSummarizeMinTokens", "OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MIN", "autoSummarizeMinTokens"), 4000, 0, 10_000_000),
+    maxAutoSummaries: asInt(compressValue("maxAutoSummaries", "OPENCODE_CONTEXT_PRUNER_MAX_AUTO_SUMMARIES", "maxAutoSummaries"), 12, 0, 1000),
     // DCP has no cap on compression. The cap stays for the conservative
     // profile, but any profile can set it to 0 (unlimited); the model-call
     // budget is what actually gates the decision, and past
@@ -621,7 +637,7 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
     steadyTargetRatio: Math.min(Math.max(num(pick("steadyTargetRatio", "OPENCODE_CONTEXT_PRUNER_STEADY_RATIO"), 0.06), 0), 1),
     steadyTargetMinTokens: asInt(pick("steadyTargetMinTokens", "OPENCODE_CONTEXT_PRUNER_STEADY_MIN"), 1500, 0, 10_000_000),
     collapseRanges: asBool(pick("collapseRanges", "OPENCODE_CONTEXT_PRUNER_COLLAPSE"), true),
-    collapseStubs: asBool(pick("collapseStubs", "OPENCODE_CONTEXT_PRUNER_COLLAPSE_STUBS"), false),
+    collapseStubs: asBool(pick("collapseStubs", "OPENCODE_CONTEXT_PRUNER_COLLAPSE_STUBS"), true),
     cacheAware: asBool(pick("cacheAware", "OPENCODE_CONTEXT_PRUNER_CACHE_AWARE"), true),
     cacheAmortize: asInt(pick("cacheAmortize", "OPENCODE_CONTEXT_PRUNER_CACHE_AMORTIZE"), 4, 1, 100),
     compactionCheckpoint: asBool(pick("compactionCheckpoint", "OPENCODE_CONTEXT_PRUNER_COMPACTION"), true),
@@ -647,6 +663,8 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
     turnProtection,
     notify,
     notifyType,
+    notifyMinTokens,
+    notifyOnTopic,
     log: asBool(pick("log", "OPENCODE_CONTEXT_PRUNER_LOG"), false),
     debug: asBool(pick("debug", "OPENCODE_CONTEXT_PRUNER_DEBUG"), false),
     configPath: path,
@@ -654,7 +672,10 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
 }
 
 function valueToText(value: unknown): string {
-  if (typeof value === "string") return value;
+  if (typeof value === "string") {
+    if (value.length > 2000 && value.length % 4 === 0 && /^[A-Za-z0-9+/=]+$/.test(value.slice(0, 2000)) && /[A-Z]/.test(value) && /[a-z]/.test(value) && /[0-9]/.test(value)) return `${value.slice(0, 2000)}\n[truncated]`;
+    return value.length > 50000 ? `${value.slice(0, 50000)}\n[truncated]` : value;
+  }
   if (value === undefined || value === null) return "";
   if (Array.isArray(value)) {
     // Live tool-result values are arrays of content parts
@@ -673,7 +694,9 @@ function valueToText(value: unknown): string {
     // size estimate still reflects the payload instead of reading empty.
   }
   try {
-    return JSON.stringify(value);
+    // CP-9: file-only payloads can be huge — cap the serialized form.
+    const json = JSON.stringify(value) ?? "";
+    return json.length > 2000 ? `${json.slice(0, 2000)}\n[truncated]` : json;
   } catch {
     return String(value);
   }
@@ -822,6 +845,39 @@ function countToolCalls(messages: MessageLike[]): number {
   return n;
 }
 
+function partHasReasoning(part: unknown): boolean {
+  if (!isPlainObject(part)) return false;
+  const p = part as AnyRecord;
+  const type = String(p.type ?? "").toLowerCase();
+  if (type === "reasoning" || type === "thinking") return true;
+  if (typeof p.reasoning === "string" && p.reasoning.length > 0) return true;
+  if (typeof p.thinking === "string" && p.thinking.length > 0) return true;
+  return false;
+}
+
+function messageHasReasoning(message: unknown): boolean {
+  if (!isPlainObject(message)) return false;
+  const m = message as AnyRecord;
+  if (typeof m.reasoning === "string" && m.reasoning.length > 0) return true;
+  if (typeof m.thinking === "string" && m.thinking.length > 0) return true;
+  const content = Array.isArray(m.content) ? m.content : Array.isArray(m.parts) ? m.parts : [];
+  for (const part of content) if (partHasReasoning(part)) return true;
+  return false;
+}
+
+/**
+ * Reasoning turns are provider-sensitive. Injecting a synthetic turn into a
+ * session whose transcript already carries assistant reasoning makes strict
+ * providers (reasoning_content round-trip / "thinking is enabled but
+ * reasoning_content is missing") reject the next request and kills the
+ * session. Detect the real part shape (`type: "reasoning"`) as well as the
+ * legacy top-level `reasoning`/`thinking` fields and `parts` arrays.
+ */
+function hasReasoningContent(messages: MessageLike[]): boolean {
+  for (const message of messages) if (messageHasReasoning(message)) return true;
+  return false;
+}
+
 /** C16: prose compresses far better than tool output — lower floor for it. */
 function minCharsFor(r: CollectedResult, cfg: Config): number {
   return r.kind === "text" ? Math.max(200, Math.floor(cfg.minChars / 4)) : cfg.minChars;
@@ -934,18 +990,28 @@ function deriveTitle(messages: MessageLike[]): string | undefined {
   return undefined;
 }
 
+// CP-11: shared RegExp instances are stateful when global/sticky — a `g`/`y`
+// flag left over from a future caller or hand-built config would make
+// `test()` alternate true/false via `lastIndex`. Reset around every test.
+function statelessTest(re: RegExp, text: string): boolean {
+  re.lastIndex = 0;
+  const hit = re.test(text);
+  re.lastIndex = 0;
+  return hit;
+}
+
 function blockedByFilePattern(result: CollectedResult, cfg: Config): boolean {
   if (cfg.protectedFilePatterns.length === 0) return false;
   const path = filePathOf(result);
   if (!path) return false;
-  return cfg.protectedFilePatterns.some((re) => re.test(path));
+  return cfg.protectedFilePatterns.some((re) => statelessTest(re, path));
 }
 
 function isProtected(result: CollectedResult, cfg: Config): boolean {
   return (
     cfg.ignoreTools.has(result.name) ||
     cfg.protectedTools.has(result.name) ||
-    cfg.protectedPatterns.some((re) => re.test(result.name)) ||
+    cfg.protectedPatterns.some((re) => statelessTest(re, result.name)) ||
     blockedByFilePattern(result, cfg)
   );
 }
@@ -1073,7 +1139,15 @@ function makeStub(
     savedChars: Math.max(0, r.text.length - stub.length),
     savedTokens: Math.max(0, r.tokens - estimateTokens(stub, cfg, ratio)),
   };
-  if (stubMemo.size >= STUB_MEMO_MAX) stubMemo.clear();
+  // CP-10: FIFO-evict the oldest entries instead of dropping the whole
+  // cache — a full clear throws away hot stubs next to cold ones.
+  if (stubMemo.size >= STUB_MEMO_MAX) {
+    let evicted = 0;
+    for (const oldest of stubMemo.keys()) {
+      stubMemo.delete(oldest);
+      if (++evicted >= 512) break;
+    }
+  }
   stubMemo.set(memoKey, out);
   return out;
 }
@@ -1112,7 +1186,10 @@ function writeUnit(r: CollectedResult, value: string): void {
     r.part.text = value;
     return;
   }
-  r.part.result = typedResult(r, value);
+  // CP-7: preserve extra host fields — replacing the whole object drops
+  // metadata the host attached to `result`.
+  const prev = isPlainObject(r.part.result) ? (r.part.result as AnyRecord) : {};
+  r.part.result = { ...prev, ...typedResult(r, value) };
 }
 
 function sumSaved(decisions: Map<string, Decision>): number {
@@ -1190,7 +1267,10 @@ function resolveModel(ctx: LooseCtx, ref: AnyRecord | undefined): ModelInfo | un
 function budgetFor(model: ModelInfo | undefined, cfg: Config): { window: number; budget: number; target: number } | null {
   const window = num(model?.limit?.context);
   if (!window || window <= 0) return null;
-  const reserve = Math.min(num(model?.limit?.output, cfg.maxOutputReserve) || cfg.maxOutputReserve, cfg.maxOutputReserve);
+  // CP-5: real hard cap — reserve is the model's output limit clamped to
+  // maxOutputReserve, falling back to maxOutputReserve when unknown.
+  const outputLimit = num(model?.limit?.output);
+  const reserve = outputLimit > 0 ? Math.min(outputLimit, cfg.maxOutputReserve) : cfg.maxOutputReserve;
   const budget = Math.max(0, Math.floor(window * cfg.budgetRatio) - reserve);
   const target = Math.max(0, Math.floor(budget * cfg.targetRatio));
   return { window, budget, target };
@@ -1217,6 +1297,25 @@ function overrideLimit(map: AnyRecord, model: ModelInfo | undefined, ref: AnyRec
 
 const sessions = new Map<string, SessionState>();
 const calibration = new Map<string, number>();
+// CP-4: model-key hint per session — must be evicted with its session (see stateFor).
+const sessionModelKey = new Map<string, string>();
+
+/**
+ * CP-1: best-effort storage write — a throwing or rejecting store must never
+ * surface (sync throw is swallowed, async rejection gets a no-op catch so
+ * Node never reports an unhandled rejection).
+ */
+function guardedSet(store: unknown, key: string, value: unknown): void {
+  try {
+    Promise.resolve(
+      (store as { set?: (k: string, v: unknown) => unknown } | undefined)?.set?.(key, value),
+    ).catch(() => {
+      /* ignore */
+    });
+  } catch {
+    /* ignore */
+  }
+}
 /**
  * Adaptive cache economics. Rewriting a cached prefix pays the provider's
  * cache-write premium once; pruning saves cache-read tokens on every later
@@ -1279,6 +1378,9 @@ function stateFor(sessionID: string): SessionState {
       const evicted = sessions.get(stalestKey);
       if (evicted) flushEpoch(stalestKey, evicted);
       sessions.delete(stalestKey);
+      // CP-4: the model-key hint must die with its session or the map
+      // grows without bound across sessions.
+      sessionModelKey.delete(stalestKey);
     }
   }
   st = {
@@ -1329,6 +1431,7 @@ function stateFor(sessionID: string): SessionState {
       collapseSpans: 0,
       collapseMessages: 0,
       collapseSavedTokens: 0,
+      pendingNotes: [],
     };
     sessions.set(sessionID, st);
     // C18: epoch/decisions reload lazily (fire-and-forget, like summaries) —
@@ -1408,16 +1511,36 @@ export const __test__ = {
   hasSession: (sessionID: string): boolean => sessions.has(sessionID),
   resetSessions: (): void => {
     sessions.clear();
+    sessionModelKey.clear();
   },
   setEpochStore: (store: typeof epochStore): void => {
     epochStore = store;
   },
   sanitizeLabel,
   summaryCacheKey,
+  // CP-1..CP-11 verification seams.
+  resolveConfig,
+  guardedSet,
+  valueToText,
+  statelessTest,
+  compilePatterns,
+  isProtected,
+  writeUnit,
+  budgetFor,
+  makeStub,
+  stubMemoSize: (): number => stubMemo.size,
+  clearStubMemo: (): void => {
+    stubMemo.clear();
+  },
+  setModelKey: (sid: string, key: string): void => {
+    sessionModelKey.set(sid, key);
+  },
+  hasModelKey: (sid: string): boolean => sessionModelKey.has(sid),
+  latestTopic,
+  topicLedger,
 };
 
 /** Calibration is keyed per model string when the context hook has seen one. */
-const sessionModelKey = new Map<string, string>();
 
 function modelKeyHint(sessionID: string): string {
   return sessionModelKey.get(sessionID) ?? "";
@@ -1918,6 +2041,41 @@ function sanitizeLabel(raw: unknown): string {
   return s;
 }
 
+/**
+ * Per-turn auto-prune tally. The context hook hands one to
+ * maybeAutoSummarize so the synchronous auto-stub work accumulates into the
+ * turn's single digest instead of notifying on its own.
+ */
+type TurnTally = { stubbed: number; stubSaved: number };
+
+/** Cap for banked receipt fragments (each is one short clause). */
+const MAX_PENDING_NOTES = 4;
+
+/**
+ * Bank a receipt fragment for the next turn's single digest. Out-of-turn
+ * completions (async auto-summarise, compress tool, checkpoint) report here
+ * so they never emit a second receipt line for a request.
+ */
+function bankNote(st: SessionState, note: string): void {
+  const text = note.replace(/\s+/g, " ").trim();
+  if (!text) return;
+  st.pendingNotes.push(text.length > 200 ? `${text.slice(0, 200).trimEnd()}…` : text);
+  while (st.pendingNotes.length > MAX_PENDING_NOTES) st.pendingNotes.shift();
+}
+
+/** Most recently created summary topic ("": none). Receipts reuse it. */
+function latestTopic(st: SessionState): string {
+  let topic = "";
+  let at = -Infinity;
+  for (const rec of st.summaries.values()) {
+    if (rec.topic && rec.at >= at) {
+      at = rec.at;
+      topic = rec.topic;
+    }
+  }
+  return topic;
+}
+
 function summaryCacheKey(topic: string, source: string): string {
   return `summary:${hash32(`${VERSION}\0${sanitizeLabel(topic)}\0${source}`)}`;
 }
@@ -1987,6 +2145,27 @@ function effectiveInputPrice(st: SessionState): number {
   return st.inputCost;
 }
 
+/** Per-topic savings ledger: display-only rollup of the tracked summary records. */
+function topicLedger(st: SessionState, cfg: Config): Array<{ topic: string; summaries: number; units: number; saved: number }> {
+  if (st.summaries.size === 0) return [];
+  const byKey = new Map(st.compressible.map((r) => [r.key, r]));
+  const groups = new Map<string, { topic: string; summaries: number; units: number; saved: number }>();
+  for (const record of st.summaries.values()) {
+    const topic = record.topic || "(general)";
+    let group = groups.get(topic);
+    if (!group) {
+      group = { topic, summaries: 0, units: 0, saved: 0 };
+      groups.set(topic, group);
+    }
+    group.summaries++;
+    group.units += record.covers.length;
+    const present = record.covers.map((key) => byKey.get(key)).filter((r) => r !== undefined);
+    const original = present.reduce((sum, r) => sum + r.tokens, 0);
+    group.saved += Math.max(0, original - estimateTokens(record.text, cfg, st.ratio));
+  }
+  return [...groups.values()].sort((a, b) => b.saved - a.saved);
+}
+
 function renderReport(sessionID: string | undefined, cfg: Config): string {
   const st = sessionID ? sessions.get(sessionID) : undefined;
   const lines: string[] = ["context-pruner — context compiler", ""];
@@ -2028,6 +2207,13 @@ function renderReport(sessionID: string | undefined, cfg: Config): string {
   lines.push(
     `active summaries: ${st.summaries.size} (covering ${coveredKeys(st).size} units, ~${st.summarySavedTokens} tokens saved${proseSummaries ? `, ${proseSummaries} prose` : ""})`,
   );
+  const ledger = topicLedger(st, cfg);
+  if (ledger.length > 0) {
+    lines.push("savings by topic:");
+    for (const row of ledger) {
+      lines.push(`  · ${row.topic} — ${row.summaries} summaries, ${row.units} units, ~${row.saved} tokens saved`);
+    }
+  }
   lines.push(`nudges sent: ${st.nudges}  tool calls since last summary: ${st.iterationsSinceCompress}`);
   lines.push(
     `span collapse: ${cfg.collapseRanges ? "on" : "off"}${cfg.collapseStubs ? "+stubs" : ""}  last request: ${st.collapseSpans} span(s), ${st.collapseMessages} message(s), ~${st.collapseSavedTokens} tokens`,
@@ -2077,6 +2263,11 @@ export default Plugin.define({
   async setup(ctx) {
     const c = ctx as unknown as LooseCtx;
     let cfg = resolveConfig(c.location?.directory, c.options);
+    if (!cfg.enabled) {
+      // Keep the plugin file loadable for easy re-enabling, but do not register
+      // any hooks, tools, or background work while explicitly disabled.
+      return async () => {};
+    }
     refreshModels(c);
     const disposers: Array<() => void | Promise<void>> = [];
     const track = (registration: unknown): void => {
@@ -2141,20 +2332,28 @@ export default Plugin.define({
         return undefined;
       }
     };
+    // CP-1: storage writes are best-effort — a rejecting store must never
+    // surface as an unhandled rejection.
     const writeStore = (key: string, value: unknown): void => {
-      try {
-        void c.storage?.set?.(key, value);
-      } catch {
-        /* ignore */
-      }
+      guardedSet(c.storage, key, value);
     };
+    // CP-2: per-session persist chain — serializes recall read-modify-write
+    // so overlapping flushes cannot clobber each other.
+    const persistChains = new Map<string, Promise<void>>();
+    // CP-8: memoize the per-request JSON.stringify(event.tools).
+    let lastToolsRef: unknown;
+    let lastToolsJson = "{}";
 
     const notify = (sessionID: string, summaryLine: string, detail: string): void => {
       if (cfg.notify === "off") return;
-      const text = cfg.notify === "minimal" ? summaryLine : detail;
+      // Minimal stays a single line; detailed is that line plus the detail.
+      const text = cfg.notify === "minimal" ? summaryLine : `${summaryLine}\n${detail}`;
       if (cfg.notifyType === "chat") {
         try {
-          void c.session?.synthetic?.({ sessionID, text: `[context-pruner] ${text}`, description: "context-pruner", delivery: "queue" });
+          // CP-1: guarded so a rejecting session sink cannot escape.
+          Promise.resolve(c.session?.synthetic?.({ sessionID, text: `[context-pruner] ${text}`, description: "context-pruner", delivery: "queue" })).catch(() => {
+            /* ignore */
+          });
         } catch {
           /* ignore */
         }
@@ -2238,21 +2437,40 @@ export default Plugin.define({
     /** Flush newly pruned outputs, merging anything already persisted first. */
     const persistRecall = (sessionID: string, st: SessionState): void => {
       if (!st.recallDirty) return;
-      void loadRecall(sessionID, st).then(() => {
-        writeStore(`recall:${sessionID}`, [...st.recall.entries()].map(([id, entry]) => ({ id, ...entry })));
-        st.recallDirty = false;
-      });
+      // CP-2: chain onto the session's pending persist so an in-flight
+      // read-modify-write finishes before the next one starts.
+      const tail = persistChains.get(sessionID) ?? Promise.resolve();
+      const head = tail
+        .then(() => loadRecall(sessionID, st))
+        .then(() => {
+          writeStore(`recall:${sessionID}`, [...st.recall.entries()].map(([id, entry]) => ({ id, ...entry })));
+          st.recallDirty = false;
+        })
+        .catch(() => {
+          /* CP-1: ignore */
+        });
+      persistChains.set(sessionID, head);
+      if (persistChains.size > 20) {
+        const first = persistChains.keys().next().value as string | undefined;
+        if (first !== undefined && first !== sessionID) persistChains.delete(first);
+      }
+      void head.then(() => {
+        if (persistChains.get(sessionID) === head) persistChains.delete(sessionID);
+      }).catch(() => {});
     };
 
     /**
      * Guaranteed token relief: when the projected request exceeds the target,
      * summarise the largest compressible results immediately instead of waiting
      * for the model to act on a nudge. Runs at most `autoSummarizeMaxCalls`
-     * times per session, and the summary is applied on the next request.
+     * model calls per session (cache hits are free), covers at most
+     * `maxAutoSummaries` units per request (largest first; 0 = unlimited),
+     * and the summary is applied on the next request.
+     * Default budget is 5 calls; 0 opts out into unlimited.
      */
-    async function maybeAutoSummarize(sessionID: string, st: SessionState, estimate: number): Promise<void> {
+    async function maybeAutoSummarize(sessionID: string, st: SessionState, estimate: number, turn?: TurnTally): Promise<void> {
       if (!cfg.autoSummarize || !cfg.compressEnabled || st.autoSummarizing) return;
-      // 0 = unlimited, matching uncapped model-driven compression.
+      // 0 = opt-out unlimited; default 5 bounds `session.generate` spend on stuck sessions.
       if (cfg.autoSummarizeMaxCalls > 0 && st.autoSummarizeCalls >= cfg.autoSummarizeMaxCalls) return;
       if (st.target === null || estimate <= st.target) return;
       const session = c.session;
@@ -2276,11 +2494,14 @@ export default Plugin.define({
       const shortfall = estimate - st.target;
       const chosen: CollectedResult[] = [];
       let sum = 0;
+      // Per-request cap: the pool is sorted by tokens desc, so this keeps the
+      // top-N biggest wins. 0 = unlimited (no count cap).
+      const cap = cfg.maxAutoSummaries > 0 ? cfg.maxAutoSummaries : pool.length;
       for (const r of pool) {
         if (chosen.length > 0 && sum >= shortfall) break;
         chosen.push(r);
         sum += r.tokens;
-        if (chosen.length >= 12) break;
+        if (chosen.length >= cap) break;
       }
 
       // Present the summary at the earliest covered unit so the model reads it
@@ -2311,11 +2532,14 @@ export default Plugin.define({
             totals.stubSavedTokens += savedStubs;
             st.savedTokensTotal += savedStubs;
             st.iterationsSinceCompress = 0;
-            notify(
-              sessionID,
-              `stubbed ${appliedStubs.count} result(s), ~${savedStubs} tokens saved`,
-              `auto-stub: ${appliedStubs.count} result(s) below the summary floor (saved ~${savedStubs})`,
-            );
+            // Folded into the turn's single digest (or banked when there is
+            // no turn to attach to) — never a receipt of its own.
+            if (turn) {
+              turn.stubbed += appliedStubs.count;
+              turn.stubSaved += savedStubs;
+            } else {
+              bankNote(st, `stubbed ${appliedStubs.count} result(s), ~${savedStubs} tokens saved`);
+            }
             debug(`auto-stub applied for ${sessionID}: ${appliedStubs.count} results, ~${savedStubs} tokens`);
           }
         }
@@ -2325,7 +2549,6 @@ export default Plugin.define({
       if (typeof session?.generate !== "function") return;
 
       st.autoSummarizing = true;
-      st.autoSummarizeCalls++;
       try {
         const raw = chosen.map((r) => `### ${r.name}\n${r.text}`).join("\n\n");
         let blocks: string[] = [];
@@ -2342,6 +2565,10 @@ export default Plugin.define({
         const cached = await readStore(cacheKey);
         if (isPlainObject(cached) && typeof cached.text === "string" && cached.text) body = cached.text;
         if (!body) {
+          // Cache misses spend the session model-call budget; cache hits are
+          // free so repeat requests covering the same units don't re-spend.
+          st.autoSummarizeCalls++;
+          if (cfg.autoSummarizeMaxCalls > 0 && st.autoSummarizeCalls > cfg.autoSummarizeMaxCalls) return;
           const prompt = summaryPrompt(source, "what future work needs", "context budget", blocks);
           try {
             const response = await session.generate({ sessionID, prompt });
@@ -2373,11 +2600,9 @@ export default Plugin.define({
         totals.summaries++;
         totals.summarySavedTokens += saved;
         st.iterationsSinceCompress = 0;
-        notify(
-          sessionID,
-          `auto-summarised ${chosen.length} result(s), ~${saved} tokens saved`,
-          `auto-compress: ${chosen.length} result(s) -> ${tokens} tokens (saved ~${saved})`,
-        );
+        // Banked for the next turn's single digest: this completion lands
+        // after the triggering turn already flushed its receipt.
+        bankNote(st, `auto-summarised ${chosen.length} result(s), ~${saved} tokens saved`);
         debug(`auto-summarise applied for ${sessionID}: ${chosen.length} results, ~${saved} tokens`);
       } catch (err) {
         debug(`auto-summarise failed: ${String(err)}`);
@@ -2388,8 +2613,9 @@ export default Plugin.define({
 
     // ---------------------------------------------------------------- context
     if (typeof c.session?.hook === "function") {
-      track(
-        await c.session.hook("context", (event) => {
+      try {
+          track(
+            await c.session.hook("context", (event) => {
           try {
             if (!cfg.enabled) return;
             const sessionID = String((event as AnyRecord).sessionID ?? "unknown");
@@ -2410,16 +2636,19 @@ export default Plugin.define({
                     calibration.set(mKey, r);
                     st.ratio = r;
                   }
+                }).catch(() => {
+                  /* CP-1: ignore */
                 });
               } catch {
                 /* ignore */
               }
             }
             if (mKey) sessionModelKey.set(sessionID, mKey);
-            if (!st.loadedSummaries) void loadSummaries(sessionID, st);
+            if (!st.loadedSummaries) void loadSummaries(sessionID, st).catch(() => {});
 
             const ratio = st.ratio;
-            const messages = ((event as AnyRecord).messages ?? []) as MessageLike[];
+            const rawMessages = (event as AnyRecord).messages;
+            const messages = (Array.isArray(rawMessages) ? rawMessages : []) as MessageLike[];
             const results = collectResults(messages, cfg, ratio);
             st.compressible = results;
             const protectTurns = Math.max(cfg.keepRecentTurns, cfg.turnProtection.enabled ? cfg.turnProtection.turns : 0);
@@ -2463,9 +2692,21 @@ export default Plugin.define({
             if (steady !== null) effectiveTarget = effectiveTarget === null ? steady : Math.min(effectiveTarget, steady);
             if (effectiveTarget !== null) st.target = effectiveTarget;
 
+            // CP-8: `event.tools` rarely changes between requests — reuse the
+            // last serialization when the reference is identical.
+            const eventTools = (event as AnyRecord).tools;
+            if (eventTools !== lastToolsRef) {
+              try {
+                const raw = JSON.stringify(eventTools ?? {});
+                lastToolsJson = raw.length > 50000 ? raw.slice(0, 50000) : raw;
+              } catch {
+                lastToolsJson = "{}";
+              }
+              lastToolsRef = eventTools;
+            }
             const overhead =
               estimateTokens(systemTextOf(event as AnyRecord), cfg, ratio) +
-              estimateTokens(JSON.stringify((event as AnyRecord).tools ?? {}), cfg, ratio) +
+              estimateTokens(lastToolsJson, cfg, ratio) +
               messages.length * 4;
 
             const candidates = candidateResults(results, messages, cfg, covered, cfg.minChars, undefined, st.turnProtectedFrom);
@@ -2539,7 +2780,11 @@ export default Plugin.define({
             // low steady target, but a digest of the stubbed units is smaller
             // still. The record is stored now and applied on the next request.
             const rawEstimate = sentTokens(results, overhead, new Map(), 0);
-            if (!cfg.manualMode.enabled) void maybeAutoSummarize(sessionID, st, rawEstimate);
+            // Single-digest receipts: auto-stub counts accumulate into this
+            // turn's receipt instead of notifying separately; async
+            // completions bank a note for the next turn's digest.
+            const turnAuto: TurnTally = { stubbed: 0, stubSaved: 0 };
+            if (!cfg.manualMode.enabled) void maybeAutoSummarize(sessionID, st, rawEstimate, turnAuto).catch(() => {});
 
             const summaryApplied = applySummaries(results, st);
             const applied = applyDecisions(results, decisions, cfg, ratio, covered, st);
@@ -2588,12 +2833,23 @@ export default Plugin.define({
             // subsequent request.
             st.savedTokensTotal += applied.savedTokens + collapsed.savedTokens;
 
-            if ((applied.count > 0 || summaryApplied > 0 || collapsed.spans > 0) && cfg.notify !== "off") {
-              const saved = applied.savedTokens + stats.saved + collapsed.savedTokens;
-              notify(
-                sessionID,
-                `pruned ${applied.count} result(s)${summaryApplied ? `, ${summaryApplied} summarised` : ""}${collapsed.spans > 0 ? `, ${collapsed.messages} message(s) collapsed` : ""}, ~${saved} tokens saved (epoch ${st.epoch})`,
-                `epoch ${st.epoch}: pruned ${applied.count}/${results.length}, summaries ${st.summaries.size}, ~${saved} tokens saved` +
+            // One receipt per turn: prune, stub, summary, collapse and any
+            // banked notes share a single digest through notify().
+            const banked = st.pendingNotes.length > 0 ? [...st.pendingNotes] : [];
+            if ((applied.count > 0 || summaryApplied > 0 || collapsed.spans > 0 || turnAuto.stubbed > 0 || banked.length > 0) && cfg.notify !== "off") {
+              const saved = applied.savedTokens + stats.saved + collapsed.savedTokens + turnAuto.stubSaved;
+              const sessionTotal = st.savedTokensTotal + st.summarySavedTokens;
+              const topic = latestTopic(st);
+              // Throttled receipt: meaningful saves always report; a freshly
+              // applied summary — or a banked note from an async/manual
+              // summarise or checkpoint — reports too so nothing is lost.
+              if (saved >= cfg.notifyMinTokens || (summaryApplied > 0 && cfg.notifyOnTopic) || (banked.length > 0 && cfg.notifyOnTopic)) {
+                st.pendingNotes.length = 0;
+                const receipt = `saved ~${saved} tokens this turn · ~${sessionTotal} session total${topic ? ` · topic: ${topic}` : ""}${banked.length > 0 ? ` · ${banked.join(" · ")}` : ""}`;
+                notify(
+                  sessionID,
+                  `pruned ${applied.count} result(s)${summaryApplied ? `, ${summaryApplied} summarised` : ""}${turnAuto.stubbed > 0 ? `, ${turnAuto.stubbed} stubbed` : ""}${collapsed.spans > 0 ? `, ${collapsed.messages} message(s) collapsed` : ""} — ${receipt} (epoch ${st.epoch})`,
+                  `epoch ${st.epoch}: pruned ${applied.count}/${results.length}, summaries ${st.summaries.size}, ${receipt}` +
                   (collapsed.spans > 0
                     ? `\n  span collapse: ${collapsed.spans} span(s), ${collapsed.messages} message(s), ~${collapsed.savedTokens} tokens`
                     : "") +
@@ -2601,6 +2857,7 @@ export default Plugin.define({
                     ? `\n  reasons: ${[...new Set([...decisions.values()].map((d) => d.reason))].join(", ")}`
                     : ""),
               );
+              }
             }
 
             // nudges -------------------------------------------------------
@@ -2628,10 +2885,21 @@ export default Plugin.define({
                     "",
                     map,
                   ].join("\n");
-                  try {
-                    void c.session?.synthetic?.({ sessionID, text: nudge, description: "context-pruner nudge", delivery: "queue" });
-                  } catch {
-                    /* ignore */
+                  // Never inject into a reasoning turn: bank the nudge and
+                  // surface it on the next receipt instead of voice-ing it as
+                  // a synthetic turn (which strict providers reject).
+                  if (hasReasoningContent(messages)) {
+                    st.pendingNotes.push(nudge.length > 200 ? `${nudge.slice(0, 200).trimEnd()}.` : nudge);
+                    while (st.pendingNotes.length > 20) st.pendingNotes.shift();
+                  } else {
+                    try {
+                      // CP-1: guarded so a rejecting session sink cannot escape.
+                      Promise.resolve(c.session?.synthetic?.({ sessionID, text: nudge, description: "context-pruner nudge", delivery: "queue" })).catch(() => {
+                        /* ignore */
+                      });
+                    } catch {
+                      /* ignore */
+                    }
                   }
                   st.iterationsSinceCompress = 0;
                 }
@@ -2646,8 +2914,14 @@ export default Plugin.define({
           } catch (err) {
             debug(`context hook failed: ${String(err)}`);
           }
-        }),
-      );
+            }),
+          );
+        } catch (err) {
+          // A failed registration must not take down the host session. Leave
+          // context untouched and expose a safe diagnostic for debugging.
+          log(`context hook registration failed; continuing without pruning: ${String(err)}`);
+          debug(`context hook registration failed: ${String(err)}`);
+        }
     }
 
     // ----------------------------------------------------------------- usage
@@ -2718,7 +2992,7 @@ export default Plugin.define({
             } catch {
               /* stream closed */
             }
-          })();
+          })().catch(() => {});
         } else if (typeof stream === "function") {
           track(stream as () => void | Promise<void>);
         } else if (stream && typeof (stream as PromiseLike<unknown>).then === "function") {
@@ -2739,8 +3013,9 @@ export default Plugin.define({
 
     // ------------------------------------------------------------------ tools
     if (typeof c.tool?.transform === "function") {
-      track(
-        await c.tool.transform((editor) => {
+      try {
+        track(
+          await c.tool.transform((editor) => {
           editor.add({
             name: "context_pruner_stats",
             description: "Show what context-pruner trimmed and the active configuration.",
@@ -2861,14 +3136,19 @@ export default Plugin.define({
               }
             },
           });
-        }),
-      );
+          }),
+        );
+      } catch (err) {
+        log(`tool registration failed; continuing with the remaining plugins: ${String(err)}`);
+        debug(`tool registration failed: ${String(err)}`);
+      }
     }
 
     // --------------------------------------------------------------- commands
     if (typeof c.command?.transform === "function") {
-      track(
-        await c.command.transform((editor) => {
+      try {
+        track(
+          await c.command.transform((editor) => {
           editor.add({
             name: "context",
             description: "Report the current context-compiler budget, epoch, summaries and prune decisions.",
@@ -2901,8 +3181,12 @@ export default Plugin.define({
               }
             },
           });
-        }),
-      );
+          }),
+        );
+      } catch (err) {
+        log(`command registration failed; continuing with the remaining plugins: ${String(err)}`);
+        debug(`command registration failed: ${String(err)}`);
+      }
     }
 
     // --- compress tool implementation (closure over ctx/st) ------------------
@@ -3005,10 +3289,15 @@ export default Plugin.define({
           return { content: "The session model is unavailable, so compress cannot generate a summary right now." };
         }
         const prompt = summaryPrompt(source, topic, reason, protectedBlocks);
-        const response = await session.generate({ sessionID, prompt });
-        body = generatedText(response);
+        try {
+          const response = await session.generate({ sessionID, prompt });
+          body = generatedText(response);
+        } catch {
+          body = "";
+        }
+        if (!body && cfg.autoSummarizeStub) body = fallbackSummary(targets);
         if (!body) {
-          debug(`compress generate returned empty (${isPlainObject(response) ? Object.keys(response).join(",") : typeof response})`);
+          debug(`compress generate returned empty`);
           return { content: "The model returned an empty summary; nothing was compressed." };
         }
         totals.generations++;
@@ -3042,11 +3331,9 @@ export default Plugin.define({
       totals.summarySavedTokens += savedTokens;
       st.iterationsSinceCompress = 0;
 
-      notify(
-        sessionID,
-        `summarised ${targets.length} result(s) into ~${record.tokens} tokens (saved ~${savedTokens})`,
-        `compress: ${targets.length} result(s) → ${record.tokens} tokens (saved ~${savedTokens}). topic: ${topic || "general"}`,
-      );
+      // Banked for the next turn's single digest: the digest names the
+      // summary and its topic when it applies the record.
+      bankNote(st, `compress: ${targets.length} result(s) → ${record.tokens} tokens (saved ~${savedTokens})`);
 
       return {
         content: [
@@ -3076,7 +3363,8 @@ export default Plugin.define({
             // cache.read/write). A bare number crashes compaction on `cache.read`.
             record.result = { summary, tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } };
             totals.checkpoints++;
-            notify(sessionID, `context checkpoint written (${summary.length} chars)`, `compaction: checkpoint ${summary.length} chars`);
+            // Banked for the next turn's single digest, not a receipt of its own.
+            bankNote(stateFor(sessionID), `checkpoint written (${summary.length} chars)`);
             debug(`checkpoint for ${sessionID}: ${summary.length} chars`);
           } catch (err) {
             debug(`compaction hook failed: ${String(err)}`);
@@ -3129,7 +3417,7 @@ export default Plugin.define({
     }
 
     log(
-      `ready (budgetRatio=${cfg.budgetRatio}, targetRatio=${cfg.targetRatio}, keepRecent=${cfg.keepRecent}, relaxRecentFloor=${cfg.relaxRecentFloor}, minReplanTokens=${cfg.minReplanTokens}, compress=${cfg.compressEnabled ? cfg.compressMode : "off"}${cfg.compressEnabled && cfg.compressText ? "+text" : ""}, collapse=${cfg.collapseRanges ? (cfg.collapseStubs ? "stubs" : "on") : "off"}${cfg.configPath ? `, config=${cfg.configPath}` : ""})`,
+      `ready (budgetRatio=${cfg.budgetRatio}, targetRatio=${cfg.targetRatio}, keepRecent=${cfg.keepRecent}, relaxRecentFloor=${cfg.relaxRecentFloor}, minReplanTokens=${cfg.minReplanTokens}, compress=${cfg.compressEnabled ? "range" : "off"}${cfg.compressEnabled && cfg.compressText ? "+text" : ""}, collapse=${cfg.collapseRanges ? (cfg.collapseStubs ? "stubs" : "on") : "off"}${cfg.configPath ? `, config=${cfg.configPath}` : ""})`,
     );
     debug("context-pruner initialised");
 

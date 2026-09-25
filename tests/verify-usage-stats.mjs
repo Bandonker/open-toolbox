@@ -355,7 +355,64 @@ check(
   html.includes("<!-- heatmap -->") && html.includes("<!-- bar-chart -->") && html.includes("<!-- background -->"),
 );
 check("dashboard HTML shows lifetime totals", html.includes("190") && html.includes("anthropic/claude-sonnet-4"));
-check("dashboard HTML is self-contained (no script/CDN)", !html.includes("<script") && !html.includes("http://") && !html.includes("https://"));
+check(
+  "activity hover includes per-day tokens, tools, and model details",
+  html.includes("Tokens: 7615 total") &&
+    html.includes("Tools: 2 calls (1 ok, 1 failed)") &&
+    html.includes("Models: 4 used") &&
+    html.includes("anthropic/claude-sonnet-4: 200 tokens") &&
+    html.includes("acme/pricey: 4900 tokens"),
+);
+check(
+  "bar hover includes the exact token total for its day",
+  new RegExp(`data-tooltip="\\d{4}-\\d{2}-\\d{2}: 7615 tokens\\n  input=4165 output=1040 reasoning=100 cache_read=2007 cache_write=303`).test(html),
+);
+check(
+  "activity and bar data use an accessible custom tooltip",
+  html.includes('id="usage-tooltip"') &&
+    html.includes('class="usage-tooltip"') &&
+    html.includes('role="tooltip"') &&
+    html.includes('role="group"') &&
+    html.includes('data-tooltip="') &&
+    html.includes('tabindex="0"') &&
+    html.includes('tabindex="-1"') &&
+    html.includes('pointer-events:auto') &&
+    html.includes('ArrowLeft') &&
+    html.includes('Scrollable table') &&
+    html.includes('updateScrollableTables') &&
+    html.includes('removeAttribute("tabindex")') &&
+    html.includes('mouseenter') &&
+    html.includes('focus') &&
+    html.includes('Escape'),
+);
+check(
+  "model table includes searchable multi-select controls",
+  html.includes('id="model-filter-search"') &&
+    html.includes('type="search"') &&
+    html.includes('id="model-filter" multiple') &&
+    html.includes('id="model-filter-all"') &&
+    html.includes('id="model-filter-clear"') &&
+    html.includes('data-search="anthropic/claude-sonnet-4 anthropic"') &&
+    html.includes('id="models-table"') &&
+    html.includes('data-model="anthropic/claude-sonnet-4"'),
+);
+check(
+  "model filter script supports search, multi-select, and select-all/clear actions",
+  html.includes('search.addEventListener("input",apply)') &&
+    html.includes('select.addEventListener("change",function()') &&
+    html.includes('all.addEventListener("click"') &&
+    html.includes('clear.addEventListener("click"') &&
+    html.includes('var selectedValues=new Set();') &&
+    html.includes('var selectedSet=new Set(selected);') &&
+    html.includes('selectedValues.add(option.value)') &&
+    html.includes('selectedValues.delete(option.value)') &&
+    html.includes('select.textContent="";select.appendChild(fragment);'),
+);
+check(
+  "model filter reports an empty search result",
+  html.includes('id="model-filter-empty"') && html.includes("No models match"),
+);
+check("dashboard HTML is self-contained (no external script/CDN)", !html.includes("<script src") && !html.includes("http://") && !html.includes("https://"));
 check(
   "dashboard shows reported vs list-price KPI cards",
   html.includes("Cost (reported)") && html.includes("Cost (list price)"),
@@ -434,7 +491,7 @@ const html2 = readFileSync(dashPath, "utf8");
 check("autoRefreshSec=0 omits the refresh meta", !html2.includes('<meta http-equiv="refresh"'));
 check(
   "dashboard stays self-contained with refresh off",
-  !html2.includes("<script") && !html2.includes("http://") && !html2.includes("https://"),
+  !html2.includes("<script src") && !html2.includes("http://") && !html2.includes("https://"),
 );
 if (typeof cleanup2 === "function") await cleanup2();
 

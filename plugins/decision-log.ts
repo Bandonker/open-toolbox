@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
-import { mkdirSync, existsSync, copyFileSync, rmSync } from "fs";
+import { mkdirSync, existsSync } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import {
@@ -13,6 +13,11 @@ import {
   parseStringArray,
   quoteFtsQuery,
   dbUnavailable,
+  clampLimit,
+  copyBackupIntoPlace,
+  hasTriggers,
+  truncateStored,
+  STORE_CAPS,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
 import { redactSecrets } from "../lib/redact.ts";
@@ -23,9 +28,14 @@ const BACKUP_DIR = join(DB_DIR, "backups");
 const MAX_BACKUPS = 5;
 const DECISION_STATUSES = ["proposed", "accepted", "deprecated", "superseded"] as const;
 /** P5: redact obvious secrets before they hit the pack's own store (opt-out via env). */
-const STORE_REDACT = process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+// DL-7: read the flag lazily (call time, not module load) so runtime
+// toggles and tests take effect without a re-import. Default-on, like before.
+function storeRedactOn(): boolean {
+  return process.env.OPENCODE_PLUGINS_STORE_REDACT !== "false";
+}
+
 function scrubStore(text: string): string {
-  return STORE_REDACT ? redactSecrets(text) : text;
+  return storeRedactOn() ? redactSecrets(text) : text;
 }
 
 let db: AnyDatabase | null = null;
@@ -33,8 +43,10 @@ let lastBackupTime = 0;
 
 function getDb(): AnyDatabase {
   if (!db) {
-    if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
+    // DL-2: mkdir inside try so a creation failure routes to backup-restore
+    // instead of escaping as an unhandled throw.
     try {
+      if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
       db = openDatabase(DB_PATH);
       applyPragmas(db);
       initSchema(db);
@@ -87,9 +99,8 @@ function initSchema(database: AnyDatabase): void {
   // D1: triggers are ensured on every open, not only when the FTS table was
   // just created — a dropped/desynced trigger must not silently stop making
   // new decisions searchable.
-  const hadTriggers = !!database
-    .query("SELECT 1 FROM sqlite_master WHERE type='trigger' AND name='decisions_ai'")
-    .get();
+  // CR-9: verify all three triggers (ai/ad/au), not just the insert one.
+  const hadTriggers = hasTriggers(database, ["decisions_ai", "decisions_ad", "decisions_au"]);
 
   database.exec(`
     CREATE TRIGGER IF NOT EXISTS decisions_ai AFTER INSERT ON decisions BEGIN
@@ -147,10 +158,9 @@ function tryRestore(): AnyDatabase | null {
     try { db.close(); } catch { /* ignore */ }
     db = null;
   }
-  for (const suffix of ["-wal", "-shm"]) {
-    try { rmSync(DB_PATH + suffix, { force: true }); } catch { /* ignore */ }
-  }
-  copyFileSync(latest, DB_PATH);
+  // CR-8: I/O wrapped with context (copyBackupIntoPlace); it also drops
+  // -wal/-shm/-journal so they cannot be replayed on the restored snapshot.
+  copyBackupIntoPlace(DB_PATH, latest);
   const restored = openDatabase(DB_PATH);
   applyPragmas(restored);
   initSchema(restored);
@@ -174,9 +184,15 @@ function withRetry<T>(fn: () => T, isWrite = false): T {
       db = null;
       db = tryRestore();
       if (db) {
-        const result = fn();
-        if (isWrite) { try { backup(); } catch {} }
-        return result;
+        // CR-3: the retried call can fail too — route it to dbUnavailable
+        // instead of throwing out of the tool.
+        try {
+          const result = fn();
+          if (isWrite) { try { backup(); } catch {} }
+          return result;
+        } catch (retryErr) {
+          return dbUnavailable(retryErr) as T;
+        }
       }
     }
     // CR-3: never throw storage failures out of tools — every caller uses
@@ -246,10 +262,11 @@ export default Plugin.define({
             );
             const result = stmt.run(
               toolCtx.sessionID || null,
-              scrubStore(args.title),
-              args.context ? scrubStore(args.context) : null,
-              scrubStore(args.decision),
-              args.consequences ? scrubStore(args.consequences) : null,
+              // CR-4: cap unbounded inputs into DB/FTS (title 500, bodies 20k).
+              truncateStored(scrubStore(args.title), STORE_CAPS.decisionTitle),
+              args.context ? truncateStored(scrubStore(args.context), STORE_CAPS.decisionBody) : null,
+              truncateStored(scrubStore(args.decision), STORE_CAPS.decisionBody),
+              args.consequences ? truncateStored(scrubStore(args.consequences), STORE_CAPS.decisionBody) : null,
               status,
               tags,
               args.project || null
@@ -285,15 +302,17 @@ export default Plugin.define({
         input: z.object({
           query: z.string().describe("Search query (words are matched literally; FTS5 operators are not interpreted)"),
           all_sessions: z.boolean().optional().describe("Search across all sessions (default: false, current session only)"),
+          project: z.string().optional().describe("Filter by project (parity with decision_list)"),
           limit: z.number().optional().describe("Max results (default: 10)"),
         }),
         execute: async (input, toolCtx) => {
-          const args = input as { query: string; all_sessions?: boolean; limit?: number };
+          const args = input as { query: string; all_sessions?: boolean; project?: string; limit?: number };
           const out = withRetry(() => {
             const database = getDb();
             const q = quoteFtsQuery(args.query);
             if (q === null) return "No decisions found. (empty query)";
-            const limit = Math.min(Math.max(args.limit ?? 10, 1), 50);
+            // DL-6: trunc + finite guard via shared clampLimit.
+            const limit = clampLimit(args.limit ?? 10, 10, 50);
             let sql = `SELECT d.* FROM decisions d
                  JOIN decisions_fts f ON d.id = f.rowid
                  WHERE decisions_fts MATCH ?`;
@@ -302,6 +321,12 @@ export default Plugin.define({
             if (!args.all_sessions && toolCtx.sessionID) {
               sql += " AND d.session_id = ?";
               params.push(toolCtx.sessionID);
+            }
+
+            // DL-8: project filter parity with decision_list.
+            if (args.project) {
+              sql += " AND d.project = ?";
+              params.push(args.project);
             }
 
             sql += " ORDER BY rank LIMIT ?";
@@ -334,7 +359,8 @@ export default Plugin.define({
           };
           const out = withRetry(() => {
             const database = getDb();
-            const limit = Math.min(Math.max(args.limit ?? 20, 1), 100);
+            // DL-6: trunc + finite guard via shared clampLimit.
+            const limit = clampLimit(args.limit ?? 20, 20, 100);
             let where = "WHERE 1=1";
             const params: unknown[] = [];
 
@@ -403,10 +429,11 @@ export default Plugin.define({
             const updates: string[] = [];
             const params: unknown[] = [];
 
-            if (args.title !== undefined) { updates.push("title = ?"); params.push(scrubStore(args.title)); }
-            if (args.context !== undefined) { updates.push("context = ?"); params.push(scrubStore(args.context)); }
-            if (args.decision !== undefined) { updates.push("decision = ?"); params.push(scrubStore(args.decision)); }
-            if (args.consequences !== undefined) { updates.push("consequences = ?"); params.push(scrubStore(args.consequences)); }
+            // CR-4: cap unbounded inputs into DB/FTS (title 500, bodies 20k).
+            if (args.title !== undefined) { updates.push("title = ?"); params.push(truncateStored(scrubStore(args.title), STORE_CAPS.decisionTitle)); }
+            if (args.context !== undefined) { updates.push("context = ?"); params.push(truncateStored(scrubStore(args.context), STORE_CAPS.decisionBody)); }
+            if (args.decision !== undefined) { updates.push("decision = ?"); params.push(truncateStored(scrubStore(args.decision), STORE_CAPS.decisionBody)); }
+            if (args.consequences !== undefined) { updates.push("consequences = ?"); params.push(truncateStored(scrubStore(args.consequences), STORE_CAPS.decisionBody)); }
             if (args.status !== undefined) { updates.push("status = ?"); params.push(args.status); }
             if (args.superseded_by !== undefined) { updates.push("superseded_by = ?"); params.push(args.superseded_by); }
             if (args.tags !== undefined) { updates.push("tags = ?"); params.push(JSON.stringify(args.tags)); }

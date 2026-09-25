@@ -84,6 +84,16 @@ function resolveConfig(options: Record<string, unknown> | undefined): Config {
     ),
     ignoreTools: new Set([
       "todowrite",
+      // Sibling noisy tools: usage-stats dashboards and session exports would
+      // otherwise flood the audit log with their own reads/writes.
+      "stats_summary",
+      "stats_tokens",
+      "stats_heatmap",
+      "stats_tools",
+      "stats_dashboard",
+      "stats_export",
+      "session_export",
+      "session_export_history",
       ...AUDIT_TOOLS,
       ...asList(o.ignoreTools, env("OPENCODE_TOOL_AUDIT_IGNORE")),
     ]),
@@ -116,6 +126,25 @@ function safeLen(value: unknown, cap: number): number {
     return n;
   } catch {
     return cap;
+  }
+}
+
+/**
+ * TA-8: snapshot hook input at capture time. The event object may be mutated
+ * after `execute.before` returns, so storing the reference would record the
+ * *final* state (or throw at serialization). Deep-clone, capped and total.
+ */
+function snapshotInput(value: unknown): unknown {
+  if (value === null || value === undefined) return value;
+  try {
+    if (typeof structuredClone === "function") return structuredClone(value);
+  } catch {
+    // Fall through to the JSON copy below.
+  }
+  try {
+    return JSON.parse(JSON.stringify(value) ?? "null") as unknown;
+  } catch {
+    return String(value).slice(0, 4000);
   }
 }
 
@@ -232,7 +261,15 @@ function initSchema(database: AnyDatabase): void {
 function prune(database: AnyDatabase, cfg: Config): void {
   if (cfg.retentionDays <= 0) return;
   const cutoff = Date.now() - cfg.retentionDays * 86_400_000;
-  database.prepare("DELETE FROM calls WHERE started_ms < ?").run(cutoff);
+  const result = database.prepare("DELETE FROM calls WHERE started_ms < ?").run(cutoff) as { changes?: unknown };
+  // Reclaim space after bulk deletes; WAL checkpoint keeps readers unblocked.
+  if (typeof result?.changes === "number" && result.changes > 0) {
+    try {
+      database.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    } catch {
+      // Checkpoint is best-effort (e.g. non-WAL journals) — deletes already landed.
+    }
+  }
 }
 
 /** "30m" | "24h" | "7d" | ISO date -> epoch ms cutoff. */
@@ -433,10 +470,25 @@ export default Plugin.define({
 
     const registrations: Array<{ dispose: () => Promise<void> }> = [];
 
+    // TA-3: sweep stale pending entries (at most once per 10 min) so a missed
+    // execute.after can never grow the map without bound.
+    let lastPendingSweep = 0;
+    const sweepPending = (now: number): void => {
+      if (now - lastPendingSweep < 10 * 60_000) return;
+      lastPendingSweep = now;
+      for (const [key, entry] of pending) {
+        if (now - entry.startedMs > 10 * 60_000) pending.delete(key);
+      }
+    };
+
     if (cfg.enabled) {
       registrations.push(
         await ctx.tool.hook("execute.before", (event) => {
           if (cfg.ignoreTools.has(event.tool)) return;
+          sweepPending(Date.now());
+          // TA-2: id-less events share no key — skipping them here keeps them
+          // from colliding on "" (the after-hook still records a fallback entry).
+          if (event.id === undefined || event.id === null) return;
           // T7: normalize the event id — "undefined" must never become a
           // call_id (it would collide across every id-less event).
           const callId = String(event.id ?? "");
@@ -446,7 +498,8 @@ export default Plugin.define({
             agent: String(event.agent ?? ""),
             messageID: String(event.messageID ?? ""),
             callId,
-            input: event.input,
+            // TA-8: snapshot the input — the event object may be mutated after the hook.
+            input: snapshotInput(event.input),
             startedMs: Date.now(),
           });
         }),
@@ -516,7 +569,10 @@ export default Plugin.define({
             // S4/T1: an empty/whitespace query must not reach MATCH ("" throws
             // an FTS5 syntax error); filters work standalone now because all
             // whereClause columns are qualified with the `c.` alias.
-            const q = args.query && args.query.trim() ? quoteFtsQuery(args.query) : null;
+            // TA-4: cap the FTS query — an unbounded MATCH string is a
+            // pathological-query vector (and quoteFtsQuery cost grows with it).
+            const rawQuery = (args.query ?? "").trim().split(/\s+/).slice(0, 20).join(" ");
+            const q = rawQuery ? quoteFtsQuery(rawQuery) : null;
             if (q) {
               rows = database
                 .query(
@@ -696,7 +752,7 @@ export default Plugin.define({
           status: z.enum(["completed", "error"]).optional().describe("Only calls with this status"),
           since: z.string().optional().describe('Time window: "30m", "24h", "7d" or an ISO date'),
           format: z.enum(["jsonl", "markdown"]).optional().describe("Output format (default jsonl)"),
-          limit: z.number().optional().describe("Max rows (default 200, max 1000)"),
+          limit: z.number().optional().describe("Max rows (default 50, max 1000)"),
         }),
         execute: async (input) => {
           const args = input as {
@@ -715,7 +771,7 @@ export default Plugin.define({
               status: args.status,
               since: parseSince(args.since),
             });
-            const limit = Math.min(Math.max(Math.trunc(args.limit ?? 200), 1), 1000);
+            const limit = Math.min(Math.max(Math.trunc(args.limit ?? 50), 1), 1000);
             const rows = database
               .query(`SELECT * FROM calls c WHERE 1=1${where.sql} ORDER BY c.started_ms ASC LIMIT ?`)
               .all(...where.params, limit) as CallRow[];
@@ -749,7 +805,10 @@ export default Plugin.define({
                   duration_ms: r.duration_ms,
                   session: r.session_id,
                   agent: r.agent,
-                  error: r.error,
+                  // TA-5: the error column is unbounded — truncate so a bulk
+                  // export cannot return megabytes of text.
+                  error:
+                    r.error && r.error.length > 2000 ? `${r.error.slice(0, 2000)}…[truncated]` : r.error,
                   input: r.input,
                   output_chars: r.output_chars,
                 }),

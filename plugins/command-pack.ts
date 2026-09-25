@@ -49,8 +49,12 @@ const TOOLBOX_TOOLS = [
   "codebase_delete_index",
   "trace_query",
   "trace_stats",
+  "trace_sessions",
   "trace_export",
   "context_pruner_stats",
+  "context_pruner_recall",
+  "context_report",
+  "compress",
   "session_export",
   "session_export_info",
   "memory_remember",
@@ -128,6 +132,15 @@ const TOOL_OWNERS: Record<string, string> = {
 
 const ownerOf = (tool: string): string => TOOL_OWNERS[tool] ?? "unknown plugin";
 
+/**
+ * CP-5: delivery allowlist — only known delivery modes are forwarded to
+ * session.prompt; anything else is dropped rather than passed through blindly.
+ */
+const DELIVERY_ALLOWLIST = new Set(["agent", "user", "queue", "steer"]);
+function isAllowedDelivery(value: unknown): value is "agent" | "user" | "queue" | "steer" {
+  return typeof value === "string" && DELIVERY_ALLOWLIST.has(value);
+}
+
 const COMMANDS: CommandSpec[] = [
   {
     name: "handoff",
@@ -166,7 +179,7 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "recall",
     description: "Search past decisions, errors, snippets and indexed code.",
-    requires: ["decision_search", "error_search", "snippet_search"],
+    requires: ["decision_search", "error_search", "snippet_search", "codebase_search"],
     build: (args) =>
       [
         `Search the toolbox knowledge bases for: ${args || "(ask me what to look for)"}`,
@@ -200,7 +213,14 @@ const COMMANDS: CommandSpec[] = [
     description: "Show which open-toolbox tools are installed in this session.",
     requires: [],
     build: (args, available) => {
-      const installed = TOOLBOX_TOOLS.filter((t) => available.has(t));
+      // CP-1: work from the live tool list (dynamic — any live tool with a
+      // known provider counts) and only fall back to the static inventory
+      // when the live listing failed (empty set). Gating on TOOL_OWNERS
+      // instead of the static TOOLBOX_TOOLS keeps tools like trace_sessions
+      // visible even as the pack grows.
+      const live = [...available];
+      const source = live.length ? live : [...TOOLBOX_TOOLS];
+      const installed = source.filter((t) => t in TOOL_OWNERS);
       const lines = installed.length
         ? installed.map((t) => `- ${t} (${ownerOf(t)})`)
         : ["(no open-toolbox tools detected)"];
@@ -219,13 +239,19 @@ const COMMANDS: CommandSpec[] = [
 export default Plugin.define({
   id: "command-pack",
   async setup(ctx) {
+    // CP-3: cache the tool listing — every command delivery re-invokes
+    // toolIds(), and listing on each call is wasteful. 60s TTL.
+    let toolIdsCache: { at: number; ids: Set<string> } | null = null;
     const toolIds = async (): Promise<Set<string>> => {
+      if (toolIdsCache && Date.now() - toolIdsCache.at < 60_000) return toolIdsCache.ids;
       try {
         const tools = await ctx.tool.list();
-        return new Set(tools.map((t) => t.id));
+        const ids = new Set(tools.map((t) => t.id));
+        toolIdsCache = { at: Date.now(), ids };
+        return ids;
       } catch (err) {
         console.error(`[command-pack] tool.list failed: ${String(err)}`);
-        return new Set<string>();
+        return toolIdsCache?.ids ?? new Set<string>();
       }
     };
 
@@ -235,7 +261,9 @@ export default Plugin.define({
           name: spec.name,
           description: spec.description,
           execute: async ({ sessionID, prompt, delivery }) => {
-            const args = (prompt?.text ?? "").trim();
+            // CP-6: bound raw args — a pasted wall of text must not bloat every prompt.
+            const rawArgs = (prompt?.text ?? "").trim();
+            const args = rawArgs.length > 500 ? `${rawArgs.slice(0, 500)}…[truncated]` : rawArgs;
             const available = await toolIds();
             const missing = spec.requires.filter((t) => !available.has(t));
             const body = spec.build(args, available);
@@ -246,10 +274,13 @@ export default Plugin.define({
               await ctx.session.prompt({
                 sessionID,
                 text,
-                ...(delivery ? { delivery } : {}),
+                ...(isAllowedDelivery(delivery) ? { delivery } : {}),
               });
             } catch (err) {
+              // CP-4: surface prompt failures visibly — a bare console.error
+              // leaves the user believing the command ran.
               console.error(`[command-pack] /${spec.name} failed to inject: ${String(err)}`);
+              throw err;
             }
           },
         });

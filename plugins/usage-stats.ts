@@ -24,8 +24,9 @@ import { openDatabase, applyPragmas, type AnyDatabase } from "../lib/sqlite.ts";
  *   - tool `execute.before` / `execute.after` hooks count calls, outcomes and
  *     durations per tool.
  *
- * The dashboard is a self-contained HTML file (inline SVG/CSS, no CDN, no
- * script) written to `<dir>/dashboard.html`. There is no way to open a browser
+ * The dashboard is a self-contained HTML file (inline SVG/CSS and a small
+ * inline model-filter script; no CDN or external assets) written to
+ * `<dir>/dashboard.html`. There is no way to open a browser
  * from a plugin, so tools return the path for the user to open.
  */
 
@@ -68,6 +69,8 @@ interface UsageState {
   sessionModels: Map<string, string>;
   /** In-flight tool calls keyed by call id, for duration measurement. */
   pending: Map<string, { tool: string; startedMs: number }>;
+  /** Last US-6 threshold-gated pending sweep (epoch ms). */
+  lastPendingSweep: number;
 }
 
 function createState(): UsageState {
@@ -79,6 +82,7 @@ function createState(): UsageState {
     dirty: false,
     sessionModels: new Map(),
     pending: new Map(),
+    lastPendingSweep: 0,
   };
 }
 
@@ -441,6 +445,29 @@ function initSchema(database: AnyDatabase): void {
       total_ms INTEGER NOT NULL DEFAULT 0,
       max_ms INTEGER NOT NULL DEFAULT 0
     );
+    CREATE TABLE IF NOT EXISTS daily_models (
+      day TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input INTEGER NOT NULL DEFAULT 0,
+      output INTEGER NOT NULL DEFAULT 0,
+      reasoning INTEGER NOT NULL DEFAULT 0,
+      cache_read INTEGER NOT NULL DEFAULT 0,
+      cache_write INTEGER NOT NULL DEFAULT 0,
+      cost REAL NOT NULL DEFAULT 0,
+      cost_computed REAL,
+      events INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, model)
+    );
+    CREATE TABLE IF NOT EXISTS daily_tools (
+      day TEXT NOT NULL,
+      tool TEXT NOT NULL,
+      calls INTEGER NOT NULL DEFAULT 0,
+      succeeded INTEGER NOT NULL DEFAULT 0,
+      failed INTEGER NOT NULL DEFAULT 0,
+      total_ms INTEGER NOT NULL DEFAULT 0,
+      max_ms INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (day, tool)
+    );
     CREATE TABLE IF NOT EXISTS sources (
       source TEXT PRIMARY KEY,
       count INTEGER NOT NULL DEFAULT 0,
@@ -523,6 +550,21 @@ function initSchema(database: AnyDatabase): void {
   `);
 }
 
+/** US-7: last unconditional db-failure notice (epoch ms, module-level). */
+let lastDbErrorLog = 0;
+
+/**
+ * US-7: db failures must never fail silently. This logs unconditionally
+ * (independent of cfg.log) but rate-limited to one notice per 5 minutes so
+ * a permanently broken db cannot spam stderr on every tool call.
+ */
+function logDbError(message: string): void {
+  const now = Date.now();
+  if (now - lastDbErrorLog < 300_000) return;
+  lastDbErrorLog = now;
+  console.error(`[usage-stats] ${message}`);
+}
+
 function getDb(state: UsageState, cfg: Config): AnyDatabase {
   if (!state.db) {
     state.db = openDatabase(join(cfg.dir, DB_NAME));
@@ -543,6 +585,8 @@ function prune(state: UsageState, cfg: Config, force: boolean): void {
     const database = state.db;
     if (!database) return;
     database.prepare("DELETE FROM daily WHERE day < ?").run(cutoff);
+    database.prepare("DELETE FROM daily_models WHERE day < ?").run(cutoff);
+    database.prepare("DELETE FROM daily_tools WHERE day < ?").run(cutoff);
     // U1: never prune session_state rows that hold cumulative usage — a
     // resumed session would otherwise re-add its entire lifetime as one
     // delta (double counting everything). Only rows with no recorded
@@ -664,7 +708,46 @@ function addModelUsage(
     .run(model, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost, events, costComputed);
 }
 
-function addBackgroundUsage(database: AnyDatabase, day: string, source: string, t: Tokens, cost: number): void {
+function addDailyModelUsage(
+  database: AnyDatabase,
+  day: string,
+  model: string,
+  t: Tokens,
+  cost: number,
+  events: number,
+  costComputed: number | null,
+): void {
+  database
+    .prepare(
+      `INSERT INTO daily_models(day, model, input, output, reasoning, cache_read, cache_write, cost, events, cost_computed)
+       VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(day, model) DO UPDATE SET
+         input = input + excluded.input,
+         output = output + excluded.output,
+         reasoning = reasoning + excluded.reasoning,
+         cache_read = cache_read + excluded.cache_read,
+         cache_write = cache_write + excluded.cache_write,
+         cost = cost + excluded.cost,
+         events = events + excluded.events,
+         cost_computed = CASE WHEN excluded.cost_computed IS NULL THEN cost_computed ELSE COALESCE(cost_computed, 0) + excluded.cost_computed END`,
+    )
+    .run(day, model, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost, events, costComputed);
+}
+
+/**
+ * US-3: background usage must also land in model_totals (with a computed
+ * list-price cost) — otherwise cost_computed is never written for it and
+ * per-model totals silently miss background traffic.
+ */
+function addBackgroundUsage(
+  database: AnyDatabase,
+  state: UsageState,
+  day: string,
+  sessionID: string,
+  source: string,
+  t: Tokens,
+  cost: number,
+): void {
   database
     .prepare(
       `INSERT INTO sources(source, count, cost, input, output, reasoning, cache_read, cache_write)
@@ -695,6 +778,13 @@ function addBackgroundUsage(database: AnyDatabase, day: string, source: string, 
       )
       .run(day, t.input, t.output, t.reasoning, t.cacheRead, t.cacheWrite, cost);
   }
+  // US-3: attribute background usage to a model as well, storing a computed
+  // list-price cost — without this, cost_computed is never written for
+  // background traffic and per-model totals miss it entirely.
+  const model = state.sessionModels.get(sessionID) ?? loadSession(database, sessionID)?.model ?? "unknown";
+  const modelCost = computedCost(model, t, state);
+  addModelUsage(database, model, t, cost, 1, modelCost);
+  addDailyModelUsage(database, day, model, t, cost, 1, modelCost);
 }
 
 function recordUsageUpdated(
@@ -747,6 +837,7 @@ function recordUsageUpdated(
     if (changed) {
       addDailyUsage(database, day, delta, deltaCost, deltaComputed);
       addModelUsage(database, model, delta, deltaCost, 1, deltaComputed);
+      addDailyModelUsage(database, day, model, delta, deltaCost, 1, deltaComputed);
     }
     database
       .prepare(
@@ -776,7 +867,7 @@ function recordUsageUpdated(
 
 function recordUsageRecorded(database: AnyDatabase, sessionID: string, source: string, tokensRaw: unknown, costRaw: unknown, state: UsageState): void {
   ensureSession(database, sessionID, null);
-  addBackgroundUsage(database, dayKey(), source || "unknown", readTokens(tokensRaw), readCost(costRaw));
+  addBackgroundUsage(database, state, dayKey(), sessionID, source || "unknown", readTokens(tokensRaw), readCost(costRaw));
   state.dirty = true;
 }
 
@@ -805,8 +896,24 @@ function rememberModel(state: UsageState, sessionID: string, model: string): voi
   }
 }
 
+function addDailyToolUsage(database: AnyDatabase, day: string, tool: string, ok: boolean, durationMs: number): void {
+  database
+    .prepare(
+      `INSERT INTO daily_tools(day, tool, calls, succeeded, failed, total_ms, max_ms)
+       VALUES(?, ?, 1, ?, ?, ?, ?)
+       ON CONFLICT(day, tool) DO UPDATE SET
+         calls = calls + 1,
+         succeeded = succeeded + excluded.succeeded,
+         failed = failed + excluded.failed,
+         total_ms = total_ms + excluded.total_ms,
+         max_ms = MAX(max_ms, excluded.max_ms)`,
+    )
+    .run(day, tool, ok ? 1 : 0, ok ? 0 : 1, durationMs, durationMs);
+}
+
 function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durationMs: number, state: UsageState): void {
   const ms = Math.max(0, Math.round(durationMs));
+  const day = dayKey();
   // U3: both rollups are written atomically; U2: the daily increment is
   // mirrored into the never-pruned lifetime rollup.
   database.exec("BEGIN TRANSACTION");
@@ -823,6 +930,7 @@ function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durati
            max_ms = MAX(max_ms, excluded.max_ms)`,
       )
       .run(tool, ok ? 1 : 0, ok ? 0 : 1, ms, ms);
+    addDailyToolUsage(database, day, tool, ok, ms);
     for (const table of ["daily", "lifetime"] as const) {
       database
         .prepare(
@@ -833,7 +941,7 @@ function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durati
              tool_ok = tool_ok + excluded.tool_ok,
              tool_fail = tool_fail + excluded.tool_fail`,
         )
-        .run(dayKey(), ok ? 1 : 0, ok ? 0 : 1);
+        .run(day, ok ? 1 : 0, ok ? 0 : 1);
     }
     database.exec("COMMIT");
   } catch (err) {
@@ -918,6 +1026,25 @@ function dailyRows(database: AnyDatabase, sinceDay?: string): DayRow[] {
   }));
 }
 
+/** US-8: fetch a single day row directly instead of scanning the table. */
+function dailyRow(database: AnyDatabase, day: string): DayRow | undefined {
+  const r = database.prepare("SELECT * FROM daily WHERE day = ?").get(day) as Record<string, unknown> | null;
+  if (!r) return undefined;
+  return {
+    day: String(r.day ?? ""),
+    ...totalsOf(r),
+    tool_calls: num(r.tool_calls),
+    tool_ok: num(r.tool_ok),
+    tool_fail: num(r.tool_fail),
+    bg_input: num(r.bg_input),
+    bg_output: num(r.bg_output),
+    bg_reasoning: num(r.bg_reasoning),
+    bg_cache_read: num(r.bg_cache_read),
+    bg_cache_write: num(r.bg_cache_write),
+    bg_cost: num(r.bg_cost),
+  };
+}
+
 function lifetimeTotals(database: AnyDatabase): UsageTotals {
   const r = database
     .prepare(
@@ -971,7 +1098,7 @@ function summaryText(database: AnyDatabase): string {
   const bg = backgroundTotals(database);
   const unknownModels = countUnknownModels(database);
   const day = dayKey();
-  const todayRow = dailyRows(database, day).find((r) => r.day === day);
+  const todayRow = dailyRow(database, day);
   const today = totalsOf(todayRow);
   // Success rate is measured over completed calls (ok + fail). Older rows
   // counted every started call, so `calls` can exceed completed; those
@@ -1048,7 +1175,7 @@ const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "
 const DOWS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const HEAT_CHARS = ["·", "░", "▒", "▓", "█"];
 
-type HeatCell = { day: string; value: number; inRange: boolean };
+type HeatCell = { day: string; value: number; inRange: boolean; row: DayRow | null };
 type HeatGrid = {
   weeks: number;
   metric: HeatMetric;
@@ -1104,7 +1231,7 @@ function heatmapGrid(
         max = Math.max(max, value);
         total += value;
       }
-      cells.push({ day: key, value, inRange });
+      cells.push({ day: key, value, inRange, row: r ?? null });
     }
     const first = shiftDays(startSunday, col * 7);
     // Month labels sit in a single 12px column but render ~18px wide, so
@@ -1119,6 +1246,124 @@ function heatmapGrid(
     columns.push(cells);
   }
   return { weeks, metric, max, total, columns, months, start: startSunday, end: todayMid };
+}
+
+type DayModelUsage = UsageTotals & { model: string; events: number };
+type DayToolUsage = {
+  tool: string;
+  calls: number;
+  succeeded: number;
+  failed: number;
+  avgMs: number;
+  maxMs: number;
+};
+type DayBreakdown = { models: DayModelUsage[]; tools: DayToolUsage[] };
+
+function dayBreakdowns(database: AnyDatabase, grid: HeatGrid): Map<string, DayBreakdown> {
+  const start = dayKey(grid.start);
+  const end = dayKey(grid.end);
+  const result = new Map<string, DayBreakdown>();
+  const ensure = (day: string): DayBreakdown => {
+    let breakdown = result.get(day);
+    if (!breakdown) {
+      breakdown = { models: [], tools: [] };
+      result.set(day, breakdown);
+    }
+    return breakdown;
+  };
+  const models = database
+    .prepare(
+      `SELECT day, model, input, output, reasoning, cache_read, cache_write, cost, cost_computed, events
+       FROM daily_models
+       WHERE day >= ? AND day <= ?
+       ORDER BY day ASC, (input + output + reasoning + cache_read + cache_write) DESC, model ASC`,
+    )
+    .all(start, end) as Array<Record<string, unknown>>;
+  for (const row of models) {
+    const totals = totalsOf(row);
+    ensure(String(row.day ?? "")).models.push({
+      model: String(row.model ?? "unknown"),
+      ...totals,
+      events: num(row.events),
+    });
+  }
+  const tools = database
+    .prepare(
+      `SELECT day, tool, calls, succeeded, failed, total_ms, max_ms
+       FROM daily_tools
+       WHERE day >= ? AND day <= ?
+       ORDER BY day ASC, calls DESC, tool ASC`,
+    )
+    .all(start, end) as Array<Record<string, unknown>>;
+  for (const row of tools) {
+    const calls = num(row.calls);
+    ensure(String(row.day ?? "")).tools.push({
+      tool: String(row.tool ?? "unknown"),
+      calls,
+      succeeded: num(row.succeeded),
+      failed: num(row.failed),
+      avgMs: calls > 0 ? num(row.total_ms) / calls : 0,
+      maxMs: num(row.max_ms),
+    });
+  }
+  return result;
+}
+
+function tokenBreakdownText(t: UsageTotals): string {
+  return `input=${fmtInt(t.input)} output=${fmtInt(t.output)} reasoning=${fmtInt(t.reasoning)} cache_read=${fmtInt(t.cacheRead)} cache_write=${fmtInt(t.cacheWrite)}`;
+}
+
+function heatmapDayTitle(
+  row: DayRow,
+  metric: HeatMetric,
+  includeBackground: boolean,
+  breakdown: DayBreakdown | undefined,
+): string {
+  const background: UsageTotals = {
+    input: row.bg_input,
+    output: row.bg_output,
+    reasoning: row.bg_reasoning,
+    cacheRead: row.bg_cache_read,
+    cacheWrite: row.bg_cache_write,
+    cost: row.bg_cost,
+    costComputed: null,
+  };
+  const displayed: UsageTotals = includeBackground
+    ? {
+        input: row.input + background.input,
+        output: row.output + background.output,
+        reasoning: row.reasoning + background.reasoning,
+        cacheRead: row.cacheRead + background.cacheRead,
+        cacheWrite: row.cacheWrite + background.cacheWrite,
+        cost: row.cost + background.cost,
+        costComputed: row.costComputed,
+      }
+    : row;
+  const lines = [
+    `${row.day} — ${heatCellLabel(metricValue(row, metric, includeBackground), metric)} ${metric}`,
+    `Tokens: ${fmtInt(tokenTotal(displayed))} total`,
+    `  ${tokenBreakdownText(displayed)}`,
+  ];
+  if (includeBackground && tokenTotal(background) > 0) {
+    lines.push(`Background: ${fmtInt(tokenTotal(background))} tokens (${tokenBreakdownText(background)})`);
+  }
+  lines.push(`Tools: ${fmtInt(row.tool_calls)} calls (${fmtInt(row.tool_ok)} ok, ${fmtInt(row.tool_fail)} failed)`);
+  for (const tool of breakdown?.tools ?? []) {
+    lines.push(
+      `  ${tool.tool}: ${fmtInt(tool.calls)} calls (${fmtInt(tool.succeeded)} ok, ${fmtInt(tool.failed)} failed), avg ${Math.round(tool.avgMs)}ms, max ${fmtInt(tool.maxMs)}ms`,
+    );
+  }
+  lines.push(`Models: ${breakdown?.models.length ?? 0} used`);
+  for (const model of breakdown?.models ?? []) {
+    lines.push(
+      `  ${model.model}: ${fmtInt(tokenTotal(model))} tokens (${tokenBreakdownText(model)}), ${fmtInt(model.events)} events, cost ${fmtUsd(model.cost)}${model.costComputed === null ? "" : ` (list ${fmtUsd(model.costComputed)})`}`,
+    );
+  }
+  if ((breakdown?.models.length ?? 0) === 0) {
+    lines.push("  No per-model history was recorded for this day.");
+  }
+  lines.push(`Cost: ${fmtUsd(displayed.cost)} reported${includeBackground && row.bg_cost > 0 ? ` (including ${fmtUsd(row.bg_cost)} background)` : ""}`);
+  return lines.join("\n");
 }
 
 function heatmapText(database: AnyDatabase, weeks: number, metric: HeatMetric, includeBackground: boolean): string {
@@ -1152,7 +1397,11 @@ function heatCellLabel(value: number, metric: HeatMetric): string {
   return metric === "cost" ? fmtShortUsd(value) : fmtCompact(value);
 }
 
-function buildHeatmapHtml(grid: HeatGrid): string {
+function buildHeatmapHtml(
+  grid: HeatGrid,
+  breakdowns: Map<string, DayBreakdown>,
+  includeBackground: boolean,
+): string {
   const cells: string[] = [];
   for (let col = 0; col < grid.weeks; col++) {
     for (let row = 0; row < 7; row++) {
@@ -1160,8 +1409,10 @@ function buildHeatmapHtml(grid: HeatGrid): string {
       if (!cell) continue;
       const level = cell.inRange ? heatLevel(cell.value, grid.max) : 0;
       const cls = cell.inRange ? `hm-cell ${HEAT_COLORS[level]}` : "hm-cell hm-out";
-      const title = `${cell.day}: ${heatCellLabel(cell.value, grid.metric)} ${grid.metric}`;
-      cells.push(`<span class="${cls}" title="${escapeHtml(title)}"></span>`);
+      const title = cell.inRange && cell.row
+        ? heatmapDayTitle(cell.row, grid.metric, includeBackground, breakdowns.get(cell.day))
+        : `${cell.day}: no usage recorded`;
+      cells.push(`<span class="${cls}" tabindex="0" role="button" data-tooltip="${escapeHtml(title)}" aria-label="${escapeHtml(`${cell.day} usage details`)}"></span>`);
     }
   }
   const monthSpans = grid.months
@@ -1174,20 +1425,21 @@ function buildHeatmapHtml(grid: HeatGrid): string {
   const span = `${dayKey(grid.start)} → ${dayKey(grid.end)}`;
   return [
     `<!-- heatmap -->`,
-    `<div class="hm-wrap" role="img" aria-label="${escapeHtml(`activity heatmap ${span}, metric ${grid.metric}`)}">`,
-    `<div class="hm-months" style="grid-template-columns:repeat(${grid.weeks},12px)">${monthSpans}</div>`,
+    `<div class="hm-wrap" role="group" aria-label="${escapeHtml(`activity heatmap ${span}, metric ${grid.metric}`)}">`,
+    `<div class="hm-months" style="grid-template-columns:repeat(${grid.weeks},24px)">${monthSpans}</div>`,
     `<div class="hm-body">`,
     `<div class="hm-days">${dayLabels}</div>`,
-    `<div class="hm-grid" style="grid-template-columns:repeat(${grid.weeks},12px)">${cells.join("")}</div>`,
+    `<div class="hm-grid" style="grid-template-columns:repeat(${grid.weeks},24px)">${cells.join("")}</div>`,
     `</div>`,
     `</div>`,
     `<div class="hm-legend"><span class="muted">Less</span>${legend}<span class="muted">More</span><span class="hm-max">peak ${escapeHtml(heatCellLabel(grid.max, grid.metric))}</span></div>`,
   ].join("");
 }
 
-function buildBarChartHtml(rows: DayRow[], includeBackground: boolean): string {
+/** US-4: the bar chart follows the configured metric instead of hardcoding tokens. */
+function buildBarChartHtml(rows: DayRow[], includeBackground: boolean, metric: HeatMetric): string {
   const last = rows.slice(-30);
-  const values = last.map((r) => metricValue(r, "tokens", includeBackground));
+  const values = last.map((r) => metricValue(r, metric, includeBackground));
   const max = Math.max(1, ...values);
   const w = 760;
   const h = 220;
@@ -1215,10 +1467,28 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean): string {
     .map((r, i) => {
       const v = values[i] ?? 0;
       const bh = Math.max(0, Math.round((v / max) * plotH));
+      const visibleHeight = Math.max(4, bh);
       const x = padL + i * step + (step - barW) / 2;
-      const y = padT + plotH - bh;
+      const y = padT + plotH - visibleHeight;
       const rx = Math.min(3, barW / 2);
-      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${bh}" rx="${rx.toFixed(1)}" class="bar"><title>${escapeHtml(`${r.day}: ${fmtInt(v)} tokens`)}</title></rect>`;
+      const backgroundTokens = r.bg_input + r.bg_output + r.bg_reasoning + r.bg_cache_read + r.bg_cache_write;
+      const barTokens = tokenTotal(r) + (includeBackground ? backgroundTokens : 0);
+      const barTitle = [
+        `${r.day}: ${fmtInt(barTokens)} tokens`,
+        `  ${tokenBreakdownText(includeBackground ? {
+          input: r.input + r.bg_input,
+          output: r.output + r.bg_output,
+          reasoning: r.reasoning + r.bg_reasoning,
+          cacheRead: r.cacheRead + r.bg_cache_read,
+          cacheWrite: r.cacheWrite + r.bg_cache_write,
+          cost: 0,
+          costComputed: null,
+        } : r)}`,
+        ...(metric === "tokens"
+          ? []
+          : [metric === "cost" ? `  ${heatCellLabel(v, "cost")} cost` : `  ${fmtInt(v)} tool calls`]),
+      ].join("\n");
+      return `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${visibleHeight}" rx="${rx.toFixed(1)}" class="bar" tabindex="0" focusable="true" role="button" data-tooltip="${escapeHtml(barTitle)}" aria-label="${escapeHtml(`${r.day} usage details`)}"></rect>`;
     })
     .join("");
 
@@ -1234,7 +1504,7 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean): string {
 
   return [
     `<!-- bar-chart -->`,
-    `<svg class="bars" viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="xMidYMid meet" role="img" aria-label="tokens per day over the last 30 days">`,
+    `<svg class="bars" viewBox="0 0 ${w} ${h}" width="100%" preserveAspectRatio="xMidYMid meet" role="group" aria-label="${metric} per day over the last 30 days">`,
     gridLines,
     rects,
     `<line x1="${padL}" y1="${padT + plotH}" x2="${w - padR}" y2="${padT + plotH}" class="axis-line"/>`,
@@ -1243,7 +1513,12 @@ function buildBarChartHtml(rows: DayRow[], includeBackground: boolean): string {
   ].join("");
 }
 
-function tableHtml(headers: string[], rows: Cell[][]): string {
+function tableHtml(
+  headers: string[],
+  rows: Cell[][],
+  rowAttributes: Array<string | undefined> = [],
+  tableId?: string,
+): string {
   const cell = (c: Cell, tag: "th" | "td", num: boolean): string => {
     const cls = num ? ' class="num"' : "";
     return typeof c === "string"
@@ -1253,9 +1528,15 @@ function tableHtml(headers: string[], rows: Cell[][]): string {
   const head = headers.map((x, i) => cell(x, "th", i > 0)).join("");
   const body =
     rows.length > 0
-      ? rows.map((r) => `<tr>${r.map((c, i) => cell(c, "td", i > 0)).join("")}</tr>`).join("")
+      ? rows
+          .map((r, rowIndex) => {
+            const attrs = rowAttributes[rowIndex] ? ` ${rowAttributes[rowIndex]}` : "";
+            return `<tr${attrs}>${r.map((c, i) => cell(c, "td", i > 0)).join("")}</tr>`;
+          })
+          .join("")
       : `<tr><td colspan="${headers.length}" class="muted">No data yet</td></tr>`;
-  return `<div class="tbl-wrap"><table class="tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+  const idAttribute = tableId ? ` id="${escapeHtml(tableId)}"` : "";
+  return `<div class="tbl-wrap"><table${idAttribute} class="tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
 type AppInfo = { name?: string; version?: string; channel?: string };
@@ -1272,6 +1553,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
   const sessions = countSessions(database);
   const bg = backgroundTotals(database);
   const grid = heatmapGrid(database, cfg.heatmapWeeks, cfg.heatmapMetric, cfg.includeBackground);
+  const breakdowns = dayBreakdowns(database, grid);
   const recent = dailyRows(database, dayKey(shiftDays(new Date(), -29)));
   // Success rate is measured over completed calls (ok + fail). Older rows
   // counted every started call, so `calls` can exceed completed; those
@@ -1297,14 +1579,13 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ];
   });
 
-  const modelRows = (
-    database
-      .prepare(
-        `SELECT * FROM model_totals
-         ORDER BY (input + output + reasoning + cache_read + cache_write) DESC, model ASC LIMIT 20`,
-      )
-      .all() as Array<Record<string, unknown>>
-  ).map((r) => {
+  const modelRecords = database
+    .prepare(
+      `SELECT * FROM model_totals
+       ORDER BY (input + output + reasoning + cache_read + cache_write) DESC, model ASC`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  const modelRows = modelRecords.map((r) => {
     const t = totalsOf(r);
     const model = String(r.model);
     const slash = model.indexOf("/");
@@ -1322,6 +1603,24 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
       compactCell(num(r.events)),
     ];
   });
+  const modelAttributes = modelRecords.map(
+    (r) => `data-model="${escapeHtml(String(r.model ?? "unknown"))}"`,
+  );
+  const modelOptions = modelRecords
+    .map((r) => {
+      const model = String(r.model ?? "unknown");
+      const slash = model.indexOf("/");
+      const provider = slash >= 0 ? model.slice(0, slash) : "";
+      return `<option value="${escapeHtml(model)}" data-search="${escapeHtml(`${model} ${provider}`)}">${escapeHtml(model)}</option>`;
+    })
+    .join("");
+  const modelFilterHtml = [
+    `<div class="model-filter">`,
+    `<label class="model-filter-field" for="model-filter-search"><span>Search models</span><input id="model-filter-search" type="search" autocomplete="off" placeholder="Model or provider" /></label>`,
+    `<label class="model-filter-field" for="model-filter"><span>Selected models</span><select id="model-filter" multiple size="5">${modelOptions}</select></label>`,
+    `<div class="model-filter-actions"><button type="button" id="model-filter-all">Select all</button><button type="button" id="model-filter-clear">Clear</button><span id="model-filter-status" class="muted" aria-live="polite">${fmtInt(modelRecords.length)} models</span><span id="model-filter-empty" class="muted" hidden>No models match</span></div>`,
+    `</div>`,
+  ].join("");
 
   const sourceRows = (
     database
@@ -1366,7 +1665,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ":root{--font-display:Georgia,'Iowan Old Style','Times New Roman',serif;--font-text:ui-monospace,'SF Mono','Cascadia Code',Menlo,Consolas,monospace;",
     "--step--1:0.75rem;--step-0:1rem;--step-1:1.333rem;--step-2:1.777rem;--step-3:2.369rem;--step-4:3.157rem;--step-5:4.209rem;",
     "--space-3xs:0.25rem;--space-2xs:0.5rem;--space-xs:0.75rem;--space-s:1rem;--space-m:1.5rem;--space-l:2rem;--space-xl:3rem;--space-2xl:4.5rem;--space-3xl:7rem;",
-    "--base:#f4f1ea;--surface:#fdfcf7;--surface-2:#ece5d3;--line:#d9d1c1;--ink:#161310;--ink-2:#575046;--ink-3:#7a7368;",
+    "--base:#f4f1ea;--surface:#fdfcf7;--surface-2:#ece5d3;--line:#d9d1c1;--ink:#161310;--ink-2:#575046;--ink-3:#726b61;",
     "--accent:#a92c1a;--accent-deep:#7e1f12;--ok:#1e6b3a;",
     "--hm0:#e5ddcb;--hm1:#d8b9a5;--hm2:#d08a6d;--hm3:#c15535;--hm4:#9e2a16;",
     "--radius:0;--shadow:none}",
@@ -1402,22 +1701,28 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ".panel-head h2::before{content:'0' counter(section) ' — ';color:var(--accent);font-weight:400}",
     ".sub{color:var(--ink-3);font-size:var(--step--1)}",
     ".muted{color:var(--ink-3)}",
-    ".grid2{display:grid;grid-template-columns:5fr 7fr;gap:var(--space-xl)}",
+    ".grid2{display:grid;grid-template-columns:5fr 7fr;gap:var(--space-xl);min-width:0}",
+    ".grid2>.panel{min-width:0}",
     "@media (max-width:60em){.grid2{grid-template-columns:1fr}.wrap{padding:var(--space-s) var(--space-s) var(--space-xl)}.kpi:first-child .v{font-size:var(--step-3)}}",
     ".hm-wrap{display:inline-block;max-width:100%;overflow-x:auto;padding-bottom:var(--space-2xs)}",
-    ".hm-months{display:grid;gap:3px;margin-left:30px;height:14px;font-size:10px;color:var(--ink-3);align-items:end;text-transform:uppercase;letter-spacing:.06em}",
+    ".hm-months{display:grid;gap:0;margin-left:30px;height:14px;font-size:10px;color:var(--ink-3);align-items:end;text-transform:uppercase;letter-spacing:.06em}",
     ".hm-months span{white-space:nowrap}",
     ".hm-body{display:flex;gap:6px;margin-top:4px}",
-    ".hm-days{display:grid;grid-template-rows:repeat(7,12px);gap:3px;width:24px;font-size:10px;color:var(--ink-3);text-align:right;line-height:12px}",
-    ".hm-grid{display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,12px);gap:3px}",
-    ".hm-cell{display:block;width:12px;height:12px;border-radius:0;border:1px solid var(--line)}",
-    ".hm-out{background:transparent;opacity:1;border:1px dashed var(--line)}",
-    ".hm-l0{background:var(--hm0)}.hm-l1{background:var(--hm1)}.hm-l2{background:var(--hm2)}.hm-l3{background:var(--hm3)}.hm-l4{background:var(--hm4)}",
+    ".hm-days{display:grid;grid-template-rows:repeat(7,24px);gap:0;width:24px;font-size:10px;color:var(--ink-3);text-align:right;line-height:24px}",
+    ".hm-grid{display:grid;grid-auto-flow:column;grid-template-rows:repeat(7,24px);gap:0}",
+    ".hm-cell{position:relative;display:grid;place-items:center;width:24px;height:24px;background:transparent;border:0;cursor:pointer}",
+    ".hm-cell::before{content:\"\";display:block;width:12px;height:12px;background:var(--hm0);border:1px solid var(--line);border-radius:0}",
+    ".hm-out::before{background:transparent;border:1px dashed var(--line)}",
+    ".hm-cell.hm-l0::before{background:var(--hm0)}.hm-cell.hm-l1::before{background:var(--hm1)}.hm-cell.hm-l2::before{background:var(--hm2)}.hm-cell.hm-l3::before{background:var(--hm3)}.hm-cell.hm-l4::before{background:var(--hm4)}",
     ".hm-legend{display:flex;align-items:center;gap:5px;margin-top:var(--space-s);font-size:11.5px;color:var(--ink-3)}",
     ".hm-legend i{width:12px;height:12px;border-radius:0;display:inline-block;border:1px solid var(--line)}",
     ".hm-max{margin-left:auto;font-variant-numeric:tabular-nums}",
     ".bars{display:block;width:100%;height:auto;overflow:visible}",
-    ".bar{fill:var(--ink);opacity:1}.bar:hover{fill:var(--accent)}.bar:last-of-type{fill:var(--accent)}",
+    ".bar{fill:var(--ink);opacity:1;cursor:pointer}.bar:hover,.bar:focus-visible{fill:var(--accent)}.bar:last-of-type{fill:var(--accent)}",
+    ".hm-cell{cursor:pointer}",
+    "[data-tooltip]{cursor:help}",
+    ".usage-tooltip{position:fixed;z-index:100;width:max-content;max-width:min(36rem,calc(100vw - 1.5rem));max-height:min(32rem,calc(100vh - 1.5rem));overflow:auto;padding:var(--space-s);background:var(--surface);border:1px solid var(--ink);border-left:3px solid var(--accent);box-shadow:5px 5px 0 var(--surface-2);color:var(--ink);font:400 var(--step--1)/1.55 var(--font-text);white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:auto;overscroll-behavior:contain}",
+    ".usage-tooltip[hidden]{display:none}",
     ".gl{stroke:var(--line);stroke-width:1}",
     ".axis{fill:var(--ink-3);font-size:10.5px;font-family:var(--font-text);font-variant-numeric:tabular-nums}",
     ".axis-line{stroke:var(--ink);stroke-width:1}",
@@ -1427,10 +1732,81 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ".tbl thead th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-3);font-weight:700;border-bottom:1px solid var(--ink)}",
     ".tbl td.num,.tbl th.num{text-align:right;white-space:nowrap}",
     ".tbl tbody tr:last-child td{border-bottom:0}",
+    ".model-filter{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.5fr);align-items:start;gap:var(--space-s);margin:0 0 var(--space-s)}",
+    ".model-filter-field{display:grid;gap:var(--space-3xs);min-width:0}",
+    ".model-filter-field span{font-size:var(--step--1);text-transform:uppercase;letter-spacing:.06em;color:var(--ink-2)}",
+    ".model-filter input,.model-filter select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--ink-2);border-radius:0;padding:var(--space-3xs) var(--space-2xs);min-width:0}",
+    ".model-filter input{width:100%}",
+    ".model-filter select{width:100%;min-height:7rem}",
+    ".model-filter-actions{grid-column:1/-1;display:flex;align-items:center;gap:var(--space-2xs);flex-wrap:wrap;padding-bottom:var(--space-3xs)}",
+    ".model-filter-actions button{font:inherit;color:var(--ink);background:transparent;border:1px solid var(--ink);border-radius:0;padding:var(--space-3xs) var(--space-2xs);cursor:pointer}",
+    ".model-filter-actions button:hover,.model-filter-actions button:focus-visible{background:var(--ink);color:var(--surface)}",
+    ".model-filter .muted{font-size:var(--step--1);color:var(--ink-2)}",
+    "@media (max-width:60em){.model-filter{grid-template-columns:1fr}.model-filter-actions{padding-bottom:0}}",
     ".bg-panel{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--surface);padding:var(--space-s) var(--space-m);border-top:2px solid var(--ink)}",
     "p.sub{max-width:68ch}",
     ":focus-visible{outline:2px solid var(--accent);outline-offset:2px}",
     "footer{color:var(--ink-3);font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;text-align:left;border-top:3px double var(--ink);padding:var(--space-xs) 0 0}",
+  ].join("\n");
+
+  const tooltipScript = [
+    `<script>`,
+    `(function(){`,
+    `var tooltip=document.getElementById("usage-tooltip");`,
+    `if(!tooltip)return;`,
+    `var active=null;`,
+    `var pinned=false;`,
+    `var returnFocus=null;`,
+    `var returning=false;`,
+    `var hideTimer;`,
+    `function position(target){tooltip.style.left="0px";tooltip.style.top="0px";var box=target.getBoundingClientRect();var gap=10;var edge=12;var width=tooltip.offsetWidth;var height=tooltip.offsetHeight;var left=box.left+box.width/2-width/2;var top=box.bottom+gap;left=Math.max(edge,Math.min(left,window.innerWidth-width-edge));if(top+height>window.innerHeight-edge)top=box.top-height-gap;top=Math.max(edge,Math.min(top,window.innerHeight-height-edge));tooltip.style.left=left+"px";tooltip.style.top=top+"px";}`,
+    `function hide(){var focusTarget=returnFocus;var restoreFocus=!!(focusTarget&&document.activeElement===tooltip);if(active)active.removeAttribute("aria-describedby");active=null;pinned=false;returnFocus=null;tooltip.hidden=true;tooltip.setAttribute("aria-hidden","true");if(restoreFocus){returning=true;focusTarget.focus();setTimeout(function(){returning=false;},0);}}`,
+    `function show(target,pin,keyboard){var text=target.getAttribute("data-tooltip");if(!text||returning)return;clearTimeout(hideTimer);if(active&&active!==target)active.removeAttribute("aria-describedby");active=target;pinned=pin===true;returnFocus=keyboard?target:null;tooltip.textContent=text;tooltip.hidden=false;tooltip.setAttribute("aria-hidden","false");target.setAttribute("aria-describedby","usage-tooltip");position(target);if(keyboard)tooltip.focus();}`,
+    `function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(function(){if(!pinned&&document.activeElement!==active&&!tooltip.matches(":hover"))hide();},120);}`,
+    `function toggle(target,keyboard){if(active===target&&pinned)hide();else show(target,true,keyboard);}`,
+    `function bind(target){target.addEventListener("mouseenter",function(){show(target,false);});target.addEventListener("mouseleave",function(){scheduleHide();});target.addEventListener("focus",function(){if(target.classList.contains("hm-cell"))setHeatIndex(target);if(!returning)show(target,false);});target.addEventListener("blur",function(){scheduleHide();});target.addEventListener("click",function(event){event.stopPropagation();toggle(target,false);});target.addEventListener("keydown",function(event){if(event.key==="Escape"){hide();}else if(event.key==="Enter"||event.key===" "){event.preventDefault();toggle(target,true);}});}`,
+    `var heatCells=Array.prototype.slice.call(document.querySelectorAll(".hm-grid .hm-cell"));`,
+    `var heatIndex=0;`,
+    `function setHeatIndex(target){var index=heatCells.indexOf(target);if(index<0)return;heatIndex=index;heatCells.forEach(function(cell,i){cell.tabIndex=i===heatIndex?0:-1;});}`,
+    `function focusHeatCell(index){if(!heatCells.length)return;heatIndex=Math.max(0,Math.min(heatCells.length-1,index));setHeatIndex(heatCells[heatIndex]);heatCells[heatIndex].focus();}`,
+    `if(heatCells.length){heatCells.forEach(function(cell){cell.tabIndex=-1;});heatCells[0].tabIndex=0;heatCells.forEach(function(cell,index){cell.addEventListener("keydown",function(event){var next=index;if(event.key==="ArrowLeft")next--;else if(event.key==="ArrowRight")next++;else if(event.key==="ArrowUp")next-=7;else if(event.key==="ArrowDown")next+=7;else if(event.key==="Home")next=0;else if(event.key==="End")next=heatCells.length-1;else return;event.preventDefault();focusHeatCell(next);});});}`,
+    `document.querySelectorAll("[data-tooltip]").forEach(bind);`,
+    `function updateScrollableTables(){document.querySelectorAll(".tbl-wrap").forEach(function(wrapper){if(wrapper.scrollWidth>wrapper.clientWidth){var panel=wrapper.closest(".panel");var heading=panel&&panel.querySelector("h2");wrapper.tabIndex=0;wrapper.setAttribute("role","region");wrapper.setAttribute("aria-label",heading?heading.textContent+" table, scrollable":"Scrollable table");}else{wrapper.removeAttribute("tabindex");wrapper.removeAttribute("role");wrapper.removeAttribute("aria-label");}});}`,
+    `updateScrollableTables();`,
+    `tooltip.addEventListener("mouseenter",function(){clearTimeout(hideTimer);});`,
+    `tooltip.addEventListener("mouseleave",function(){scheduleHide();});`,
+    `document.addEventListener("click",function(event){if(!(event.target instanceof Element)||(!event.target.closest("[data-tooltip]")&&!tooltip.contains(event.target)))hide();});`,
+    `document.addEventListener("keydown",function(event){if(event.key==="Escape")hide();});`,
+    `window.addEventListener("resize",function(){updateScrollableTables();if(active)position(active);});`,
+    `})();`,
+    `</script>`,
+  ].join("\n");
+
+  const modelFilterScript = [
+    `<script>`,
+    `(function(){`,
+    `var search=document.getElementById("model-filter-search");`,
+    `var select=document.getElementById("model-filter");`,
+    `var all=document.getElementById("model-filter-all");`,
+    `var clear=document.getElementById("model-filter-clear");`,
+    `var status=document.getElementById("model-filter-status");`,
+    `var empty=document.getElementById("model-filter-empty");`,
+    `var table=document.getElementById("models-table");`,
+    `if(!search||!select||!all||!clear||!status||!empty||!table)return;`,
+    `var rows=Array.prototype.slice.call(table.querySelectorAll("tbody tr[data-model]"));`,
+    `var allOptions=Array.prototype.slice.call(select.options);`,
+    `var selectedValues=new Set();`,
+    `function matchesOption(option,query){return !query||(option.getAttribute("data-search")||"").toLowerCase().indexOf(query)>=0;}`,
+    `function updateOptions(){var query=search.value.trim().toLowerCase();var fragment=document.createDocumentFragment();var matches=0;allOptions.forEach(function(option){if(!matchesOption(option,query))return;matches++;option.selected=selectedValues.has(option.value);option.disabled=false;fragment.appendChild(option);});select.textContent="";select.appendChild(fragment);return matches;}`,
+    `function selectedModels(){return Array.from(selectedValues);}`,
+    `function apply(){var query=search.value.trim().toLowerCase();var matches=updateOptions();var selected=selectedModels();var selectedSet=new Set(selected);var visible=0;rows.forEach(function(row){var match=selected.length===0||selectedSet.has(row.getAttribute("data-model"));row.hidden=!match;if(match)visible++;});var noResults=query!==""&&matches===0;empty.hidden=!noResults;status.textContent=noResults?"No models match":selected.length?(selected.length+" of "+allOptions.length+" models selected"):(visible===1?"1 model":visible+" models");}`,
+    `search.addEventListener("input",apply);`,
+    `select.addEventListener("change",function(){Array.prototype.slice.call(select.options).forEach(function(option){if(option.selected)selectedValues.add(option.value);else selectedValues.delete(option.value);});apply();});`,
+    `all.addEventListener("click",function(){var query=search.value.trim().toLowerCase();allOptions.forEach(function(option){if(matchesOption(option,query))selectedValues.add(option.value);});apply();});`,
+    `clear.addEventListener("click",function(){selectedValues.clear();apply();});`,
+    `apply();`,
+    `})();`,
+    `</script>`,
   ].join("\n");
 
   return [
@@ -1451,11 +1827,11 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `<section class="kpis">${cardsHtml}</section>`,
     `<section class="panel">`,
     `<div class="panel-head"><h2>Activity</h2><span class="sub">last ${grid.weeks} weeks · metric: ${escapeHtml(grid.metric)}</span></div>`,
-    buildHeatmapHtml(grid),
+    buildHeatmapHtml(grid, breakdowns, cfg.includeBackground),
     `</section>`,
     `<section class="panel">`,
-    `<div class="panel-head"><h2>Tokens per day</h2><span class="sub">last 30 days</span></div>`,
-    buildBarChartHtml(recent, cfg.includeBackground),
+    `<div class="panel-head"><h2>Activity per day</h2><span class="sub">last 30 days · metric: ${escapeHtml(cfg.heatmapMetric)}</span></div>`,
+    buildBarChartHtml(recent, cfg.includeBackground, cfg.heatmapMetric),
     `</section>`,
     `<div class="grid2">`,
     `<section class="panel">`,
@@ -1464,9 +1840,12 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `</section>`,
     `<section class="panel">`,
     `<div class="panel-head"><h2>Models</h2><span class="sub">$/M list rates</span></div>`,
+    modelFilterHtml,
     tableHtml(
       ["model", "provider", "in $/M", "out $/M", "tokens", "cost", "cost (list)", "events"],
       modelRows,
+      modelAttributes,
+      "models-table",
     ),
     `</section>`,
     `</div>`,
@@ -1481,6 +1860,9 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
       `list-price column shows the API-equivalent value. Unknown prices render <b>—</b>, never $0.</p>`,
     `<footer>lifetime: ${escapeHtml(lifetimeSummaryLine(database))} · usage-stats</footer>`,
     `</div>`,
+    `<div id="usage-tooltip" class="usage-tooltip" role="tooltip" tabindex="-1" aria-hidden="true" hidden></div>`,
+    tooltipScript,
+    modelFilterScript,
     "</body></html>",
   ].join("\n");
 }
@@ -1492,6 +1874,9 @@ function renderDashboard(
   state: UsageState,
 ): { path: string; bytes: number; summary: string } {
   const html = buildDashboardHtml(database, cfg, app, state);
+  // US-5: intentionally synchronous — this runs on the render path (command
+  // or 60s interval), writes a single small file, and keeping it sync avoids
+  // interleaved dashboard writes from overlapping renders.
   mkdirSync(cfg.dir, { recursive: true });
   const path = join(cfg.dir, DASHBOARD_NAME);
   writeFileSync(path, html, "utf8");
@@ -1507,12 +1892,20 @@ function renderDashboard(
 function openInBrowser(filePath: string): boolean {
   if (process.env.OPENCODE_USAGE_STATS_NO_OPEN) return false;
   try {
+    // US-2: never pass the path through a shell (cmd /c start re-parses
+    // metacharacters such as `&` — a command-injection vector). Launch the
+    // opener directly with an argv list, and swallow async spawn failures so
+    // they cannot crash the host as an unhandled "error" event.
     const child =
       process.platform === "win32"
-        ? spawn("cmd", ["/c", "start", "", filePath], { detached: true, stdio: "ignore" })
+        ? spawn("powershell", ["-NoProfile", "-Command", "Start-Process", "-FilePath", filePath], {
+            detached: true,
+            stdio: "ignore",
+          })
         : process.platform === "darwin"
           ? spawn("open", [filePath], { detached: true, stdio: "ignore" })
           : spawn("xdg-open", [filePath], { detached: true, stdio: "ignore" });
+    child.on("error", () => {});
     child.unref?.();
     return true;
   } catch {
@@ -1538,6 +1931,9 @@ export default Plugin.define({
     try {
       getDb(state, cfg);
     } catch (err) {
+      // US-7: unconditional (not cfg.log-gated), rate-limited — a dead db
+      // must not silently stop recording.
+      logDbError(`db init failed: ${String(err)}`);
       log(`db init failed: ${String(err)}`);
     }
 
@@ -1587,11 +1983,17 @@ export default Plugin.define({
         try {
           const key = String(event.id ?? "");
           if (!key) return;
-          // U5: sweep orphaned entries (execute.after never arrived) so the
-          // map cannot grow without bound in long-lived servers.
-          const cutoff = Date.now() - 600_000;
-          for (const [k, v] of state.pending) {
-            if (v.startedMs < cutoff) state.pending.delete(k);
+          // U5/US-6: sweep orphaned entries (execute.after never arrived) so the
+          // map cannot grow without bound in long-lived servers. The full
+          // scan is threshold-gated — it only runs when the map is large or
+          // a minute has passed since the last sweep, not on every tool call.
+          const now = Date.now();
+          if (state.pending.size > 500 || now - state.lastPendingSweep > 60_000) {
+            state.lastPendingSweep = now;
+            const cutoff = now - 600_000;
+            for (const [k, v] of state.pending) {
+              if (v.startedMs < cutoff) state.pending.delete(k);
+            }
           }
           state.pending.set(key, { tool: String(event.tool ?? "unknown"), startedMs: Date.now() });
         } catch (err) {

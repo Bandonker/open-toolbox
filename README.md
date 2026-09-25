@@ -69,25 +69,233 @@ cd .opencode && npm install
 
 ## Plugins
 
+Click any plugin name to jump to its expandable documentation below.
+
 | Plugin | Tools | Description |
 | :-- | :--: | :-- |
-| **[opencode-sessions](opencode-sessions/README.md)** | 7 | Spawn child sessions, wait for them, read results, send follow-ups, answer permission prompts, cancel them — and **hand off the current working point into a fresh session**. Created sessions are real opencode sessions, so they show up in the Desktop session switcher as if you'd pressed `+`. |
-| **decision-log** | 5 | Record and search architectural decisions in a local SQLite FTS5 database. `decision_log`, `decision_search`, `decision_list`, `decision_get`, `decision_update`. |
-| **error-journal** | 5 | Log errors with context, search past ones, and record resolutions so you stop re-debugging the same failure. |
-| **snippet-library** | 5 | Save reusable code snippets and search them by language, tag, or full text. |
-| **codebase-index** | 4 | Index a codebase directory and run BM25-ranked full-text search over it. |
-| **tool-audit** | 3 | Flight recorder for every tool call: tool, args, status, duration and error land in a local SQLite DB, searchable with `trace_query`, summarised with `trace_stats`, exportable with `trace_export`. Secrets in arguments are redacted before they touch disk. |
-| **command-pack** | — | Registers 7 slash commands so the pack is one keystroke away (see [Commands](#commands)). |
-| **context-pruner** | 1 | Token-accurate context compiler: trims stale tool output out of the request only (`session.hook("context")`), plans changes once per epoch so the prompt-cache prefix stays stable, dedupes and purges stale output, and never touches the transcript on disk. `context_pruner_stats` shows what it trimmed; `context_report` shows budget, epoch, cache hit ratio and active decisions; `context_pruner_recall` returns a pruned output on demand so it need not be re-run. |
-| **session-export** | 2 | Dump a session transcript to markdown / json / jsonl / text with a model + message/tool/token/cost header, role and tool filters, optional reasoning, per-part truncation, secret redaction with home-path rewriting, and safe non-overwriting filenames. `session_export` writes a file (or returns it inline); `session_export_info` reports config and the last export. |
-| **memory** | 5 | Local-first long-term memory in SQLite FTS5 — `memory_remember`, `memory_recall`, `memory_forget`, `memory_list`, `memory_stats`. No embedding API, no cloud, no network. Relevant memories are auto-injected into each request (`session.hook("context")`) within a hard character budget, deduped per session. DB at `~/.opencode-plugins/memory/memory.db`. |
-| **goal** | 3 | Set an objective for a session and keep working until it is actually reached. `/goal <objective>` (add `- ` lines for success criteria) starts the loop; the goal is re-injected into every request (`session.hook("context")`) so it survives long turns, and when a turn ends the model is auto-continued (`session.prompt`) with the remaining budget. The loop stops only on `goal_complete` (with evidence) or `goal_blocked`, a user interrupt (which pauses), a detected stall (turns that run no tools and repeat themselves), a failure streak, or the iteration/time budget. Goal state is persisted per session, so it survives a plugin reload. Tools: `goal_complete`, `goal_blocked`, `goal_progress`. |
-| **secret-shield** | 4 | v2-native secret detector and redactor. Scrubs the **outbound HTTP body** (session-title, compaction and generate calls), the prompt, tool arguments/results and child-process env; `observe`/`redact`/`block` modes, 69 high-precision rules plus a Shannon-entropy fallback, allowlist precedence, and a hashed JSONL audit that never stores the value. Tools: `secret_shield_scan`, `secret_shield_stats`, `secret_shield_shape`, `secret_shield_keys`. |
-| **strip-skills-catalog** | — | Strips the `<available_skills>` catalog from the system prompt to save tokens. The `skill` tool still works on demand — agents can call it by name. |
-| **usage-stats** | 5 | Lifetime token / dollar / tool accounting in local SQLite. Cumulative `session.usage.updated` totals are delta-attributed to the session's current model; `title`/`compaction` spend is tracked separately as background. `stats_summary`, `stats_tools`, `stats_tokens`, `stats_heatmap` and `/stats` expose the numbers; `stats_dashboard` writes a self-contained HTML dashboard (heatmap + bar chart + tables) to `~/.opencode-plugins/usage-stats/dashboard.html`. |
+| **[opencode-sessions](#plugin-opencode-sessions)** | 7 | Spawn child sessions, wait for them, read results, send follow-ups, answer permission prompts, cancel them — and **hand off the current working point into a fresh session**. Created sessions are real opencode sessions, so they show up in the Desktop session switcher as if you'd pressed `+`. |
+| **[decision-log](#plugin-decision-log)** | 5 | Record and search architectural decisions in a local SQLite FTS5 database. `decision_log`, `decision_search`, `decision_list`, `decision_get`, `decision_update`. |
+| **[error-journal](#plugin-error-journal)** | 5 | Log errors with context, search past ones, and record resolutions so you stop re-debugging the same failure. |
+| **[snippet-library](#plugin-snippet-library)** | 5 | Save reusable code snippets and search them by language, tag, or full text. |
+| **[codebase-index](#plugin-codebase-index)** | 4 | Index a codebase directory and run BM25-ranked full-text search over it. |
+| **[tool-audit](#plugin-tool-audit)** | 3 | Flight recorder for every tool call: tool, args, status, duration and error land in a local SQLite DB, searchable with `trace_query`, summarised with `trace_stats`, exportable with `trace_export`. Secrets in arguments are redacted before they touch disk. |
+| **[command-pack](#plugin-command-pack)** | — | Registers 7 slash commands so the pack is one keystroke away (see [Commands](#commands)). |
+| **[context-pruner](#plugin-context-pruner)** | 1 | Token-accurate context compiler: trims stale tool output out of the request only (`session.hook("context")`), plans changes once per epoch so the prompt-cache prefix stays stable, dedupes and purges stale output, and never touches the transcript on disk. `context_pruner_stats` shows what it trimmed; `context_report` shows budget, epoch, cache hit ratio and active decisions; `context_pruner_recall` returns a pruned output on demand so it need not be re-run. |
+| **[session-export](#plugin-session-export)** | 2 | Dump a session transcript to markdown / json / jsonl / text with a model + message/tool/token/cost header, role and tool filters, optional reasoning, per-part truncation, secret redaction with home-path rewriting, and safe non-overwriting filenames. `session_export` writes a file (or returns it inline); `session_export_info` reports config and the last export. |
+| **[memory](#plugin-memory)** | 5 | Local-first long-term memory in SQLite FTS5 — `memory_remember`, `memory_recall`, `memory_forget`, `memory_list`, `memory_stats`. No embedding API, no cloud, no network. Relevant memories are auto-injected into each request (`session.hook("context")`) within a hard character budget, deduped per session. DB at `~/.opencode-plugins/memory/memory.db`. |
+| **[goal](#plugin-goal)** | 3 | Set an objective for a session and keep working until it is actually reached. `/goal <objective>` (add `- ` lines for success criteria) starts the loop; the goal is re-injected into every request (`session.hook("context")`) so it survives long turns, and when a turn ends the model is auto-continued (`session.prompt`) with the remaining budget. The loop stops only on `goal_complete` (with evidence) or `goal_blocked`, a user interrupt (which pauses), a detected stall (turns that run no tools and repeat themselves), a failure streak, or the iteration/time budget. Goal state is persisted per session, so it survives a plugin reload. Tools: `goal_complete`, `goal_blocked`, `goal_progress`. |
+| **[secret-shield](#plugin-secret-shield)** | 4 | v2-native secret detector and redactor. Scrubs the **outbound HTTP body** (session-title, compaction and generate calls), the prompt, tool arguments/results and child-process env; `observe`/`redact`/`block` modes, 69 high-precision rules plus a Shannon-entropy fallback, allowlist precedence, and a hashed JSONL audit that never stores the value. Tools: `secret_shield_scan`, `secret_shield_stats`, `secret_shield_shape`, `secret_shield_keys`. |
+| **[finish-guard](#plugin-finish-guard)** | — | Normalises OpenAI-compatible SSE streams at the `session.hook("http.response")` seam so a content/reasoning/tool delta that arrives *after* the `finish_reason` chunk cannot abort the turn. Fixes `AI.Error.InvalidProviderOutput: OpenAI Chat received content after the finish reason` (and the `Failed to drain Session` cascade) from reasoning models behind strict OpenAI-compatible gateways. |
+| **[strip-skills-catalog](#plugin-strip-skills-catalog)** | — | Strips the `<available_skills>` catalog from the system prompt to save tokens. The `skill` tool still works on demand — agents can call it by name. |
+| **[usage-stats](#plugin-usage-stats)** | 5 | Lifetime token / dollar / tool accounting in local SQLite. Cumulative `session.usage.updated` totals are delta-attributed to the session's current model; `title`/`compaction` spend is tracked separately as background. `stats_summary`, `stats_tools`, `stats_tokens`, `stats_heatmap` and `/stats` expose the numbers; `stats_dashboard` writes a self-contained HTML dashboard (heatmap + bar chart + tables) to `~/.opencode-plugins/usage-stats/dashboard.html`. |
 
 > All SQLite-backed plugins use `bun:sqlite` when available and fall back to
 > `node:sqlite`. Databases land in `~/.opencode-plugins/`.
+
+## Plugin details
+
+Expand a plugin to read its purpose and key capabilities. Configuration options
+are documented in [Configuration](#configuration).
+
+<a id="plugin-opencode-sessions"></a>
+<details>
+<summary><strong>opencode-sessions</strong> — session orchestration and handoff</summary>
+
+Spawn child sessions, wait for their results, send follow-ups, answer permission
+prompts, cancel them, and hand off the current working point into a fresh
+session. Created sessions are real opencode sessions and appear in the Desktop
+session switcher.
+
+Tools: 7. See the [opencode-sessions package documentation](opencode-sessions/README.md)
+for the complete tool list and configuration knobs.
+
+</details>
+
+<a id="plugin-decision-log"></a>
+<details>
+<summary><strong>decision-log</strong> — durable architecture decisions</summary>
+
+Record architectural decisions with context and consequences, then search and
+update them from a local SQLite FTS5 database.
+
+Tools: `decision_log`, `decision_search`, `decision_list`, `decision_get`, and
+`decision_update`.
+
+</details>
+
+<a id="plugin-error-journal"></a>
+<details>
+<summary><strong>error-journal</strong> — searchable debugging history</summary>
+
+Log errors with context, search previous failures, and record resolutions so
+recurring problems do not have to be debugged from scratch.
+
+Tools: 5, including error logging, search, listing, and resolution tracking.
+
+</details>
+
+<a id="plugin-snippet-library"></a>
+<details>
+<summary><strong>snippet-library</strong> — reusable code snippets</summary>
+
+Save reusable code snippets locally and search them by language, tags, or full
+text. Everything is stored locally in SQLite with full-text search.
+
+Tools: 5 for saving, retrieving, listing, updating, and searching snippets.
+
+</details>
+
+<a id="plugin-codebase-index"></a>
+<details>
+<summary><strong>codebase-index</strong> — local codebase search</summary>
+
+Index a codebase directory and run BM25-ranked full-text search over it. The
+index is local and can be refreshed incrementally as the project changes.
+
+Tools: 4 for indexing, searching, inspecting status, and managing the index.
+
+</details>
+
+<a id="plugin-tool-audit"></a>
+<details>
+<summary><strong>tool-audit</strong> — local tool-call flight recorder</summary>
+
+Record every tool call with its tool name, arguments, status, duration, and
+error. Use `trace_query` to search the audit log, `trace_stats` to summarise it,
+and `trace_export` to export it. Secrets in arguments are redacted before they
+touch disk.
+
+Tools: `trace_query`, `trace_stats`, and `trace_export`.
+
+</details>
+
+<a id="plugin-command-pack"></a>
+<details>
+<summary><strong>command-pack</strong> — slash commands for the toolbox</summary>
+
+Registers slash commands for the most common toolbox actions, including
+`/handoff`, `/decide`, `/journal`, `/recall`, `/index`, `/trace`, `/toolbox`,
+and `/stats`.
+
+See [Commands](#commands) for the command list. Commands inject short
+instructions into the current session and use the corresponding toolbox tools.
+
+</details>
+
+<a id="plugin-context-pruner"></a>
+<details>
+<summary><strong>context-pruner</strong> — token-accurate context compiler</summary>
+
+Trims stale tool output from the outgoing request only. The session transcript
+on disk is unchanged, and pruned tool output can be recalled or re-run. The
+planner preserves a stable prompt-cache prefix, removes superseded output, and
+can proactively summarise stale context before the model window fills.
+
+Use `context_pruner_stats` to inspect savings, `context_report` to inspect the
+active budget and epoch, and `context_pruner_recall` to retrieve pruned output
+without re-running the original tool.
+
+</details>
+
+<a id="plugin-session-export"></a>
+<details>
+<summary><strong>session-export</strong> — transcript exports</summary>
+
+Export session transcripts to Markdown, JSON, JSONL, or text with a model and
+usage header. Exports support role and tool filters, optional reasoning,
+per-part truncation, secret redaction, and safe non-overwriting filenames.
+
+`session_export` writes a file or returns the export inline;
+`session_export_info` reports the current configuration and last export.
+
+</details>
+
+<a id="plugin-memory"></a>
+<details>
+<summary><strong>memory</strong> — local-first long-term memory</summary>
+
+Store and recall durable local memories without an embedding API, cloud service,
+or network request. Relevant memories are injected into each request within a
+character budget and deduplicated per session.
+
+Tools: `memory_remember`, `memory_recall`, `memory_forget`, `memory_list`, and
+`memory_stats`. The database lives at
+`~/.opencode-plugins/memory/memory.db`.
+
+</details>
+
+<a id="plugin-goal"></a>
+<details>
+<summary><strong>goal</strong> — persistent autonomous goal loops</summary>
+
+Start an objective with `/goal <objective>` and optional `- ` success
+criteria. The goal is re-injected into requests and the model is automatically
+continued when a turn ends, until `goal_complete`, `goal_blocked`, an
+interrupt, a stall, repeated failures, or the iteration/time budget stops it.
+
+Goal state is persisted per session, so it survives plugin reloads and long
+turns. Tools: `goal_complete`, `goal_blocked`, and `goal_progress`.
+
+</details>
+
+<a id="plugin-secret-shield"></a>
+<details>
+<summary><strong>secret-shield</strong> — secret detection and redaction</strong>
+
+Detect and redact secrets across outbound HTTP bodies, prompts, tool arguments
+and results, and child-process environments. Choose `observe`, `redact`, or
+`block` mode, with high-precision rules, entropy fallback detection, allowlists,
+and a hashed JSONL audit that never stores the secret value.
+
+Tools: `secret_shield_scan`, `secret_shield_stats`, `secret_shield_shape`, and
+`secret_shield_keys`.
+
+</details>
+
+<a id="plugin-finish-guard"></a>
+<details>
+<summary><strong>finish-guard</strong> — resilient SSE stream handling</summary>
+
+Normalise OpenAI-compatible SSE streams when a content, reasoning, or tool delta
+arrives after the provider's `finish_reason` chunk. This prevents invalid
+provider-output failures and the follow-on failed-session-drain cascade for
+reasoning models behind strict gateways.
+
+</details>
+
+<a id="plugin-strip-skills-catalog"></a>
+<details>
+<summary><strong>strip-skills-catalog</strong> — smaller system prompts</summary>
+
+Strips the `<available_skills>` catalog from the system prompt to save tokens.
+The `skill` tool remains available on demand, so agents can still load a skill
+when they need it.
+
+</details>
+
+<a id="plugin-usage-stats"></a>
+<details>
+<summary><strong>usage-stats</strong> — lifetime usage dashboard</summary>
+
+Track lifetime tokens, cost, tool calls, model usage, and background title or
+compaction spend in local SQLite. Use `stats_summary`, `stats_tools`,
+`stats_tokens`, `stats_heatmap`, or `/stats` for the data, and `stats_dashboard`
+to write a self-contained HTML dashboard.
+
+The dashboard includes an activity heatmap, a 30-day token chart, tool and model
+tables, exact hover breakdowns for daily activity and chart bars, searchable
+multi-select model filtering, responsive layout, and automatic refresh without
+spending model tokens.
+
+### Dashboard screenshots
+
+![Usage-stats dashboard overview](images/usage-stats.PNG)
+
+![Usage-stats dashboard with a populated activity chart](images/usage-stats2.PNG)
+
+![Usage-stats dashboard details](images/usage-stats3.PNG)
+
+</details>
 
 ## Commands
 
@@ -181,7 +389,7 @@ nudges. It reads optional config from
 | `enabled` | `OPENCODE_CONTEXT_PRUNER_ENABLED` | `true` | Turn pruning off without uninstalling |
 | `keepRecent` | `OPENCODE_CONTEXT_PRUNER_KEEP_RECENT` | `6` | Most-recent tool results to leave untouched |
 | `minChars` | `OPENCODE_CONTEXT_PRUNER_MIN_CHARS` | `2000` | Only prune results longer than this |
-| `keepHeadChars` | `OPENCODE_CONTEXT_PRUNER_KEEP_HEAD` | `400` | Characters of the result kept as a preview |
+| `keepHeadChars` | `OPENCODE_CONTEXT_PRUNER_KEEP_HEAD` | `200` | Characters of the result kept as a preview |
 | `keepErrors` | `OPENCODE_CONTEXT_PRUNER_KEEP_ERRORS` | `true` | Never prune error results |
 | `ignoreTools` | `OPENCODE_CONTEXT_PRUNER_IGNORE` | `context_pruner_stats` | Comma-separated tools to never prune |
 | `log` | `OPENCODE_CONTEXT_PRUNER_LOG` | `false` | Log each prune to stderr |
@@ -195,11 +403,17 @@ nudges. It reads optional config from
 | `charsPerToken` | `OPENCODE_CONTEXT_PRUNER_CHARS_PER_TOKEN` | `3.6` | Seed estimator before calibration |
 | `protectedTools` | `OPENCODE_CONTEXT_PRUNER_PROTECTED_TOOLS` | `task,skill,compress,context_report` | Tools never pruned |
 | `protectedPatterns` | `OPENCODE_CONTEXT_PRUNER_PROTECTED_PATTERNS` | (none) | Regexes of tools never pruned |
-| `notify` | `OPENCODE_CONTEXT_PRUNER_NOTIFY` | `true` | One-line stderr summary when pruning |
+| `notify` | `OPENCODE_CONTEXT_PRUNER_NOTIFY` | `true` | Receipt verbosity: `off` \| `minimal` \| `detailed` |
+| `notifyType` | `OPENCODE_CONTEXT_PRUNER_NOTIFY_TYPE` | `toast` | `chat` posts the receipt inline (`session.synthetic`); `toast` logs to stderr |
+| `notifyMinTokens` | `OPENCODE_CONTEXT_PRUNER_NOTIFY_MIN_TOKENS` | `500` | Turn savings needed to trigger a receipt (`0` = every prune) |
+| `notifyOnTopic` | `OPENCODE_CONTEXT_PRUNER_NOTIFY_ON_TOPIC` | `true` | Also send a receipt when a summary is applied, even below the token floor |
+| `collapseRanges` | `OPENCODE_CONTEXT_PRUNER_COLLAPSE` | `true` | Collapse fully-pruned message spans |
+| `collapseStubs` | `OPENCODE_CONTEXT_PRUNER_COLLAPSE_STUBS` | `true` | Also collapse spans that are only stubbed (max savings) |
 | `superseded` | `OPENCODE_CONTEXT_PRUNER_SUPERSEDED` | `true` | Prune output superseded by a newer read/write of the same file |
 | `autoSummarize` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS` | `true` | Summarise automatically when the token target is exceeded |
 | `autoSummarizeMaxCalls` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MAX` | `0` | Max automatic summariser calls per session (`0` = unlimited) |
 | `autoSummarizeMinTokens` | `OPENCODE_CONTEXT_PRUNER_AUTO_COMPRESS_MIN` | `4000` | Minimum tokens a range must hold to be auto-summarised |
+| `maxAutoSummaries` | `OPENCODE_CONTEXT_PRUNER_MAX_AUTO_SUMMARIES` | `12` | Max stale units covered per proactive summary (`0` = unlimited; lower trades coverage for fewer calls) |
 | `proactiveSummarize` | `OPENCODE_CONTEXT_PRUNER_PROACTIVE` | `true` | Keep the request near the steady ceiling even when the window is wide |
 | `steadyTargetRatio` | `OPENCODE_CONTEXT_PRUNER_STEADY_RATIO` | `0.06` | Steady ceiling as a fraction of the window (`0` disables) |
 | `steadyTargetMinTokens` | `OPENCODE_CONTEXT_PRUNER_STEADY_MIN` | `1500` | Floor for the steady ceiling |
@@ -288,6 +502,15 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 | `blockEnvReads` | `OPENCODE_SECRET_SHIELD_BLOCK_ENV_READS` | `true` | In `block` mode, deny protected secret-file reads |
 | `log` | `OPENCODE_SECRET_SHIELD_LOG` | `false` | Emit diagnostics to stderr |
 
+### finish-guard options
+
+| Option | Env var | Default | Meaning |
+| :-- | :-- | :-- | :-- |
+| `enabled` | `OPENCODE_FINISH_GUARD_ENABLED` | `true` | Turn stream normalisation off without uninstalling |
+| `log` | `OPENCODE_FINISH_GUARD_LOG` | `false` | Log each normalised stream to stderr |
+| `retry` | `OPENCODE_FINISH_GUARD_RETRY` | `true` | Ask opencode to retry the turn when a stream is malformed |
+| `retryMax` | `OPENCODE_FINISH_GUARD_RETRY_MAX` | `3` | Maximum retry attempts before the turn is allowed to fail |
+
 ### usage-stats options
 
 | Option | Env var | Default | Meaning |
@@ -307,9 +530,12 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 **The dashboard.** `stats_dashboard` (and `/stats`) writes a self-contained HTML
 report to `~/.opencode-plugins/usage-stats/dashboard.html` — a GitHub-style
 activity heatmap, a 30-day bar chart, top-tools and per-model tables, and a
-separate background (title/compaction) section. It has no JavaScript, no CDN and
-no network access; it auto-switches light/dark with your OS theme, and reloads
-itself every `autoRefreshSec` so it stays current **without spending any model
+separate background (title/compaction) section. Hovering an activity day shows
+its token categories, tool calls, model usage and cost; hovering a bar shows
+its exact token total; and the Models table can be filtered by model. It has
+no external scripts, CDN or network access; a small inline script powers the
+model filter, it auto-switches light/dark with your OS theme, and reloads itself
+every `autoRefreshSec` so it stays current **without spending any model
 tokens** (the plugin runs in the server process, not the model).
 
 **Cost is computed from the provider's real price list.** The plugin reads each
@@ -354,6 +580,7 @@ since some plugins import helpers that live outside it:
 │   ├── session-export.ts
 │   ├── memory.ts
 │   ├── secret-shield.ts
+│   ├── finish-guard.ts
 │   ├── usage-stats.ts
 │   ├── goal.ts
 │   └── strip-skills-catalog.ts
