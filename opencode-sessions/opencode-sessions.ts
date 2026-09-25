@@ -1,4 +1,5 @@
 import { Plugin } from "@opencode/plugin";
+import fs from "node:fs";
 import { z } from "zod";
 import {
   asBool,
@@ -140,10 +141,18 @@ function resolveConfig(options: Record<string, unknown> | undefined): ResolvedCo
       typeof o.titlePrefix === "string" && o.titlePrefix
         ? o.titlePrefix
         : "[spawned",
-    autoInjectParent: asBool(o.autoInjectParent, true),
-    maxInjectChars: clampInt(o.maxInjectChars, 4000, 200, 100_000),
-    injectPermissionNotices: asBool(o.injectPermissionNotices, true),
-    inheritParentDefaults: asBool(o.inheritParentDefaults, true),
+    autoInjectParent: asBool(o.autoInjectParent ?? env("OPENCODE_SESSIONS_AUTO_INJECT"), true),
+    maxInjectChars: clampInt(
+      o.maxInjectChars ?? env("OPENCODE_SESSIONS_MAX_INJECT_CHARS"),
+      4000,
+      200,
+      100_000,
+    ),
+    injectPermissionNotices: asBool(
+      o.injectPermissionNotices ?? env("OPENCODE_SESSIONS_INJECT_PERMISSIONS"),
+      true,
+    ),
+    inheritParentDefaults: asBool(o.inheritParentDefaults ?? env("OPENCODE_SESSIONS_INHERIT_DEFAULTS"), true),
     pruneTerminalAfterSec: clampInt(
       o.pruneTerminalAfterSec ?? env("OPENCODE_SESSIONS_PRUNE_AFTER_SEC"),
       3600,
@@ -171,6 +180,27 @@ export default Plugin.define({
     const tracked = new Map<string, Tracked>();
     /** Cached parent agent/model defaults, keyed by parent session id. */
     const parentDefaults = new Map<string, { agent?: string; model?: ModelRef }>();
+    const MAX_PARENT_DEFAULTS = 500;
+
+    // Race a server call against a timeout so a hung opencode API can't stall
+    // orchestration forever. (The ctx.* helpers don't accept AbortSignal, so a
+    // Promise.race timeout is used instead of AbortSignal.timeout().)
+    const SERVER_TIMEOUT_MS = 30_000;
+    function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      });
+      return Promise.race([p, timeout]).finally(() => {
+        if (timer !== undefined) clearTimeout(timer);
+      });
+    }
+
+    // Short-lived cache for child session.context reads so that polling
+    // session_result (and timeout/interrupt best-effort refreshes) doesn't
+    // hammer the server with a context read on every call.
+    const OUTCOME_CACHE_TTL_MS = 3000;
+    const outcomeCache = new Map<string, { at: number; text: string; error?: string }>();
 
     const log = (
       level: "debug" | "info" | "warn" | "error",
@@ -315,12 +345,22 @@ export default Plugin.define({
     /**
      * Read the child's last assistant turn via `session.context`.
      * Falls back to whatever was already recorded when the read fails.
+     * Results are cached for OUTCOME_CACHE_TTL_MS so status polling doesn't
+     * issue a context read per call, and reads are bounded by SERVER_TIMEOUT_MS.
      */
     const fetchOutcome = async (
       childID: string,
     ): Promise<{ text: string; structured?: unknown; error?: string }> => {
+      const cached = outcomeCache.get(childID);
+      if (cached && Date.now() - cached.at < OUTCOME_CACHE_TTL_MS) {
+        return { text: cached.text, error: cached.error };
+      }
       try {
-        const messages = await ctx.session.context({ sessionID: childID });
+        const messages = await withTimeout(
+          ctx.session.context({ sessionID: childID }),
+          SERVER_TIMEOUT_MS,
+          "session.context",
+        );
         for (let i = messages.length - 1; i >= 0; i -= 1) {
           const m = messages[i] as unknown as {
             type: string;
@@ -330,8 +370,10 @@ export default Plugin.define({
           if (m.type !== "assistant") continue;
           const text = assistantTextOf(m);
           const error = m.error ? describeError(m.error) : undefined;
+          outcomeCache.set(childID, { at: Date.now(), text, error });
           return { text, error };
         }
+        outcomeCache.set(childID, { at: Date.now(), text: "" });
         return { text: "" };
       } catch (err) {
         log("debug", `session.context unreadable for ${childID}`, {
@@ -393,21 +435,25 @@ export default Plugin.define({
 
     const handleInterrupted = async (t: Tracked): Promise<void> => {
       if (isTerminal(t.state)) return;
+      // Terminal transition first so concurrent events can't double-handle,
+      // then settle waiters immediately before any best-effort server reads.
       t.state = "cancelled";
       t.errorText = t.errorText ?? "Session was interrupted.";
       t.idleAt = Date.now();
       touch(t);
-      try {
-        const o = await fetchOutcome(t.childID);
-        if (o.text) t.resultText = o.text;
-      } catch {
-        /* ignore */
-      }
-      const hadWaiter = settleWaiters(t) > 0;
-      if (cfg.autoInjectParent && !hadWaiter) {
-        await postToParent(t, buildCompletionNote(t));
-      }
+      const hadWaiter = settleWaiters(t);
       pruneTracked();
+      void (async () => {
+        try {
+          const o = await fetchOutcome(t.childID);
+          if (o.text) t.resultText = o.text;
+        } catch {
+          /* ignore */
+        }
+        if (cfg.autoInjectParent && !hadWaiter) {
+          await postToParent(t, buildCompletionNote(t));
+        }
+      })();
     };
 
     const waitFor = (t: Tracked, timeoutSec: number): Promise<SessionOutcome> => {
@@ -422,7 +468,18 @@ export default Plugin.define({
             t.errorText = `Timed out after ${Math.round(ms / 1000)}s; interrupted child.`;
             void ctx.session.interrupt({ sessionID: t.childID }).catch(() => undefined);
           }
-          resolve(outcomeOf(t));
+          // Best-effort refresh so the timeout outcome carries the latest
+          // partial text instead of a stale cache entry.
+          void (async () => {
+            try {
+              const o = await fetchOutcome(t.childID);
+              if (o.text) t.resultText = o.text;
+              if (o.error && !t.errorText) t.errorText = o.error;
+            } catch {
+              /* ignore */
+            }
+            resolve(outcomeOf(t));
+          })();
         }, ms);
         t.waiters.push({ resolve, timer });
       });
@@ -465,7 +522,11 @@ export default Plugin.define({
       if (cached) return cached;
       const result: { agent?: string; model?: ModelRef } = {};
       try {
-        const messages = await ctx.session.context({ sessionID: parentID });
+        const messages = await withTimeout(
+          ctx.session.context({ sessionID: parentID }),
+          SERVER_TIMEOUT_MS,
+          "session.context",
+        );
         for (let i = messages.length - 1; i >= 0; i -= 1) {
           const m = messages[i] as unknown as {
             type: string;
@@ -483,7 +544,14 @@ export default Plugin.define({
       } catch {
         /* parent context unreadable; leave defaults unset */
       }
+      // Cap entries so a long-lived server can't grow this map without bound (FIFO eviction).
+      if (parentDefaults.has(parentID)) parentDefaults.delete(parentID);
       parentDefaults.set(parentID, result);
+      while (parentDefaults.size > MAX_PARENT_DEFAULTS) {
+        const oldest = parentDefaults.keys().next();
+        if (oldest.done) break;
+        parentDefaults.delete(oldest.value);
+      }
       return result;
     };
 
@@ -526,6 +594,7 @@ export default Plugin.define({
       }
 
       let model: ModelRef | undefined;
+      let inherited: { agent?: string; model?: ModelRef } | undefined;
       if (modelStr) {
         const parsed = parseModelString(modelStr);
         if ("error" in parsed) return { error: parsed.error };
@@ -553,15 +622,17 @@ export default Plugin.define({
       } else if (agent?.model) {
         model = agent.model;
       } else if (cfg.inheritParentDefaults) {
-        const inherited = await parentDefaultsFor(parentID);
-        model = inherited.model;
-        if (!agent && inherited.agent) {
-          const found = agents.find((a) => a.name === inherited.agent);
+        // Single parent lookup; reuse the result for the model fallback below.
+        const parent = await parentDefaultsFor(parentID);
+        inherited = parent ?? undefined;
+        model = parent?.model;
+        if (!agent && parent?.agent) {
+          const found = agents.find((a) => a.name === parent.agent);
           if (found) agent = { name: found.name, model: found.model, mode: found.mode };
         }
       }
-      if (!model && cfg.inheritParentDefaults) {
-        model = (await parentDefaultsFor(parentID)).model;
+      if (!model && inherited?.model) {
+        model = inherited.model;
       }
       if (!model) {
         try {
@@ -578,10 +649,14 @@ export default Plugin.define({
       return { agent: agent?.name, model, agentMode: agent?.mode };
     };
 
-    /** Fire-and-forget: queue the child's turn and return immediately. */
+    /** Queue the child's turn. Callers await this so a failed send surfaces. */
     const startTurn = async (t: Tracked, text: string): Promise<void> => {
       try {
-        await ctx.session.prompt({ sessionID: t.childID, text });
+        await withTimeout(
+          ctx.session.prompt({ sessionID: t.childID, text }),
+          SERVER_TIMEOUT_MS,
+          "session.prompt",
+        );
         if (t.state === "starting") t.state = "running";
         log("debug", `child ${t.childID} prompt accepted`, { state: t.state });
       } catch (err) {
@@ -601,7 +676,11 @@ export default Plugin.define({
         | { id?: string; title?: string; parentID?: string; metadata?: Record<string, unknown> }
         | undefined;
       try {
-        info = (await ctx.session.get({ sessionID: sessionId })) as unknown as typeof info;
+        info = (await withTimeout(
+          ctx.session.get({ sessionID: sessionId }),
+          SERVER_TIMEOUT_MS,
+          "session.get",
+        )) as unknown as typeof info;
       } catch {
         return undefined;
       }
@@ -617,7 +696,10 @@ export default Plugin.define({
       const short = tail.match(/^:([A-Za-z0-9]+)\]/)?.[1] ?? "adopted";
       const t: Tracked = {
         childID: sessionId,
-        parentSessionID: info.parentID ?? metaParent ?? "",
+        // Sentinel for an unknown parent: adopted children whose parent can't
+        // be determined must stay visible in session_list (never filtered as
+        // "another parent's child").
+        parentSessionID: info.parentID ?? metaParent ?? "unknown",
         shortId: short,
         title: title || sessionId,
         // OS-1: an adopted session may still be running — we cannot tell
@@ -670,6 +752,19 @@ export default Plugin.define({
       schema?: Record<string, unknown>;
       label: string;
     }): Promise<string> => {
+      // Validate the working directory up front so a bad value fails fast
+      // instead of surfacing as a confusing server-side create error.
+      if (opts.directory !== undefined) {
+        if (typeof opts.directory !== "string" || !opts.directory.trim()) {
+          return "Refused: directory must be a non-empty path string.";
+        }
+        try {
+          const st = await fs.promises.stat(opts.directory);
+          if (!st.isDirectory()) return `Refused: directory is not a folder: ${opts.directory}`;
+        } catch {
+          return `Refused: directory does not exist or is unreadable: ${opts.directory}`;
+        }
+      }
       if (activeCount() >= cfg.maxConcurrentSessions) {
         return `Refused: concurrency limit reached (${cfg.maxConcurrentSessions} active child sessions). Wait for one to finish or call session_cancel.`;
       }
@@ -692,15 +787,19 @@ export default Plugin.define({
 
       let childID: string;
       try {
-        const created = await ctx.session.create({
-          title,
-          ...(target.agent ? { agent: target.agent } : {}),
-          ...(target.model
-            ? { model: { id: target.model.modelID, providerID: target.model.providerID } }
-            : {}),
-          ...(opts.directory ? { location: { directory: opts.directory } } : {}),
-          metadata: { parentSessionID: opts.parentID, spawnedBy: "opencode-sessions" },
-        });
+        const created = await withTimeout(
+          ctx.session.create({
+            title,
+            ...(target.agent ? { agent: target.agent } : {}),
+            ...(target.model
+              ? { model: { id: target.model.modelID, providerID: target.model.providerID } }
+              : {}),
+            ...(opts.directory ? { location: { directory: opts.directory } } : {}),
+            metadata: { parentSessionID: opts.parentID, spawnedBy: "opencode-sessions" },
+          }),
+          SERVER_TIMEOUT_MS,
+          "session.create",
+        );
         childID = created.id;
       } catch (err) {
         return `Failed to create child session: ${describeError(err)}`;
@@ -727,7 +826,9 @@ export default Plugin.define({
 
       let text = opts.promptText;
       if (opts.schema) text += schemaInstruction(opts.schema);
-      void startTurn(t, text);
+      // Await the prompt handoff so a failed first turn is reported instead
+      // of claiming the child is running (see startTurn).
+      await startTurn(t, text);
 
       const warnings: string[] = [];
       if (target.agentMode === "primary") {
@@ -741,6 +842,9 @@ export default Plugin.define({
       const warn = warnings.length ? `\n${warnings.join("\n")}` : "";
 
       if (!opts.wait) {
+        if (isTerminal(t.state) && t.errorText) {
+          return `Failed to ${opts.label.toLowerCase()} child session ${childID}: ${t.errorText}${warn}`;
+        }
         return (
           `${opts.label} child session ${childID} (title: ${title}) with status "running". ` +
           `It runs in the background and appears in the Desktop session switcher like a session opened with +. ` +
@@ -766,7 +870,11 @@ export default Plugin.define({
         content?: Array<{ type: string; text?: string }>;
       }> = [];
       try {
-        messages = (await ctx.session.context({ sessionID })) as unknown as typeof messages;
+        messages = (await withTimeout(
+          ctx.session.context({ sessionID }),
+          SERVER_TIMEOUT_MS,
+          "session.context",
+        )) as unknown as typeof messages;
       } catch (err) {
         return `(could not read current session context: ${describeError(err)})`;
       }
@@ -985,7 +1093,12 @@ export default Plugin.define({
           t.errorText = undefined;
           t.structured = undefined;
           t.resultText = undefined;
-          void startTurn(t, args.text);
+          // Await the prompt handoff so a failed send is reported instead of
+          // silently claiming the child is running again (see startTurn).
+          await startTurn(t, args.text);
+          if (isTerminal(t.state) && t.errorText) {
+            return { content: `Failed to send follow-up to ${t.childID}: ${t.errorText}` };
+          }
           return {
             content: `Sent follow-up to ${t.childID}; it is running again. Use session_result(wait:true) to await completion.`,
           };
@@ -1132,7 +1245,9 @@ export default Plugin.define({
           const args = input as { all?: boolean };
           const rows: string[] = [];
           for (const t of tracked.values()) {
-            if (!args.all && t.parentSessionID !== toolCtx.sessionID) continue;
+            // Entries with an unknown parent ("unknown" sentinel) are always
+            // shown: they may belong to this session and must not be hidden.
+            if (!args.all && t.parentSessionID !== toolCtx.sessionID && t.parentSessionID !== "unknown") continue;
             rows.push(
               `- ${t.childID} [${t.state}] ${t.shortId} parent=${t.parentSessionID}${
                 t.pendingPermissionId ? ` pending_permission=${t.pendingPermissionId}` : ""
@@ -1152,6 +1267,7 @@ export default Plugin.define({
       }
       tracked.clear();
       parentDefaults.clear();
+      outcomeCache.clear();
     };
   },
 });
