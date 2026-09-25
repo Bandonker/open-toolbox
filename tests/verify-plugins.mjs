@@ -1926,6 +1926,74 @@ const toolCtx = {
   rmSync(proj, { recursive: true, force: true });
 }
 
+// ------------------------------------ codebase-index: platform skip lists
+{
+  const mod = await import(new URL("../plugins/codebase-index.ts", import.meta.url));
+  const { walkDir, SKIP_DIRS, SKIP_FILES } = mod.__test__;
+
+  // Every entry must be lower-case, because walkDir matches on
+  // entry.name.toLowerCase(). A mixed-case entry would be dead on Linux.
+  const notLower = [...SKIP_DIRS, ...SKIP_FILES].filter((n) => n !== n.toLowerCase());
+  check(
+    "codebase-index skip lists are all lower-case",
+    notLower.length === 0,
+    notLower.join(", ") || "all lower-case",
+  );
+
+  // Build a tree of junk that Linux and macOS actually produce, alongside one
+  // real source file that must survive.
+  const junk = join(tmpdir(), "opencode-codebase-skiplist");
+  rmSync(junk, { recursive: true, force: true });
+  const put = (rel, body = "x\n") => {
+    const full = join(junk, rel);
+    mkdirSync(join(full, ".."), { recursive: true });
+    writeFileSync(full, body);
+  };
+  put("keep.ts", "export const keep = 1;\n");
+  for (const d of [
+    "venv/lib", // Python venv without a leading dot
+    "Pods", // CocoaPods (macOS/iOS)
+    "DerivedData", // Xcode
+    "CMakeFiles", // CMake
+    "cmake-build-debug",
+    "_build", // Elixir mix
+    "elm-stuff",
+    "out", // IntelliJ
+    ".venv/lib", // dot-dir, but INDEX_DOT_DIRS=1 must not re-admit it
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".ipynb_checkpoints",
+    "Node_Modules", // case variant of node_modules
+    "node_modules",
+    "PODS", // case variant of Pods
+  ]) {
+    put(`${d}/junk.ts`, "export const junk = 1;\n");
+  }
+  for (const f of [".DS_Store", "Thumbs.db", ".directory", "desktop.ini"]) {
+    put(f, "binary-ish\n");
+  }
+
+  const walked = [...walkDir(junk)].map((p) => p.slice(junk.length + 1));
+  check(
+    "codebase-index skips Linux/macOS/Windows junk directories",
+    walked.length === 1 && walked[0] === "keep.ts",
+    walked.join(" | ") || "(nothing walked)",
+  );
+  check(
+    "codebase-index skips case variants of skip-list directories on a case-sensitive FS",
+    !walked.some((p) => /^(node_modules|Node_Modules|Pods|PODS)\//.test(p)),
+    walked.join(" | ") || "(none)",
+  );
+  check(
+    "codebase-index skips OS metadata files",
+    !walked.some((p) => /\.(DS_Store|directory|ini)$/i.test(p) || /Thumbs\.db$/.test(p)),
+    walked.join(" | ") || "(none)",
+  );
+
+  rmSync(junk, { recursive: true, force: true });
+}
+
 // ------------------------------------------------------------ opencode-sessions
 {
   const mod = await import(new URL("../plugins/opencode-sessions.ts", import.meta.url));

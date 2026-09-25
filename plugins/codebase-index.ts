@@ -54,21 +54,50 @@ const BASENAME_ALLOW = new Set([
   "cmakelists.txt",
 ]);
 
+/**
+ * Directories never indexed.
+ *
+ * Entries are matched case-insensitively (see walkDir) so the index skips the
+ * same directories on a case-sensitive Linux filesystem as it does on Windows.
+ * Dot-directories are skipped by default anyway, but the dotted entries here
+ * still matter: INDEX_DOT_DIRS=1 opts dot-directories back in and SKIP_DIRS
+ * always wins, which is what stops a `venv` or `.mypy_cache` from being
+ * indexed on request.
+ */
 const SKIP_DIRS = new Set([
-  "node_modules", ".git", ".svn", ".hg",
-  "dist", "build", ".next", ".nuxt", ".output",
+  // Version control and dependencies
+  "node_modules", ".git", ".svn", ".hg", ".bzr",
+  "vendor", "bower_components", "deps", "pods",
+  // Build and bundle output
+  "dist", "build", ".next", ".nuxt", ".output", "out",
+  "target", "bin", "obj", "_build", "elm-stuff",
+  "cmakefiles", "cmake-build-debug", "cmake-build-release",
+  "deriveddata", "release",
+  // Caches and coverage
   "coverage", ".nyc_output",
-  "vendor", "bower_components",
-  ".cache", "cache", ".tox", ".eggs", "__pycache__",
-  ".serverless", ".webpack",
-  "target", "bin", "obj",
-  ".gradle", ".idea", ".vscode",
+  ".cache", "cache", ".parcel-cache", ".sass-cache",
+  ".turbo", ".eslintcache", ".stylelintcache",
+  // Python
+  "__pycache__", ".venv", "venv", "virtualenv", ".tox", ".eggs",
+  "__pypackages__", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+  ".hypothesis",
+  // JS/TS tooling
+  ".pnpm-store", ".yarn", ".parcel-cache", ".serverless", ".webpack",
+  // JVM, .NET, Rust, Go, Haskell, Ruby, PHP
+  ".gradle", ".idea", ".vscode", ".svelte-kit", ".angular",
+  ".terraform", ".terragrunt-cache", ".stack-work", ".bundle",
+  ".dart_tool", ".pub-cache", ".flutter-plugins",
+  ".ipynb_checkpoints", ".vs",
   ".opencode-memory",
 ]);
 
+/** Files never indexed: lockfiles plus desktop-environment metadata. */
 const SKIP_FILES = new Set([
   "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lock",
-  ".DS_Store", "Thumbs.db",
+  // OS / file-manager metadata. .DS_Store is macOS, Thumbs.db is Windows and
+  // Samba shares, .directory is Linux (Nautilus/Thunar/Dolphin), desktop.ini
+  // is Windows. All are noise, and none are source.
+  ".ds_store", "thumbs.db", ".directory", "desktop.ini",
 ]);
 
 const CHUNK_SIZE = 50;
@@ -397,13 +426,13 @@ function* walkDir(dir: string): Generator<string> {
     for (const entry of entries) {
       const fullPath = join(dir, entry.name);
       if (entry.isDirectory()) {
-        if (SKIP_DIRS.has(entry.name)) continue;
+        if (SKIP_DIRS.has(entry.name.toLowerCase())) continue;
         // CI-10: dot-directories are skipped by default; INDEX_DOT_DIRS=1
         // opts in (SKIP_DIRS such as .git still always skipped).
         if (entry.name.startsWith(".") && !dotDirsAllowed()) continue;
         yield* walkDir(fullPath);
       } else if (entry.isFile()) {
-        if (SKIP_FILES.has(entry.name)) continue;
+        if (SKIP_FILES.has(entry.name.toLowerCase())) continue;
         const ext = extname(entry.name).toLowerCase();
         // CI-5: extensionless well-known files via basename allowlist.
         if (!DEFAULT_EXTS.has(ext) && (ext !== "" || !BASENAME_ALLOW.has(entry.name.toLowerCase()))) continue;
@@ -893,4 +922,4 @@ export default Plugin.define({
 });
 
 /** Test hooks: unit access without a database. */
-export const __test__ = { chunkFile, normalizeRoot, escapeLike };
+export const __test__ = { chunkFile, normalizeRoot, escapeLike, walkDir, SKIP_DIRS, SKIP_FILES };
