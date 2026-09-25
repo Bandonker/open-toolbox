@@ -567,7 +567,8 @@ Copy all three folders into your config dir — **`plugins/` alone is not enough
 since some plugins import helpers that live outside it:
 
 ```
-.config/opencode/          # or <repo>/.opencode/
+~/.config/opencode/        # or <repo>/.opencode/ — this is under your HOME dir,
+                           # not relative to the repo
 ├── plugins/               # what opencode loads
 │   ├── opencode-sessions.ts
 │   ├── command-pack.ts

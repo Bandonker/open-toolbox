@@ -1,17 +1,17 @@
 /**
  * Keeps the installed plugin and this repo copy in sync.
  *
- *   node sync.mjs        install: repo/opencode-sessions.ts -> <config>/plugins/opencode-sessions.ts
+ *   node sync.mjs        install: opencode-sessions/opencode-sessions.ts -> plugins/opencode-sessions.ts
  *                       (helpers.ts lives ONLY here at opencode-sessions/helpers.ts;
  *                        the installed plugin imports it via ../opencode-sessions/helpers.ts
  *                        so opencode's loader never treats it as a plugin)
- *   node sync.mjs pull   pull:    <config>/plugins/opencode-sessions.ts -> repo
+ *   node sync.mjs pull   pull:    plugins/opencode-sessions.ts -> opencode-sessions/
  *
  * This folder is the source of truth; the file under plugins/ is the artifact
  * opencode actually loads. Run `install` after editing here, `pull` after editing
  * the installed file directly. Also fixes the import rewrite on install.
  */
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -53,9 +53,15 @@ if (mode === "pull") {
   // Safety: a stale helpers.ts in plugins/ breaks every startup (loader treats
   // each named export as a plugin factory -> "prompt.split is not a function"
   // + cascading "config hook failed" / provider-list errors). Remove it.
-  const stale = resolve(pluginsDir, "helpers.ts");
-  if (existsSync(stale)) {
-    rmSync(stale, { force: true });
-    console.log(`sync(install): removed stale plugins/helpers.ts`);
+  //
+  // Swept case-insensitively rather than probing one exact name: on Windows and
+  // default macOS `existsSync(plugins/helpers.ts)` also matches a file actually
+  // named `Helpers.ts`, but on Linux it does not, so the stale copy would
+  // survive the very cleanup meant to remove it and break startup there.
+  for (const entry of readdirSync(pluginsDir, { withFileTypes: true })) {
+    if (entry.isFile() && entry.name.toLowerCase() === "helpers.ts") {
+      rmSync(resolve(pluginsDir, entry.name), { force: true });
+      console.log(`sync(install): removed stale plugins/${entry.name}`);
+    }
   }
 }

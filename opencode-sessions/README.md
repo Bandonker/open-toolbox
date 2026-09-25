@@ -22,9 +22,15 @@ stream.
 
 Place the plugin as a flat `.ts` file in the global plugins directory:
 
-```
-%USERPROFILE%\.config\opencode\plugins\opencode-sessions.ts
-```
+| Platform | Path |
+| --- | --- |
+| Linux / BSD | `~/.config/opencode/plugins/opencode-sessions.ts` |
+| macOS | `~/Library/Application Support/opencode/plugins/opencode-sessions.ts` |
+| Windows | `%USERPROFILE%\.config\opencode\plugins\opencode-sessions.ts` |
+
+(`~` is your home directory. The plugin itself resolves this with
+`os.homedir()`, and honors `XDG_CONFIG_HOME` on Linux if you have relocated
+your config.)
 
 That is the layout used here. Global local plugins resolve their dependencies from
 the config-root `package.json`; opencode runs `bun install` there at startup.
@@ -45,12 +51,21 @@ tool input schemas.
 ### Project-local (one repo only)
 
 ```
-<repo>\.opencode\plugins\opencode-sessions.ts
+<repo>/.opencode/plugins/opencode-sessions.ts
 ```
 
-with a `package.json` **next to the plugin** (same directory, i.e.
-`<repo>\.opencode\plugins\package.json`) declaring the same two dependencies.
-opencode runs `bun install` in that folder at startup.
+with a `package.json` in the **`.opencode` directory above it** (i.e.
+`<repo>/.opencode/package.json`) declaring the same two dependencies:
+
+```bash
+cp /path/to/open-toolbox/package.json          .opencode/package.json
+cd .opencode && npm install
+```
+
+The `.opencode` root is the right place, not `.opencode/plugins/`: a plugin in
+`.opencode/plugins/` importing `zod` walks up to `.opencode/node_modules`, so
+the dependency resolves from the config root the same way the global layout
+does. opencode runs `bun install` in that folder at startup.
 
 ### Load order
 
@@ -208,14 +223,14 @@ out of the child's final message. The result surfaces as `structured_output`.
 Type-check (only the pre-existing `.ts`-extension notice shared by every local
 plugin, which the opencode loader resolves at runtime):
 
-```powershell
+```bash
 npx tsc --noEmit -p opencode-sessions
 ```
 
 Unit tests (helpers, no server needed):
 
-```powershell
-node --test opencode-sessions\unit.test.mjs
+```bash
+node --test opencode-sessions/unit.test.mjs
 ```
 
 Observed: 8/8 passing.
@@ -227,8 +242,9 @@ context registers all seven tools (`spawn_session`, `session_result`,
 
 Loader check (plugin installed into a running server's plugins dir):
 
-1. `node opencode-sessions\sync.mjs` installs the repo copy to
-   `<config>/plugins/opencode-sessions.ts`; (re)start opencode.
+1. `node opencode-sessions/sync.mjs` installs the repo copy to
+   `plugins/opencode-sessions.ts` inside this repository; copy that file into
+   your global or project plugins dir, then (re)start opencode.
 2. All seven tools appear in the live tool registry with no
    `failed to load plugin` WARN in the server log.
 3. `list_sessions` executes live against the server.

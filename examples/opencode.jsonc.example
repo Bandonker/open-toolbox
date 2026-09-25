@@ -18,10 +18,12 @@
   ],
 
   "mcp": {
-    // Example local MCP server:
+    // Example local MCP server. Use a path for your own platform:
+    //   Linux/macOS: /home/you/server/index.js
+    //   Windows:     C:\\path\\to\\server\\index.js
     // "my-tools": {
     //   "type": "local",
-    //   "command": ["node", "C:\\path\\to\\server\\index.js"],
+    //   "command": ["node", "/home/you/server/index.js"],
     //   "enabled": true
     // }
   }

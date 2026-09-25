@@ -435,10 +435,23 @@ function transpile(relPath) {
   return output;
 }
 
-/** Fail loudly if a relative `.ts` import survived into a published file. */
+/**
+ * Fail loudly if a relative `.ts` import survived into a published file.
+ *
+ * The extension match is case-insensitive on purpose. rewriteImports() below
+ * replaces exact lowercase specifiers, so a source importing "./Helpers.TS"
+ * or "./helpers.TS" is never rewritten. On a case-insensitive filesystem
+ * (Windows, default macOS) that mistake still resolves and the broken import
+ * ships to npm, where it fails only at runtime on a Linux install. Matching
+ * case-insensitively turns that into a build-time error on every platform.
+ */
 function assertNoTsImports(code, label) {
-  if (/\bfrom\s+["'][^"']+\.ts["']/.test(code)) {
-    throw new Error(`unrewritten .ts import remains in ${label}`);
+  const m = code.match(/\bfrom\s+["']([^"']+\.ts)["']/i);
+  if (m) {
+    throw new Error(
+      `unrewritten .ts import remains in ${label}: ${m[1]} ` +
+        `(import specifiers are case-sensitive; use the exact lowercase path)`,
+    );
   }
 }
 
