@@ -12,8 +12,13 @@
     "typescript": "5.8.2"
   },
   "scripts": {
-    "test": "node --test opencode-sessions/unit.test.mjs && node tests/verify-plugins.mjs && node tests/verify-pruner-state.mjs && node tests/verify-pruner-labels.mjs && node tests/verify-pruner-fix.mjs && node tests/verify-pruner-receipts.mjs && node tests/verify-pruner-ledger.mjs && node tests/verify-pruner-reasoning.mjs && node tests/verify-finish-guard.mjs && node tests/verify-cr3.mjs && node tests/verify-session-export.mjs && node tests/verify-memory.mjs && node tests/verify-memory-seen.mjs && node tests/verify-goal.mjs && node tests/verify-memory-goal.mjs && node tests/verify-secret-shield.mjs && node tests/verify-shield-limits.mjs && node tests/verify-shield-fix.mjs && node tests/verify-usage-stats.mjs && node tests/verify-usage-stats-isolation.mjs && node tests/verify-tool-audit-isolation.mjs && node tests/verify-opencode-sessions.mjs && node tests/verify-codebase-index.mjs && node tests/verify-codebase-incremental.mjs && node tests/verify-codebase-fix.mjs && node tests/verify-toolbox-providers.mjs && node tests/verify-restore-check.mjs && node --test tests/verify-final-fix.mjs",
+    "test": "node --test opencode-sessions/unit.test.mjs && node tests/verify-plugins.mjs && node tests/verify-sqlite-robustness.mjs && node tests/verify-pruner-state.mjs && node tests/verify-pruner-labels.mjs && node tests/verify-pruner-fix.mjs && node tests/verify-pruner-receipts.mjs && node tests/verify-pruner-ledger.mjs && node tests/verify-pruner-reasoning.mjs && node tests/verify-pruner-auto-cap.mjs && node tests/verify-pruner-keep-head.mjs && node tests/verify-finish-guard.mjs && node tests/verify-cr3.mjs && node tests/verify-session-export.mjs && node tests/verify-memory.mjs && node tests/verify-memory-seen.mjs && node tests/verify-goal.mjs && node tests/verify-memory-goal.mjs && node tests/verify-secret-shield.mjs && node tests/verify-shield-limits.mjs && node tests/verify-shield-fix.mjs && node tests/verify-usage-stats.mjs && node tests/verify-usage-stats-isolation.mjs && node tests/verify-tool-audit-isolation.mjs && node tests/verify-opencode-sessions.mjs && node tests/verify-codebase-index.mjs && node tests/verify-codebase-incremental.mjs && node tests/verify-codebase-fix.mjs && node tests/verify-toolbox-providers.mjs && node tests/verify-restore-check.mjs && node --test tests/verify-final-fix.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test:live": "node tests/verify-live.mjs",
+    "test:stress": "node tests/long-session.mjs",
+    "diag:db": "node tests/_diag-db.mjs",
+    "diag:breakdown": "node tests/_diag-breakdown.mjs",
+    "measure:head-to-head": "node tests/measure-head-to-head.mjs",
     "measure": "node tests/measure-savings.mjs",
     "measure:live": "node tests/measure-live-savings.mjs",
     "build:packages": "node scripts/build-packages.mjs",
