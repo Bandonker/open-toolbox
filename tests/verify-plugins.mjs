@@ -2002,6 +2002,11 @@ const toolCtx = {
     mod.default.id === "opencode-sessions" && typeof mod.default.setup === "function",
   );
   const tools = [];
+  // session.hook and session.synthetic/prompt are called during setup for peer
+  // awareness, so the stub must provide them; without them setup logs a warning
+  // and the awareness path is silently untested here (covered in depth by
+  // verify-project-presence.mjs).
+  const awarenessHooks = [];
   const ctx = stubCtx(tools, {
     event: {
       // Never yields; cleanup() aborts and the process exits at the end.
@@ -2009,13 +2014,27 @@ const toolCtx = {
         await new Promise(() => {});
       },
     },
+    storage: { get: async () => undefined, set: async () => {} },
+    session: {
+      hook: async (name, cb) => void awarenessHooks.push({ name, cb }),
+      synthetic: async () => {},
+      prompt: async () => {},
+      get: async ({ sessionID }) => ({ id: sessionID, title: "t", parentID: "p" }),
+      context: async () => [],
+      interrupt: async () => {},
+    },
   });
   const cleanup = await mod.default.setup(ctx);
+  check(
+    "opencode-sessions registers a peer-awareness context hook",
+    awarenessHooks.some((h) => h.name === "context"),
+    awarenessHooks.map((h) => h.name).join(",") || "none",
+  );
   const names = tools.map((t) => t.name).sort();
   check(
-    "opencode-sessions registers its 7 tools",
+    "opencode-sessions registers its 9 tools",
     names.join(",") ===
-      "list_sessions,session_cancel,session_handoff,session_permission,session_result,session_send,spawn_session",
+      "list_sessions,project_sessions,session_broadcast,session_cancel,session_handoff,session_permission,session_result,session_send,spawn_session",
     names.join(", "),
   );
   if (typeof cleanup === "function") await cleanup();

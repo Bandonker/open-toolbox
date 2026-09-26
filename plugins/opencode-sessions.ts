@@ -83,6 +83,29 @@ type Tracked = {
   waiters: Waiter[];
 };
 
+/**
+ * A session observed working in the same project directory, whether or not this
+ * plugin spawned it.
+ *
+ * opencode exposes no `session.list()`, so peers are discovered by watching the
+ * server-wide event stream: every session event carries `data.sessionID` and
+ * `location.directory`, which is enough to group by project without asking the
+ * server for a list.
+ */
+type Peer = {
+  sessionId: string;
+  shortId: string;
+  directory: string;
+  state: "running" | "idle";
+  lastSeenAt: number;
+  agent?: string;
+  model?: ModelRef;
+  /** Self-declared, so peers can say what they are working on. */
+  task?: string;
+  /** True when this session announced itself rather than being observed. */
+  claimed?: boolean;
+};
+
 type ResolvedConfig = {
   maxConcurrentSessions: number;
   maxSessionsPerParent: number;
@@ -96,6 +119,12 @@ type ResolvedConfig = {
   pruneTerminalAfterSec: number;
   maxTrackedSessions: number;
   autoApprovePermissions: "never" | "once" | "always";
+  peerAwareness: boolean;
+  peerStaleSec: number;
+  maxPeers: number;
+  peerTaskChars: number;
+  peerHeartbeatSec: number;
+  maxClaimedPeers: number;
 };
 
 const TERMINAL: ReadonlySet<SessionState> = new Set([
@@ -169,6 +198,42 @@ function resolveConfig(options: Record<string, unknown> | undefined): ResolvedCo
       const raw = o.autoApprovePermissions ?? env("OPENCODE_SESSIONS_AUTO_APPROVE");
       return raw === "once" || raw === "always" ? raw : "never";
     })(),
+    // --- project presence / peer awareness ---
+    // On by default: an agent that edits a file another agent just edited
+    // should know a peer exists rather than explain the diff as a mystery.
+    peerAwareness: asBool(
+      o.peerAwareness ?? env("OPENCODE_SESSIONS_PEER_AWARENESS"),
+      true,
+    ),
+    // Peers unheard from for this long stop being shown. Generous by default
+    // because a peer can be legitimately idle mid-task.
+    peerStaleSec: clampInt(
+      o.peerStaleSec ?? env("OPENCODE_SESSIONS_PEER_STALE_SEC"),
+      900,
+      30,
+      86_400,
+    ),
+    // Cap the injected awareness line so presence can never dominate a prompt.
+    maxPeers: clampInt(o.maxPeers ?? env("OPENCODE_SESSIONS_MAX_PEERS"), 8, 1, 64),
+    peerTaskChars: clampInt(
+      o.peerTaskChars ?? env("OPENCODE_SESSIONS_PEER_TASK_CHARS"),
+      120,
+      20,
+      2000,
+    ),
+    // How often a session refreshes its own presence entry.
+    peerHeartbeatSec: clampInt(
+      o.peerHeartbeatSec ?? env("OPENCODE_SESSIONS_PEER_HEARTBEAT_SEC"),
+      60,
+      5,
+      3600,
+    ),
+    maxClaimedPeers: clampInt(
+      o.maxClaimedPeers ?? env("OPENCODE_SESSIONS_MAX_CLAIMED_PEERS"),
+      2000,
+      10,
+      100_000,
+    ),
   };
 }
 
@@ -228,6 +293,218 @@ export default Plugin.define({
       pruneTerminalAfterSec: cfg.pruneTerminalAfterSec,
       autoApprovePermissions: cfg.autoApprovePermissions,
     });
+
+    /**
+     * Deliver `text` to any session by id, routing through the tracked record
+     * when we have one so the existing state machine stays authoritative.
+     * ctx.session.synthetic/prompt address any session, so this works for peers
+     * this plugin did not spawn.
+     */
+    const deliverToSession = async (
+      sessionId: string,
+      text: string,
+      noReply: boolean,
+    ): Promise<string> => {
+      const known = tracked.get(sessionId);
+      const target = known?.childID ?? sessionId;
+      if (noReply) {
+        await ctx.session.synthetic({ sessionID: target, text });
+        return `Injected context into ${target} (no reply requested).`;
+      }
+      // A tracked child goes through startTurn so a failed send is reported
+      // rather than silently leaving stale results in place.
+      if (known) {
+        if (isTerminal(known.state)) known.state = "starting";
+        known.errorText = undefined;
+        known.structured = undefined;
+        known.resultText = undefined;
+        await startTurn(known, text);
+        if (isTerminal(known.state) && known.errorText) {
+          throw new Error(known.errorText);
+        }
+        return `Sent follow-up to ${target}; it is running again.`;
+      }
+      await ctx.session.prompt({ sessionID: target, text });
+      return `Sent to ${target}.`;
+    };
+
+    // ------------------------------------------------------------------
+    // Project presence registry
+    //
+    // opencode has no `session.list()`, so peers are discovered passively from
+    // the event stream. Every session event carries `data.sessionID` plus a
+    // `location.directory`, so grouping observed ids by directory is enough to
+    // answer "who else is working here" without a server round-trip.
+    //
+    // Entries are deliberately cross-process: a standalone `opencode` run
+    // alongside the Desktop app does not share this Map, so presence is also
+    // mirrored into ctx.storage. That makes a peer in one process visible to a
+    // peer in the other, and survives a reload.
+    // ------------------------------------------------------------------
+    const peers = new Map<string, Peer>();
+    /**
+     * Session ids this plugin instance has announced itself for. ctx exposes no
+     * "current session" outside a tool call or the context hook, so self is
+     * learned from those and remembered here for cleanup.
+     */
+    const selfSessionIDs = new Set<string>();
+    /** Storage key for the mirrored registry. Versioned so shape changes are visible. */
+    const PEER_STORE_KEY = "presence:v1";
+    const peerStore = ctx.storage as unknown as {
+      get?: (key: string) => Promise<unknown>;
+      set?: (key: string, value: unknown) => Promise<unknown> | void;
+    } | undefined;
+
+    const peerKey = (sessionId: string): string => sessionId;
+
+    /** Drop peers unheard from for longer than peerStaleSec. */
+    const prunePeers = (): void => {
+      const cutoff = Date.now() - cfg.peerStaleSec * 1000;
+      for (const [id, p] of peers) {
+        if (p.lastSeenAt < cutoff) peers.delete(id);
+      }
+    };
+
+    const recordPeer = (
+      sessionId: string,
+      directory: string,
+      patch: Partial<Peer> = {},
+    ): Peer | undefined => {
+      if (!sessionId || !directory) return undefined;
+      const now = Date.now();
+      const existing = peers.get(peerKey(sessionId));
+      // A session that changes directory is a different peer context; drop the
+      // stale record rather than reporting it under two projects at once.
+      if (existing && existing.directory !== directory) peers.delete(peerKey(sessionId));
+      const base: Peer =
+        existing ??
+        {
+          sessionId,
+          shortId: sessionId.slice(0, 8),
+          directory,
+          state: "idle",
+          lastSeenAt: now,
+        };
+      const next: Peer = { ...base, ...patch, lastSeenAt: now, sessionId };
+      if (next.task !== undefined) next.task = truncate(next.task, cfg.peerTaskChars);
+      peers.set(peerKey(sessionId), next);
+      // Bound growth: a long-lived server sees many session ids.
+      if (peers.size > cfg.maxClaimedPeers) {
+        const oldest = [...peers.entries()].sort(
+          (a, b) => a[1].lastSeenAt - b[1].lastSeenAt,
+        )[0];
+        if (oldest) peers.delete(oldest[0]);
+      }
+      return next;
+    };
+
+    /**
+     * Mirror presence into ctx.storage so peers in a separate opencode process
+     * see each other. Best-effort and debounced: a storage rejection must never
+     * break orchestration, and heartbeats must not hammer the store.
+     */
+    let peerMirrorTimer: ReturnType<typeof setTimeout> | undefined;
+    let peerMirrorDirty = false;
+    const mirrorPeers = (): void => {
+      if (!peerStore?.set) return;
+      peerMirrorDirty = true;
+      if (peerMirrorTimer !== undefined) return;
+      peerMirrorTimer = setTimeout(() => {
+        peerMirrorTimer = undefined;
+        if (!peerMirrorDirty) return;
+        peerMirrorDirty = false;
+        const snapshot = [...peers.values()].map((p) => ({
+          sessionId: p.sessionId,
+          directory: p.directory,
+          state: p.state,
+          lastSeenAt: p.lastSeenAt,
+          agent: p.agent,
+          task: p.task,
+        }));
+        void Promise.resolve(peerStore.set?.(PEER_STORE_KEY, snapshot)).catch(
+          (err: unknown) => log("debug", `peer mirror write failed: ${describeError(err)}`),
+        );
+      }, 2000);
+    };
+
+    /** Merge a remote snapshot, never letting it overwrite fresher local state. */
+    const mergeRemotePeers = (raw: unknown): void => {
+      if (!Array.isArray(raw)) return;
+      const cutoff = Date.now() - cfg.peerStaleSec * 1000;
+      for (const item of raw) {
+        const r = item as Partial<Peer> & { lastSeenAt?: number };
+        if (typeof r?.sessionId !== "string" || typeof r.directory !== "string") continue;
+        if (typeof r.lastSeenAt !== "number" || r.lastSeenAt < cutoff) continue;
+        const local = peers.get(peerKey(r.sessionId));
+        if (local && local.lastSeenAt >= r.lastSeenAt) continue;
+        recordPeer(r.sessionId, r.directory, {
+          state: r.state === "running" ? "running" : "idle",
+          agent: typeof r.agent === "string" ? r.agent : undefined,
+          task: typeof r.task === "string" ? r.task : undefined,
+        });
+      }
+    };
+
+    if (peerStore?.get) {
+      void Promise.resolve(peerStore.get(PEER_STORE_KEY))
+        .then((snapshot) => {
+          prunePeers();
+          mergeRemotePeers(snapshot);
+        })
+        .catch((err: unknown) =>
+          log("debug", `peer snapshot read failed: ${describeError(err)}`),
+        );
+    }
+
+    /** Peers in `directory`, newest first, stale entries already pruned. */
+    const peersIn = (directory: string, excludeSelf?: string): Peer[] => {
+      prunePeers();
+      return [...peers.values()]
+        .filter((p) => p.directory === directory && p.sessionId !== excludeSelf)
+        .sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+    };
+
+    const agoText = (ms: number): string => {
+      const s = Math.max(0, Math.round((Date.now() - ms) / 1000));
+      if (s < 60) return `${s}s ago`;
+      const m = Math.round(s / 60);
+      if (m < 60) return `${m}m ago`;
+      return `${Math.round(m / 60)}h ago`;
+    };
+
+    const describePeer = (p: Peer): string => {
+      const bits = [
+        `${p.shortId}`,
+        p.state === "running" ? "running" : "idle",
+        agoText(p.lastSeenAt),
+      ];
+      if (p.task) bits.push(p.task);
+      else if (p.agent) bits.push(p.agent);
+      return `- ${bits.join(" | ")}`;
+    };
+
+    /**
+     * The one-line awareness injection. Kept deliberately terse: it fires on
+     * every request, so it has to pay for itself in a couple of lines.
+     */
+    const buildPeerNotice = (directory: string, selfId: string): string | undefined => {
+      const others = peersIn(directory, selfId);
+      if (others.length === 0) return undefined;
+      const shown = others.slice(0, cfg.maxPeers);
+      const extra = others.length - shown.length;
+      const lines = [
+        `[${others.length} other session${others.length === 1 ? "" : "s"} active in this project]`,
+        ...shown.map(describePeer),
+      ];
+      if (extra > 0) lines.push(`- (+${extra} more)`);
+      lines.push(
+        "Changes in this project may be theirs, not yours. `project_sessions` for detail, `session_send` to coordinate, `session_broadcast` to warn everyone.",
+      );
+      return lines.join("\n");
+    };
+
+    /** Unique sentinel so the awareness line can be re-stripped, never doubled. */
+    const PEER_SENTINEL = "[opencode-sessions:peers]";
 
     const activeCount = (): number => {
       let n = 0;
@@ -733,7 +1010,7 @@ export default Plugin.define({
       const t = tracked.get(sessionId) ?? (await hydrate(sessionId));
       if (!t) {
         return {
-          message: `Unknown session "${sessionId}". Only sessions created by this plugin (titles starting with "${cfg.titlePrefix}") are tracked. Use list_sessions to see them.`,
+          message: `Unknown session "${sessionId}". Pass a session spawned by this plugin (list_sessions) or a peer in this project (project_sessions).`,
         };
       }
       return { t };
@@ -899,12 +1176,31 @@ export default Plugin.define({
     const pump = (async (): Promise<void> => {
       try {
         for await (const raw of ctx.event.subscribe({ signal: abort.signal })) {
-          const ev = raw as unknown as { type?: string; data?: Record<string, unknown> };
+          const ev = raw as unknown as {
+            type?: string;
+            data?: Record<string, unknown>;
+            location?: { directory?: string; project?: { id?: string } };
+          };
           try {
             const type = typeof ev.type === "string" ? ev.type : "";
             const data = (ev.data ?? {}) as Record<string, unknown>;
             const sessionID =
               typeof data["sessionID"] === "string" ? (data["sessionID"] as string) : undefined;
+            // Presence: any session event is proof that session exists and is
+            // working, whether or not this plugin spawned it or it ever claimed
+            // itself. Recorded before the tracked-only branches below so an
+            // untracked peer still registers.
+            if (sessionID && typeof ev.location?.directory === "string") {
+              recordPeer(sessionID, ev.location.directory, {
+                state:
+                  type === "session.idle" || type === "session.execution.succeeded"
+                    ? "idle"
+                    : "running",
+                agent:
+                  typeof data["agent"] === "string" ? (data["agent"] as string) : undefined,
+              });
+              mirrorPeers();
+            }
             if (type === "session.idle" || type === "session.execution.succeeded") {
               if (!sessionID) continue;
               const t = tracked.get(sessionID);
@@ -993,6 +1289,62 @@ export default Plugin.define({
       schema: z.record(z.string(), z.any()).optional().describe("Optional JSON Schema; the child is instructed to answer with conforming JSON, which surfaces as structured_output."),
     });
 
+    // ------------------------------------------------------------------
+    // Ambient peer awareness
+    //
+    // Hooks `context` rather than only exposing a tool, because the point is
+    // that an agent should know a peer exists *before* it invents an
+    // explanation for a file changing under it. Follows goal.ts's pattern:
+    // strip our own previous injection by sentinel, then push a fresh one, so
+    // it survives compaction without ever doubling up.
+    // ------------------------------------------------------------------
+    if (cfg.peerAwareness) {
+      try {
+        await ctx.session.hook("context", (event) => {
+          const sessionID = typeof event?.sessionID === "string" ? event.sessionID : "";
+          if (!sessionID) return;
+          const messages = Array.isArray(event.messages) ? event.messages : [];
+          const directory = defaultDirectory;
+
+          // Self-claim: this fires on the session's very first turn, before it
+          // has produced any observable event. Without it a brand-new idle
+          // session is invisible to peers until it does something.
+          const self = peers.get(peerKey(sessionID));
+          const dueForHeartbeat =
+            !self || Date.now() - self.lastSeenAt >= cfg.peerHeartbeatSec * 1000;
+          if (dueForHeartbeat) {
+            selfSessionIDs.add(sessionID);
+            recordPeer(sessionID, directory, { state: "running", claimed: true });
+            mirrorPeers();
+          }
+
+          // Always strip the prior injection first, even when we are not adding
+          // a new one, or a session that lost its peers keeps a stale notice.
+          for (let i = messages.length - 1; i >= 0; i--) {
+            const m = messages[i];
+            if (m?.role !== "system") continue;
+            const text =
+              typeof m.content === "string"
+                ? m.content
+                : Array.isArray(m.content)
+                  ? m.content.map((c) => (typeof c?.text === "string" ? c.text : "")).join("")
+                  : "";
+            if (text.includes(PEER_SENTINEL)) messages.splice(i, 1);
+          }
+
+          const notice = buildPeerNotice(directory, sessionID);
+          if (!notice) return;
+          messages.push({
+            role: "system",
+            content: [{ type: "text", text: `${PEER_SENTINEL}\n${notice}` }],
+          });
+        });
+      } catch (err) {
+        // A failed awareness hook must not disable session orchestration.
+        log("warn", `peer awareness hook failed: ${describeError(err)}`);
+      }
+    }
+
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "spawn_session",
@@ -1068,16 +1420,34 @@ export default Plugin.define({
       editor.add({
         name: "session_send",
         description:
-          "Send a follow-up message to a spawned child session. With noReply:true it injects context without triggering a new assistant turn.",
+          "Send a message to another session. Works for sessions this plugin spawned and for any other session in this project (see project_sessions) — use the full id, not the 8-char prefix. With noReply:true it injects context without triggering a new assistant turn.",
         input: z.object({
-          sessionId: z.string().describe("Child session id."),
+          sessionId: z.string().describe("Session id (child or peer)."),
           text: z.string().describe("Message text."),
-          noReply: z.boolean().optional().describe("Inject the message without asking the child to reply (default false)."),
+          noReply: z.boolean().optional().describe("Inject the message without asking the session to reply (default false)."),
         }),
         execute: async (input) => {
           const args = input as { sessionId: string; text: string; noReply?: boolean };
           const found = await requireTracked(args.sessionId);
-          if ("message" in found) return { content: found.message };
+          if ("message" in found) {
+            // Not a session we spawned. It may still be a known peer in this
+            // project: ctx.session.synthetic/prompt address any session, so
+            // refusing here was a plugin-level restriction, not a platform one.
+            const peer = peers.get(peerKey(args.sessionId));
+            if (peer && peer.directory === defaultDirectory) {
+              try {
+                const how = await deliverToSession(args.sessionId, args.text, args.noReply === true);
+                // Announce the delivery so the peer's own awareness line shows
+                // that someone reached out, rather than context appearing.
+                recordPeer(peer.sessionId, peer.directory, { state: "running" });
+                mirrorPeers();
+                return { content: `${how} (peer session, not spawned by this plugin)` };
+              } catch (err) {
+                return { content: `Failed to send to peer ${args.sessionId}: ${describeError(err)}` };
+              }
+            }
+            return { content: found.message };
+          }
           const t = found.t;
 
           if (args.noReply) {
@@ -1089,19 +1459,14 @@ export default Plugin.define({
             }
           }
 
-          if (isTerminal(t.state)) t.state = "starting";
-          t.errorText = undefined;
-          t.structured = undefined;
-          t.resultText = undefined;
           // Await the prompt handoff so a failed send is reported instead of
           // silently claiming the child is running again (see startTurn).
-          await startTurn(t, args.text);
-          if (isTerminal(t.state) && t.errorText) {
-            return { content: `Failed to send follow-up to ${t.childID}: ${t.errorText}` };
+          try {
+            const how = await deliverToSession(args.sessionId, args.text, false);
+            return { content: `${how} Use session_result(wait:true) to await completion.` };
+          } catch (err) {
+            return { content: `Failed to send follow-up to ${t.childID}: ${describeError(err)}` };
           }
-          return {
-            content: `Sent follow-up to ${t.childID}; it is running again. Use session_result(wait:true) to await completion.`,
-          };
         },
       });
 
@@ -1258,6 +1623,105 @@ export default Plugin.define({
           return { content: `Sessions (${rows.length}):\n${rows.join("\n")}` };
         },
       });
+
+      // ---- project presence tools -------------------------------------
+      // These see sessions this plugin did not spawn, which is the whole point:
+      // two independently opened sessions in one repo otherwise have no way to
+      // know about each other.
+
+      editor.add({
+        name: "project_sessions",
+        description:
+          "List other sessions working in the same project directory, whether or not this plugin spawned them. Shows each peer's state, how long since it was last active, and any task it declared via session_claim. Use this before editing, to find out whether a surprising diff is someone else's work.",
+        input: z.object({
+          task: z
+            .string()
+            .optional()
+            .describe(
+              "Declare what this session is working on, so peers can see it (persists across turns).",
+            ),
+        }),
+        execute: async (input, toolCtx) => {
+          const args = input as { task?: string };
+          const self = peers.get(peerKey(toolCtx.sessionID));
+          // Claiming is idempotent and cheap; do it on every call so a session
+          // that only ever uses tools (never the context hook) is still visible.
+          if (args.task !== undefined && args.task !== "") {
+            selfSessionIDs.add(toolCtx.sessionID);
+            recordPeer(toolCtx.sessionID, defaultDirectory, {
+              state: "running",
+              task: args.task,
+              claimed: true,
+            });
+            mirrorPeers();
+          }
+
+          const others = peersIn(defaultDirectory, toolCtx.sessionID);
+          if (others.length === 0) {
+            return {
+              content: `No other sessions in ${defaultDirectory}.${
+                self ? `\n(this session: ${describePeer(self)})` : ""
+              }`,
+            };
+          }
+          const rows = others.map(describePeer);
+          const header = `${others.length} other session${others.length === 1 ? "" : "s"} in ${defaultDirectory}:`;
+          const footer = "Use session_send to message one, session_broadcast to warn all of them.";
+          return { content: `${header}\n${rows.join("\n")}\n${footer}` };
+        },
+      });
+
+      editor.add({
+        name: "session_broadcast",
+        description:
+          "Send one message to every other session working in this project. Use before a wide-reaching change so peers do not duplicate or fight the work. Prefer session_send when you mean one specific session.",
+        input: z.object({
+          text: z.string().describe("The message to deliver to every peer."),
+          noReply: z
+            .boolean()
+            .optional()
+            .describe("Inject without asking peers to respond (default false)."),
+        }),
+        execute: async (input, toolCtx) => {
+          const args = input as { text: string; noReply?: boolean };
+          const others = peersIn(defaultDirectory, toolCtx.sessionID);
+          if (others.length === 0) {
+            return { content: "No other sessions in this project; nothing sent." };
+          }
+          let delivered = 0;
+          const failed: string[] = [];
+          for (const p of others) {
+            try {
+              await deliverToSession(p.sessionId, args.text, args.noReply === true);
+              // Keep the peer's state honest: a prompt put it to work.
+              recordPeer(p.sessionId, p.directory, { state: "running" });
+              delivered += 1;
+            } catch (err) {
+              failed.push(`${p.shortId} (${describeError(err)})`);
+            }
+          }
+          mirrorPeers();
+          const parts = [`Broadcast to ${delivered}/${others.length} session(s).`];
+          if (failed.length > 0) parts.push(`Failed: ${failed.join(", ")}`);
+          return { content: parts.join("\n") };
+        },
+      });
+
+      /** Deliver `text` to any session, spawning it if it is not tracked here. */
+      const deliverToSession = async (
+        sessionId: string,
+        text: string,
+        noReply: boolean,
+      ): Promise<string> => {
+        const known = tracked.get(sessionId);
+        const childID = known?.childID ?? sessionId;
+        if (noReply) {
+          await ctx.session.synthetic({ sessionID: childID, text });
+          return `Injected context into ${childID} (no reply requested).`;
+        }
+        await ctx.session.prompt({ sessionID: childID, text });
+        return `Sent to ${childID}.`;
+      };
     });
 
     return () => {
@@ -1268,6 +1732,14 @@ export default Plugin.define({
       tracked.clear();
       parentDefaults.clear();
       outcomeCache.clear();
+      // Drop presence entries this instance claimed, so a closed session stops
+      // being advertised as a peer immediately rather than at the stale cutoff.
+      // ctx exposes no self id, so the ids we claimed are tracked as we go.
+      for (const id of selfSessionIDs) peers.delete(peerKey(id));
+      selfSessionIDs.clear();
+      if (peerMirrorTimer !== undefined) clearTimeout(peerMirrorTimer);
+      mirrorPeers();
+      peers.clear();
     };
   },
 });
