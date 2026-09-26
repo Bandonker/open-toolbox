@@ -13,7 +13,34 @@ redaction, and a lifetime usage dashboard.
 
 ---
 
-## Quick start
+## Contents
+
+- [Getting started](#getting-started)
+  - [Quick start](#quick-start)
+  - [Verify](#verify)
+  - [Layout](#layout)
+- [Plugins](#plugins) — the 15 plugins at a glance
+- [Plugin details](#plugin-details) — what each one does
+- [Reference](#reference)
+  - [Commands](#commands)
+  - [Configuration](#configuration)
+  - [tool-audit options](#config-tool-audit)
+  - [context-pruner options](#config-context-pruner)
+  - [session-export options](#config-session-export)
+  - [memory options](#config-memory)
+  - [goal options](#config-goal)
+  - [secret-shield options](#config-secret-shield)
+  - [finish-guard options](#config-finish-guard)
+  - [usage-stats options](#config-usage-stats)
+- [Development](#development)
+  - [Publishing](#publishing)
+- [FAQ](#faq)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Getting started
+
+### Quick start
 
 > **Requires opencode v2.** On v2 the plugins must be installed as **packages**
 > registered in the `plugins` array. Copying the loose `.ts` files into
@@ -29,12 +56,12 @@ cd open-toolbox
 npm install
 npm run build:packages        # emits packages/<name>/ (package.json + index.js)
 
-# install the packages under your opencode config dir
+## install the packages under your opencode config dir
 CFG="$HOME/.config/opencode"
 mkdir -p "$CFG/toolbox"
 cp -r packages/* "$CFG/toolbox/"
 
-# one shared dependency install for all 15 packages
+## one shared dependency install for all 15 packages
 cat > "$CFG/toolbox/package.json" <<'JSON'
 {
   "name": "open-toolbox-runtime",
@@ -45,7 +72,7 @@ cat > "$CFG/toolbox/package.json" <<'JSON'
 JSON
 (cd "$CFG/toolbox" && npm install)      # or: bun install
 
-# each package must see node_modules from its own directory
+## each package must see node_modules from its own directory
 for d in "$CFG"/toolbox/*/; do ln -sfn ../node_modules "$d/node_modules"; done
 ```
 
@@ -101,6 +128,71 @@ cp -r /path/to/open-toolbox/packages/* .opencode/toolbox/
 (cd .opencode/toolbox && npm install)
 for d in .opencode/toolbox/*/; do ln -sfn ../node_modules "$d/node_modules"; done
 ```
+
+</details>
+
+### Verify
+
+From the repo root — no opencode server needed:
+
+```bash
+npm install --no-audit --no-fund
+npm test          # helper unit tests + mock-context checks for the pack
+npm run typecheck # tsc --noEmit over plugins/ and lib/
+```
+
+The same two commands run on every push in [CI](.github/workflows/ci.yml).
+
+### Layout
+
+After `npm run build:packages` and installing, this is what your config dir
+looks like. Each plugin is a **package directory** registered in the
+`plugins` array — not a loose `.ts` file in `plugins/`:
+
+```
+~/.config/opencode/        # or <repo>/.opencode/ — this is under your HOME dir,
+                           # not relative to the repo
+├── opencode.jsonc         # the "plugins" array pointing at toolbox/*/
+└── toolbox/               # one directory per plugin
+    ├── package.json       # shared dependency manifest
+    ├── node_modules/      # one install, shared by all 15
+    ├── opencode-sessions/ # index.js + helpers.js
+    │   └── node_modules -> ../node_modules
+    ├── memory/
+    │   ├── package.json
+    │   ├── index.js
+    │   ├── lib/sqlite.js
+    │   └── node_modules -> ../node_modules
+    ├── context-pruner/
+    ├── secret-shield/
+    └── … 15 in total
+```
+
+<details>
+<summary><b>Why a directory per plugin, and not loose files in <code>plugins/</code>?</b></summary>
+
+Two independent reasons, both of which make the flat layout fail:
+
+1. **Resolution.** opencode v2 auto-discovers loose `.ts` files under
+   `plugins/`, but does not resolve bare npm specifiers from the config
+   directory for them. A plugin that does `import { Plugin } from
+   "@opencode/plugin"` fails to load with `Cannot find package
+   '@opencode/plugin'`. Registered as a package directory, it resolves
+   normally.
+2. **The loader treats every export as a plugin factory.** A stray helper
+   export in `plugins/` fails the load with `prompt.split is not a function`
+   and cascades into config/provider errors. Keeping helpers in their own
+   files outside `plugins/` avoids that entirely.
+
+</details>
+
+<details>
+<summary><b>Why does every package need its own <code>node_modules</code> symlink?</b></summary>
+
+Because resolution is anchored at the package directory, not hoisted to the
+config root. A single `npm install` in `toolbox/` populates the shared copy;
+the per-package symlink is what makes it reachable from each plugin. This is
+the same layout pnpm uses.
 
 </details>
 
@@ -334,7 +426,9 @@ spending model tokens.
 
 </details>
 
-## Commands
+## Reference
+
+### Commands
 
 `command-pack` adds these to your command palette (`usage-stats` adds `/stats`, `goal` adds `/goal`):
 
@@ -354,7 +448,7 @@ Each command injects a short instruction into the current session, so the agent
 does the work with its normal tools. If a command's tool isn't installed, the
 instruction says so instead of failing silently.
 
-## Configuration
+### Configuration
 
 Zero config is required — files in `plugins/` load with defaults. The `plugins`
 array in `opencode.jsonc` is for **npm packages** (and directory-based plugin
@@ -380,7 +474,9 @@ A string starting with `-` removes a plugin.
 > loaded with defaults. To tune a local plugin, use its env vars — that is why
 > every knob below has one.
 
-### tool-audit options
+<a id="config-tool-audit"></a>
+<details>
+<summary><strong>tool-audit options</strong></summary>
 
 Each option is read from the plugin `options` object (npm installs) or the env
 var (always works):
@@ -398,7 +494,11 @@ Values are read when the plugin loads, so restart opencode after changing them.
 `opencode-sessions` has its own knobs — see
 [its README](opencode-sessions/README.md#config-knobs).
 
-### context-pruner options
+</details>
+
+<a id="config-context-pruner"></a>
+<details>
+<summary><strong>context-pruner options</strong></summary>
 
 `context-pruner` is a *context compiler*: it trims stale tool output from the
 outgoing request only. The session transcript on disk is unchanged, and a pruned
@@ -477,7 +577,11 @@ nudges. It reads optional config from
 | `protectedFilePatterns` | `OPENCODE_CONTEXT_PRUNER_PROTECTED_FILES` | (none) | Globs of file paths never pruned |
 | `debug` | `OPENCODE_CONTEXT_PRUNER_DEBUG` | `false` | Write a debug log under `~/.config/opencode/logs/context-pruner` |
 
-### session-export options
+</details>
+
+<a id="config-session-export"></a>
+<details>
+<summary><strong>session-export options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -489,7 +593,11 @@ nudges. It reads optional config from
 | `maxCharsPerPart` | `OPENCODE_SESSION_EXPORT_MAX_PART_CHARS` | `4000` | Truncate each part to this many chars |
 | `redact` | `OPENCODE_SESSION_EXPORT_REDACT` | `true` | Scrub secrets; rewrite home paths to `~` |
 
-### memory options
+</details>
+
+<a id="config-memory"></a>
+<details>
+<summary><strong>memory options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -502,7 +610,11 @@ nudges. It reads optional config from
 | `maxEntries` | `OPENCODE_MEMORY_MAX_ENTRIES` | `0` | Prune least-important rows beyond this (`0` = unlimited) |
 | `log` | `OPENCODE_MEMORY_LOG` | `false` | Log activity to stderr |
 
-### goal options
+</details>
+
+<a id="config-goal"></a>
+<details>
+<summary><strong>goal options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -528,7 +640,11 @@ reply is unchanged, after `maxFailures` consecutive execution errors, or when th
 iteration/time budget is exhausted. Goal state is persisted per session, so a
 paused or budget-stopped goal can be resumed with `/goal resume`.
 
-### secret-shield options
+</details>
+
+<a id="config-secret-shield"></a>
+<details>
+<summary><strong>secret-shield options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -539,7 +655,11 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 | `blockEnvReads` | `OPENCODE_SECRET_SHIELD_BLOCK_ENV_READS` | `true` | In `block` mode, deny protected secret-file reads |
 | `log` | `OPENCODE_SECRET_SHIELD_LOG` | `false` | Emit diagnostics to stderr |
 
-### finish-guard options
+</details>
+
+<a id="config-finish-guard"></a>
+<details>
+<summary><strong>finish-guard options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -548,7 +668,11 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 | `retry` | `OPENCODE_FINISH_GUARD_RETRY` | `true` | Ask opencode to retry the turn when a stream is malformed |
 | `retryMax` | `OPENCODE_FINISH_GUARD_RETRY_MAX` | `3` | Maximum retry attempts before the turn is allowed to fail |
 
-### usage-stats options
+</details>
+
+<a id="config-usage-stats"></a>
+<details>
+<summary><strong>usage-stats options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -598,70 +722,7 @@ config. The server validates a `plugins` (plural) array — that is the key the
 runtime reads, confirmed in the server log when the config is reloaded.
 </details>
 
-## Layout
-
-After `npm run build:packages` and installing, this is what your config dir
-looks like. Each plugin is a **package directory** registered in the
-`plugins` array — not a loose `.ts` file in `plugins/`:
-
-```
-~/.config/opencode/        # or <repo>/.opencode/ — this is under your HOME dir,
-                           # not relative to the repo
-├── opencode.jsonc         # the "plugins" array pointing at toolbox/*/
-└── toolbox/               # one directory per plugin
-    ├── package.json       # shared dependency manifest
-    ├── node_modules/      # one install, shared by all 15
-    ├── opencode-sessions/ # index.js + helpers.js
-    │   └── node_modules -> ../node_modules
-    ├── memory/
-    │   ├── package.json
-    │   ├── index.js
-    │   ├── lib/sqlite.js
-    │   └── node_modules -> ../node_modules
-    ├── context-pruner/
-    ├── secret-shield/
-    └── … 15 in total
-```
-
-<details>
-<summary><b>Why a directory per plugin, and not loose files in <code>plugins/</code>?</b></summary>
-
-Two independent reasons, both of which make the flat layout fail:
-
-1. **Resolution.** opencode v2 auto-discovers loose `.ts` files under
-   `plugins/`, but does not resolve bare npm specifiers from the config
-   directory for them. A plugin that does `import { Plugin } from
-   "@opencode/plugin"` fails to load with `Cannot find package
-   '@opencode/plugin'`. Registered as a package directory, it resolves
-   normally.
-2. **The loader treats every export as a plugin factory.** A stray helper
-   export in `plugins/` fails the load with `prompt.split is not a function`
-   and cascades into config/provider errors. Keeping helpers in their own
-   files outside `plugins/` avoids that entirely.
-
 </details>
-
-<details>
-<summary><b>Why does every package need its own <code>node_modules</code> symlink?</b></summary>
-
-Because resolution is anchored at the package directory, not hoisted to the
-config root. A single `npm install` in `toolbox/` populates the shared copy;
-the per-package symlink is what makes it reachable from each plugin. This is
-the same layout pnpm uses.
-
-</details>
-
-## Verify
-
-From the repo root — no opencode server needed:
-
-```bash
-npm install --no-audit --no-fund
-npm test          # helper unit tests + mock-context checks for the pack
-npm run typecheck # tsc --noEmit over plugins/ and lib/
-```
-
-The same two commands run on every push in [CI](.github/workflows/ci.yml).
 
 ## Development
 
@@ -673,7 +734,7 @@ node opencode-sessions/sync.mjs        # install: repo -> plugins/ (fixes the he
 node opencode-sessions/sync.mjs pull   # pull:    plugins/ -> repo
 ```
 
-## Publishing
+### Publishing
 
 Each plugin also ships as its own scoped npm package (the v2 loader allows
 exactly one plugin per package). The build inlines each plugin's helpers and
