@@ -235,7 +235,14 @@ prompts, cancel them, and hand off the current working point into a fresh
 session. Created sessions are real opencode sessions and appear in the Desktop
 session switcher.
 
-Tools: 7. See the [opencode-sessions package documentation](opencode-sessions/README.md)
+It also adds **project presence**: any session working in a repo can see the
+other sessions in that repo — including ones this plugin did not spawn — and can
+message them. opencode has no `session.list()`, so peers are discovered from the
+server-wide event stream and announced by each session on its first turn. A short
+notice is injected into each request when peers exist, so an agent learns a
+change may be someone else's before it explains it away.
+
+Tools: 9. See the [opencode-sessions package documentation](opencode-sessions/README.md)
 for the complete tool list and configuration knobs.
 
 </details>

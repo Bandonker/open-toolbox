@@ -8,10 +8,12 @@ blocking the server event loop**.
 Every session created here is a real opencode session, so it appears in the
 Desktop session list / tab switcher exactly as if the user had hit `+`.
 
-It registers seven tools on the parent agent (`spawn_session`, `session_result`,
+It registers nine tools on the parent agent (`spawn_session`, `session_result`,
 `session_send`, `session_cancel`, `session_permission`, `session_handoff`,
-`list_sessions`) and does all completion tracking through the server's event
-stream.
+`list_sessions`, `project_sessions`, `session_broadcast`) and does all
+completion tracking through the server's event stream. The first seven are
+about sessions this plugin spawned; the last two are about *other* sessions
+working in the same project.
 
 - Plugin source: `plugins/opencode-sessions.ts`
 - Dev + verification: `opencode-sessions/` (this folder)
@@ -74,7 +76,7 @@ project-local copy of this plugin would shadow the global one for that project.
 
 ## Tools
 
-All five tools are callable by the parent agent. `sessionId` values are the child
+All nine tools are callable by the parent agent. `sessionId` values are the child
 session ids returned by `spawn_session`.
 
 ### `spawn_session`
@@ -134,6 +136,61 @@ continue the work there seamlessly.
 the current parent. Combine the in-memory map with `session.children(parentID)`
 filtered by the title prefix.
 
+## Project presence
+
+The seven tools above only know about sessions this plugin spawned. Two windows
+open on the same repo, each running its own agent, had no way to learn about each
+other — so an agent that found a file it had not touched had nothing to go on
+except inventing a reason.
+
+opencode exposes no `session.list()` (`ctx.session` is a `Pick` of `SessionApi`
+without `list`, `ctx.app` is only `{name, version, channel}`, `ctx.rpc` is only
+`{register}`), so peers are discovered **passively from the event stream**. Every
+session event on the server-wide stream carries `data.sessionID` and
+`location.directory`, which is enough to group sessions by project with no server
+round-trip. Peers are also announced by the session itself on its first turn, so a
+brand-new idle session is visible before it does anything.
+
+Presence is mirrored through `ctx.storage`, so a session in a standalone
+`opencode` process sees peers from the Desktop app (and vice versa).
+
+### `project_sessions`
+
+`{ task? }` — lists other sessions in this session's project directory, with each
+peer's state (`running`/`idle`), how long since it was last active, and any task
+it declared. Passing `task` declares what *this* session is working on; it is also
+the claim path for a session that only ever uses tools.
+
+### `session_broadcast`
+
+`{ text, noReply? }` — sends one message to every other session in the project.
+Use before a wide-reaching change so peers do not duplicate or fight the work.
+Prefer `session_send` when you mean one specific session.
+
+### `session_send` on peers
+
+`session_send` now accepts any session in the project, not just spawned
+children: `ctx.session.synthetic` and `ctx.session.prompt` address any session, so
+the old refusal was a plugin-level restriction rather than a platform one.
+Spawned children still route through `startTurn` so a failed send is reported. An
+id that is neither a spawned child nor a known peer is still refused.
+
+### Ambient awareness
+
+Beyond the tools, the plugin injects a short notice into each request when peers
+exist, so an agent learns about a peer *before* it explains the change away:
+
+```
+[2 other sessions active in this project]
+- ses_aaaaaa | running | 40s ago | refactoring auth
+- ses_bbbbbb | idle | 6m ago | build
+Changes in this project may be theirs, not yours. `project_sessions` for detail, `session_send` to coordinate, `session_broadcast` to warn everyone.
+```
+
+It hooks `context` (so it survives compaction), strips its own previous injection
+by sentinel before re-adding, and is **removed** when peers disappear rather than
+going stale. Set `peerAwareness: false` to keep the tools but drop the injection.
+
 ## Config knobs
 
 Plugin `options` (or the matching env var) are read at load time and clamped:
@@ -148,6 +205,12 @@ Plugin `options` (or the matching env var) are read at load time and clamped:
 | `autoInjectParent` | — | `true` | Post a completion note to the parent when no waiter is attached. |
 | `maxInjectChars` | — | `4000` | Truncation for injected text. |
 | `injectPermissionNotices` | — | `true` | Post a notice when a tracked child is blocked on a permission. |
+| `peerAwareness` | `OPENCODE_SESSIONS_PEER_AWARENESS` | `true` | Inject the peer notice into requests. Tools still work when off. |
+| `peerStaleSec` | `OPENCODE_SESSIONS_PEER_STALE_SEC` | `900` | Drop peers unheard from for this long. |
+| `maxPeers` | `OPENCODE_SESSIONS_MAX_PEERS` | `8` | Cap peers in the injected notice. |
+| `peerTaskChars` | `OPENCODE_SESSIONS_PEER_TASK_CHARS` | `120` | Truncation for a declared task. |
+| `peerHeartbeatSec` | `OPENCODE_SESSIONS_PEER_HEARTBEAT_SEC` | `60` | How often a session refreshes its presence. |
+| `maxClaimedPeers` | `OPENCODE_SESSIONS_MAX_CLAIMED_PEERS` | `2000` | Bound on the registry. |
 
 ## Why it doesn't block the event loop (reentrancy)
 
