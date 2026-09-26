@@ -15,54 +15,91 @@ redaction, and a lifetime usage dashboard.
 
 ## Quick start
 
+> **Requires opencode v2.** On v2 the plugins must be installed as **packages**
+> registered in the `plugins` array. Copying the loose `.ts` files into
+> `~/.config/opencode/plugins/` does **not** work here — opencode's
+> auto-discovery of that directory does not resolve bare npm specifiers, so
+> every plugin fails with `Cannot find package '@opencode/plugin'`. If you
+> followed an older copy-paste-into-`plugins/` guide, see
+> [FAQ](#faq).
+
 ```bash
 git clone https://github.com/Bandonker/open-toolbox.git
 cd open-toolbox
+npm install
+npm run build:packages        # emits packages/<name>/ (package.json + index.js)
 
-# copy all three pieces into your opencode config (see "Layout" below)
+# install the packages under your opencode config dir
 CFG="$HOME/.config/opencode"
-mkdir -p "$CFG/plugins" "$CFG/lib" "$CFG/opencode-sessions"
-cp plugins/*.ts          "$CFG/plugins/"
-cp lib/sqlite.ts         "$CFG/lib/"
-cp opencode-sessions/helpers.ts "$CFG/opencode-sessions/"
-cp package.json          "$CFG/package.json"
+mkdir -p "$CFG/toolbox"
+cp -r packages/* "$CFG/toolbox/"
 
-cd "$CFG" && npm install     # or: bun install
+# one shared dependency install for all 15 packages
+cat > "$CFG/toolbox/package.json" <<'JSON'
+{
+  "name": "open-toolbox-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": { "@opencode/plugin": "^2.0.11", "zod": "4.1.8" }
+}
+JSON
+(cd "$CFG/toolbox" && npm install)      # or: bun install
+
+# each package must see node_modules from its own directory
+for d in "$CFG"/toolbox/*/; do ln -sfn ../node_modules "$d/node_modules"; done
 ```
 
-Restart opencode. Done — every tool below is now available to your agent.
+Register the packages in the global config. This **merges** into an existing
+`opencode.jsonc` rather than overwriting it:
+
+```bash
+node -e '
+const fs=require("fs"),os=require("os"),path=require("path");
+const cfgDir=path.join(os.homedir(),".config/opencode");
+const tb=path.join(cfgDir,"toolbox"), file=path.join(cfgDir,"opencode.jsonc");
+const raw=fs.existsSync(file)?fs.readFileSync(file,"utf8"):"{}";
+const cfg=JSON.parse(raw.replace(/\/\*[\s\S]*?\*\//g,"").replace(/^\s*\/\/.*$/gm,""));
+cfg.plugins=fs.readdirSync(tb).filter(n=>fs.existsSync(path.join(tb,n,"package.json"))).sort().map(n=>path.join(tb,n));
+fs.writeFileSync(file,JSON.stringify(cfg,null,2)+"\n");
+console.log("registered "+cfg.plugins.length+" plugins -> "+file);
+'
+```
+
+Then reload opencode (`opencode reload`, or restart the app). Every tool
+below is now available to your agent.
 
 <details>
 <summary><b>Windows / PowerShell</b></summary>
 
+The package layout is identical; only the path syntax differs. Run the POSIX
+steps above in WSL/Git Bash, or adapt:
+
 ```powershell
-git clone https://github.com/Bandonker/open-toolbox.git
-cd open-toolbox
-
 $CFG = "$HOME\.config\opencode"
-New-Item -ItemType Directory "$CFG\plugins", "$CFG\lib", "$CFG\opencode-sessions" -Force | Out-Null
-Copy-Item plugins\*.ts              "$CFG\plugins\"
-Copy-Item lib\sqlite.ts             "$CFG\lib\"
-Copy-Item opencode-sessions\helpers.ts "$CFG\opencode-sessions\"
-Copy-Item package.json              "$CFG\package.json"
-
-Set-Location $CFG; npm install   # or: bun install
+New-Item -ItemType Directory "$CFG\toolbox" -Force | Out-Null
+Copy-Item -Recurse -Force packages\* "$CFG\toolbox\"
+Set-Location "$CFG\toolbox"; npm install
 ```
+
+Registering the `plugins` array uses the same `node -e` snippet — it relies on
+`os.homedir()` and `path.join()`, so it is platform-neutral. Note that a
+backslashed path in JSON must be escaped (`C:\\path\\to`); the snippet emits
+forward slashes, which opencode accepts on Windows.
 
 </details>
 
 <details>
 <summary><b>Project-local (one repo instead of globally)</b></summary>
 
-Same files, under `<repo>/.opencode/` instead of `$HOME/.config/opencode/`:
+Same packages, but under `<repo>/.opencode/toolbox/` instead of
+`$HOME/.config/opencode/toolbox/`, and registered in the **project**
+`opencode.jsonc` rather than the global one:
 
 ```bash
-mkdir -p .opencode/plugins .opencode/lib .opencode/opencode-sessions
-cp /path/to/open-toolbox/plugins/*.ts          .opencode/plugins/
-cp /path/to/open-toolbox/lib/sqlite.ts         .opencode/lib/
-cp /path/to/open-toolbox/opencode-sessions/helpers.ts .opencode/opencode-sessions/
-cp /path/to/open-toolbox/package.json          .opencode/package.json
-cd .opencode && npm install
+mkdir -p .opencode/toolbox
+cp -r /path/to/open-toolbox/packages/* .opencode/toolbox/
+(cd .opencode/toolbox && npm install)
+for d in .opencode/toolbox/*/; do ln -sfn ../node_modules "$d/node_modules"; done
 ```
 
 </details>
@@ -563,41 +600,54 @@ runtime reads, confirmed in the server log when the config is reloaded.
 
 ## Layout
 
-Copy all three folders into your config dir — **`plugins/` alone is not enough**,
-since some plugins import helpers that live outside it:
+After `npm run build:packages` and installing, this is what your config dir
+looks like. Each plugin is a **package directory** registered in the
+`plugins` array — not a loose `.ts` file in `plugins/`:
 
 ```
 ~/.config/opencode/        # or <repo>/.opencode/ — this is under your HOME dir,
                            # not relative to the repo
-├── plugins/               # what opencode loads
-│   ├── opencode-sessions.ts
-│   ├── command-pack.ts
-│   ├── tool-audit.ts
-│   ├── decision-log.ts
-│   ├── error-journal.ts
-│   ├── snippet-library.ts
-│   ├── codebase-index.ts
-│   ├── context-pruner.ts
-│   ├── session-export.ts
-│   ├── memory.ts
-│   ├── secret-shield.ts
-│   ├── finish-guard.ts
-│   ├── usage-stats.ts
-│   ├── goal.ts
-│   └── strip-skills-catalog.ts
-├── lib/
-│   └── sqlite.ts          # used by the SQLite-backed plugins
-└── opencode-sessions/
-    └── helpers.ts         # used by opencode-sessions
+├── opencode.jsonc         # the "plugins" array pointing at toolbox/*/
+└── toolbox/               # one directory per plugin
+    ├── package.json       # shared dependency manifest
+    ├── node_modules/      # one install, shared by all 15
+    ├── opencode-sessions/ # index.js + helpers.js
+    │   └── node_modules -> ../node_modules
+    ├── memory/
+    │   ├── package.json
+    │   ├── index.js
+    │   ├── lib/sqlite.js
+    │   └── node_modules -> ../node_modules
+    ├── context-pruner/
+    ├── secret-shield/
+    └── … 15 in total
 ```
 
 <details>
-<summary><b>Why aren't the helpers inside <code>plugins/</code>?</b></summary>
+<summary><b>Why a directory per plugin, and not loose files in <code>plugins/</code>?</b></summary>
 
-opencode treats **every export** of a file under `plugins/` as a plugin factory.
-A stray helper export therefore fails the load with
-`prompt.split is not a function` and cascades into config/provider errors.
-Keeping `lib/` and `opencode-sessions/` outside `plugins/` avoids that entirely.
+Two independent reasons, both of which make the flat layout fail:
+
+1. **Resolution.** opencode v2 auto-discovers loose `.ts` files under
+   `plugins/`, but does not resolve bare npm specifiers from the config
+   directory for them. A plugin that does `import { Plugin } from
+   "@opencode/plugin"` fails to load with `Cannot find package
+   '@opencode/plugin'`. Registered as a package directory, it resolves
+   normally.
+2. **The loader treats every export as a plugin factory.** A stray helper
+   export in `plugins/` fails the load with `prompt.split is not a function`
+   and cascades into config/provider errors. Keeping helpers in their own
+   files outside `plugins/` avoids that entirely.
+
+</details>
+
+<details>
+<summary><b>Why does every package need its own <code>node_modules</code> symlink?</b></summary>
+
+Because resolution is anchored at the package directory, not hoisted to the
+config root. A single `npm install` in `toolbox/` populates the shared copy;
+the per-package symlink is what makes it reachable from each plugin. This is
+the same layout pnpm uses.
 
 </details>
 
@@ -648,26 +698,70 @@ packages have no runtime dependency on each other.
 ## FAQ
 
 <details>
-<summary>opencode logs <code>failed to load plugin</code> / <code>prompt.split is not a function</code></summary>
+<summary>opencode logs <code>failed to load plugin</code> / <code>Cannot find package '@opencode/plugin'</code></summary>
 
-A helper file ended up inside `plugins/`. Move `lib/` and `opencode-sessions/`
-out of `plugins/` and restart.
+The loose-file layout is the cause. If you copied `plugins/*.ts` into
+`~/.config/opencode/plugins/`, opencode v2 will discover those files but
+cannot resolve their npm imports from the config directory, so **every**
+plugin fails identically.
+
+Fix: install the built packages and register them instead. See
+[Quick start](#quick-start). Remove the old loose files afterwards — leaving
+them in place produces a load error per plugin per reload:
+
+```bash
+rm -rf ~/.config/opencode/plugins
+```
+
+</details>
+
+<details>
+<summary>opencode logs <code>prompt.split is not a function</code></summary>
+
+A helper file ended up inside `plugins/`. opencode treats **every export** of
+a file under `plugins/` as a plugin factory, so a stray helper export breaks
+the load. The package layout avoids this by construction; if you are on the
+flat layout, move `lib/` and `opencode-sessions/` out of `plugins/` and
+restart.
+
 </details>
 
 <details>
 <summary>Tools don't appear after installing</summary>
 
-Check that you copied all three folders (`plugins/`, `lib/`,
-`opencode-sessions/`), ran `npm install` in the config dir, and fully
-restarted opencode.
+1. `npm run build:packages` actually produced `packages/<name>/package.json`.
+2. `toolbox/node_modules` exists (one `npm install` at the `toolbox/` level).
+3. Every `toolbox/<name>/node_modules` symlink exists.
+4. The absolute paths in the `plugins` array of `opencode.jsonc` are the
+   **package directories**, not the `.ts` files.
+5. You reloaded (`opencode reload`) or restarted — a reload is required, and
+   for a fresh install a full restart is safer.
+
+Confirm what opencode actually registered:
+
+```bash
+opencode plugin list
+```
+
+`opencode plugin list` reports the *configured* plugin paths, including ones
+that failed to load. To verify a plugin truly loaded, check the log for
+`loading plugin` and confirm there is no matching `failed to load plugin`:
+
+```bash
+grep -E 'loading plugin|failed to load plugin' ~/.local/share/opencode/log/opencode.log | tail
+```
+
 </details>
 
 <details>
-<summary>An npm plugin fails to load</summary>
+<summary>A third-party npm plugin fails to load</summary>
 
-The `plugins` list in `opencode.jsonc` is for npm packages. Local plugins in the
-`plugins/` folder need no config entry. Many packages are still v1-only and will
-fail under v2 — verify a v2 release before adding one.
+Third-party packages are often still v1-only. A v1 plugin depends on
+`@opencode-ai/plugin` and/or exports `Plugin` differently, and will fail under
+v2. Check its `package.json` for a dependency on `@opencode/plugin` (v2) versus
+`@opencode-ai/plugin` (v1), and confirm the release you are installing
+predates the v2 migration, before adding it to the `plugins` array.
+
 </details>
 
 ## Contributing
