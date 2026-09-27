@@ -8,6 +8,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
 
 // Sandbox HOME first: the plugin resolves config under homedir() at import time
 // and setup() watchFile()s any config it finds.
@@ -110,6 +111,66 @@ const dir = mkdtempSync(join(tmpdir(), "pruner-transcript-"));
 
   t.resetSessions();
   await cleanup();
+}
+
+// CP-24: the per-request deep copy has a measured cost, and it is small.
+//
+// Measured against the real hook (medians, fresh messages per request, Node 24):
+//   150 msgs / 0.34 MB -> 0.081 ms   600 msgs / 1.36 MB -> 0.335 ms
+//  1500 msgs / 3.41 MB -> 0.853 ms   while the whole context hook costs
+//  14-95 ms on those same sessions, i.e. the clone is <=1% of the request. A
+//  targeted copy-on-write measured 5.8-8.6x cheaper, but that would trade a
+//  0.7 ms saving on a ~90 ms hook for a rewrite that has to enumerate every
+//  mutation site to stay transcript-safe. Not worth it: this stays the simple
+//  structural copy, and the budget below is what actually keeps it honest --
+// it fails if a future change makes the copy super-linear in payload size.
+{
+  class HostPayload {
+    constructor() {
+      this.blob = "z".repeat(1000);
+    }
+  }
+  const inst = new HostPayload();
+  const withInstance = { role: "tool", content: [{ type: "tool-result", id: "i", name: "read", result: inst }] };
+  const copied = t.cloneForRequest(withInstance);
+  assert.equal(
+    copied.content[0].result,
+    inst,
+    "CP-24: a non-plain object must be shared by reference (that is what keeps the copy off host-owned payloads)",
+  );
+
+  // A long session: 500 tool calls, 6000 chars of output each.
+  const long = [];
+  for (let i = 0; i < 500; i++) {
+    const id = `call_${i}`;
+    long.push({ id: `a${i}`, role: "assistant", content: [{ type: "tool-call", id, name: "read", input: { filePath: `src/f${i}.ts` } }] });
+    long.push({
+      id: `t${i}`,
+      role: "tool",
+      content: [{ type: "tool-result", id, name: "read", result: { type: "text", value: "X".repeat(6000), metadata: { lines: 6000 } } }],
+    });
+  }
+  const bytes = JSON.stringify(long).length;
+  let sink = 0;
+  const times = [];
+  for (let trial = 0; trial < 5; trial++) {
+    const t0 = performance.now();
+    for (let i = 0; i < long.length; i++) long[i] = t.cloneForRequest(long[i]);
+    const ms = performance.now() - t0;
+    sink += long[0].content.length;
+    if (trial > 0) times.push(ms); // drop the first, JIT-warm trial
+  }
+  times.sort((a, b) => a - b);
+  const median = times[Math.floor(times.length / 2)];
+  const mb = bytes / 1e6;
+  // 20 ms/MB is ~80x the measured 0.25 ms/MB: loose enough not to flake on a
+  // loaded machine, tight enough to catch a super-linear or unbounded copy.
+  assert.ok(
+    median < 20 * mb,
+    `CP-24: cloneForRequest cost ${median.toFixed(3)} ms for ${mb.toFixed(2)} MB is over the 20 ms/MB budget (${(median / mb).toFixed(1)} ms/MB)`,
+  );
+  assert.ok(sink > 0, "sink keeps the measured work from being optimised away");
+  console.log(`  (CP-24: ${long.length} msgs / ${mb.toFixed(2)} MB cloned in ${median.toFixed(3)} ms = ${(median / mb).toFixed(2)} ms/MB)`);
 }
 
 console.log("verify-pruner-transcript: all assertions passed");

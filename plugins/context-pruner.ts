@@ -1246,6 +1246,16 @@ function writeUnit(r: CollectedResult, value: string): void {
  * before rewriting keeps the on-disk record pristine. Plain objects and arrays
  * are copied recursively; anything else (class instances, typed arrays) is kept
  * by reference so host-owned payloads are not rebuilt.
+ *
+ * CP-24: this cost is measured, not assumed - 0.081 ms for a 150-message /
+ * 0.34 MB session, 0.853 ms for 1500 messages / 3.41 MB, i.e. ~0.25 ms/MB.
+ * The context hook itself costs 14-95 ms on those same sessions, so the copy is
+ * <=1% of a request. A targeted copy-on-write (shallow message, deep only the
+ * tool-result `result`/`value` the hook actually rewrites) measures 5.8-8.6x
+ * cheaper, which is ~0.7 ms on a ~90 ms hook: not worth trading a structurally
+ * obvious copy for one that has to enumerate every mutation site to stay
+ * transcript-safe. `tests/verify-pruner-transcript.mjs` holds the budget so a
+ * future change cannot quietly make this super-linear.
  */
 function cloneForRequest<T>(value: T): T {
   if (Array.isArray(value)) return value.map((v) => cloneForRequest(v)) as unknown as T;
@@ -3630,6 +3640,11 @@ export default Plugin.define({
     // Native wins DCP cannot do: fill the compaction checkpoint ourselves,
     // recover from context-limit retries, and short-circuit title generation.
     if (typeof c.session?.hook === "function") {
+      // CP-23: guarded like the context hook above. A tier-4 registration that
+      // rejects must not reject `setup` itself: that would either fail the
+      // plugin load outright or, if the host does not await setup, leak an
+      // unhandled rejection during startup and take down a turn.
+      try {
       track(
         await c.session.hook("compaction", (event) => {
           try {
@@ -3693,6 +3708,12 @@ export default Plugin.define({
           }
         }),
       );
+      } catch (err) {
+        // Losing compaction/retry/title costs relief, not the session: the
+        // pruner simply runs without them and the host carries on.
+        log(`tier-4 hook registration failed; continuing without it: ${String(err)}`);
+        debug(`tier-4 hook registration failed: ${String(err)}`);
+      }
     }
 
     // CP-16/17: reclaim keys for sessions deleted while this plugin was not
