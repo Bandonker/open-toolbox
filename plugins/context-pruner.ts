@@ -1247,7 +1247,7 @@ function writeUnit(r: CollectedResult, value: string): void {
  * are copied recursively; anything else (class instances, typed arrays) is kept
  * by reference so host-owned payloads are not rebuilt.
  *
- * CP-24: this cost is measured, not assumed - 0.081 ms for a 150-message /
+ * CP-24: this cost is measured, not assumed — 0.081 ms for a 150-message /
  * 0.34 MB session, 0.853 ms for 1500 messages / 3.41 MB, i.e. ~0.25 ms/MB.
  * The context hook itself costs 14-95 ms on those same sessions, so the copy is
  * <=1% of a request. A targeted copy-on-write (shallow message, deep only the
@@ -2473,7 +2473,30 @@ export default Plugin.define({
     /**
      * CP-17: bound the non-session caches. `summary:<hash>` digests and
      * `calibration:<model>` ratios have no delete event, so they are capped by
-     * count, oldest first. Best-effort: never throws into its caller.
+     * count. Best-effort: never throws into its caller.
+     *
+     * CP-26: eviction is ownership-aware. Sorting purely oldest-first meant a
+     * live session's digests -- which are by definition among the *oldest*
+     * entries, having been written earlier in the session -- were the first to
+     * go once the cap was reached, so the cache lost exactly the entries still
+     * in use and the next compress re-spent a `session.generate` call to rebuild
+     * them. Unreferenced entries are now evicted first (oldest first); live
+     * ones are only touched if the cap cannot be met any other way.
+     *
+     * "In use" means "CP-18 already found a live owner for it", which needs no
+     * extra probing: `sweepOrphanedState` runs `purgeOrphanDigests` immediately
+     * before this at startup, so an entry that still lists an owner has already
+     * survived the liveness check. Only untagged/legacy entries -- the ones no
+     * session can ever claim -- are evictable ahead of the live ones. Testing
+     * the in-memory `sessions` map instead would be useless here: it is empty
+     * in a fresh process, which is exactly when the sweep runs.
+     *
+     * The cap is deliberately a SOFT bound. It is driven by a write counter, not
+     * by the size of the namespace (which would mean a full scan per write), so
+     * the real guarantee is "cap, plus at most one batch of writes before the
+     * next sweep" -- measured at 332 against a cap of 256 while driving 376
+     * models. A hard bound would need a scan per write. `verify-pruner-gc.mjs`
+     * pins the soft bound rather than the nominal one.
      */
     const gcStorage = async (): Promise<void> => {
       if (!cfg.storageGc) return;
@@ -2482,13 +2505,21 @@ export default Plugin.define({
         max: number,
         at: (v: unknown) => number,
         isOurs: (v: unknown) => boolean,
+        inUse: (key: string, v: unknown) => boolean,
       ): Promise<void> => {
         if (max <= 0) return;
         // Shape guard: even if the host ever returned keys outside our
         // namespace, GC must only ever remove entries this plugin wrote.
         const entries = (await scanStore(prefix)).filter((e) => isOurs(e.value));
         if (entries.length <= max) return;
-        entries.sort((a, b) => at(a.value) - at(b.value) || a.key.localeCompare(b.key));
+        // 0 = evictable, 1 = still in use: unreferenced entries sort ahead, and
+        // within each band the oldest goes first.
+        entries.sort(
+          (a, b) =>
+            (inUse(a.key, a.value) ? 1 : 0) - (inUse(b.key, b.value) ? 1 : 0) ||
+            at(a.value) - at(b.value) ||
+            a.key.localeCompare(b.key),
+        );
         for (const entry of entries.slice(0, entries.length - max)) guardedRemove(c.storage, entry.key);
       };
       await cap(
@@ -2496,12 +2527,20 @@ export default Plugin.define({
         cfg.summaryCacheMax,
         (v) => num((v as AnyRecord | undefined)?.at),
         (v) => isPlainObject(v) && typeof (v as AnyRecord).text === "string",
+        // Reached only after CP-18 has already reclaimed dead-owned digests, so
+        // "has an owner" means "has a live owner".
+        (_key, v) => digestOwners(v).length > 0,
       );
+      // A ratio is in use while any session this process still tracks runs that
+      // model. `sessionModelKey` is keyed by session id with the model key as
+      // the value, so test the values, not the keys.
+      const liveModelKeys = new Set(sessionModelKey.values());
       await cap(
         "calibration:",
         cfg.calibrationMax,
         (v) => num((v as AnyRecord | undefined)?.updatedAt),
         (v) => isPlainObject(v) && typeof (v as AnyRecord).r === "number",
+        (key) => liveModelKeys.has(key.slice("calibration:".length)),
       );
     };
     // CP-1: storage writes are best-effort — a rejecting store must never
