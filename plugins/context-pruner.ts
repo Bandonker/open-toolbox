@@ -134,6 +134,16 @@ type Config = {
   recall: boolean;
   recallKeep: number;
   recallMaxChars: number;
+  /**
+   * Bound the non-session KV caches (`summary:<hash>` digests and
+   * `calibration:<model>` ratios) so they cannot grow without limit over a long
+   * profile lifetime. Runs at startup and opportunistically after writes.
+   */
+  storageGc: boolean;
+  /** Max persisted auto-digest cache entries; 0 = unlimited. */
+  summaryCacheMax: number;
+  /** Max persisted calibration entries; 0 = unlimited. */
+  calibrationMax: number;
   minContextLimit: Limit | undefined;
   maxContextLimit: Limit | undefined;
   modelMinLimits: AnyRecord;
@@ -681,6 +691,9 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
     recall: asBool(pick("recall", "OPENCODE_CONTEXT_PRUNER_RECALL"), true),
     recallKeep: asInt(pick("recallKeep", "OPENCODE_CONTEXT_PRUNER_RECALL_KEEP"), 50, 0, 10000),
     recallMaxChars: asInt(pick("recallMaxChars", "OPENCODE_CONTEXT_PRUNER_RECALL_MAX_CHARS"), 200000, 1000, 10_000_000),
+    storageGc: asBool(pick("storageGc", "OPENCODE_CONTEXT_PRUNER_STORAGE_GC"), true),
+    summaryCacheMax: asInt(pick("summaryCacheMax", "OPENCODE_CONTEXT_PRUNER_SUMMARY_CACHE_MAX"), 500, 0, 1_000_000),
+    calibrationMax: asInt(pick("calibrationMax", "OPENCODE_CONTEXT_PRUNER_CALIBRATION_MAX"), 256, 0, 1_000_000),
     minContextLimit: parseLimit(compressValue("minContextLimit", "OPENCODE_CONTEXT_PRUNER_MIN_CONTEXT_LIMIT", "minContextLimit")),
     maxContextLimit: parseLimit(compressValue("maxContextLimit", "OPENCODE_CONTEXT_PRUNER_MAX_CONTEXT_LIMIT", "maxContextLimit")),
     modelMinLimits: (getPath(compress, "modelMinLimits") as AnyRecord) ?? {},
@@ -1224,6 +1237,29 @@ function writeUnit(r: CollectedResult, value: string): void {
   r.part.result = { ...prev, ...typedResult(r, value) };
 }
 
+/**
+ * Structural copy of a value for the *request only*. The context hook rewrites
+ * messages in place, and the host re-serialises `event.messages` afterwards, so
+ * a mutation that reaches a stored message object also reaches the transcript
+ * on disk (a folded assistant reply persisted as a bare
+ * `[context-pruner] folded into summary` pointer). Cloning each message slot
+ * before rewriting keeps the on-disk record pristine. Plain objects and arrays
+ * are copied recursively; anything else (class instances, typed arrays) is kept
+ * by reference so host-owned payloads are not rebuilt.
+ */
+function cloneForRequest<T>(value: T): T {
+  if (Array.isArray(value)) return value.map((v) => cloneForRequest(v)) as unknown as T;
+  if (value && typeof value === "object") {
+    const proto = Object.getPrototypeOf(value);
+    if (proto === Object.prototype || proto === null) {
+      const out: AnyRecord = {};
+      for (const key of Object.keys(value as AnyRecord)) out[key] = cloneForRequest((value as AnyRecord)[key]);
+      return out as unknown as T;
+    }
+  }
+  return value;
+}
+
 function sumSaved(decisions: Map<string, Decision>): number {
   let total = 0;
   for (const d of decisions.values()) total += d.savedTokens;
@@ -1341,6 +1377,23 @@ function guardedSet(store: unknown, key: string, value: unknown): void {
   try {
     Promise.resolve(
       (store as { set?: (k: string, v: unknown) => unknown } | undefined)?.set?.(key, value),
+    ).catch(() => {
+      /* ignore */
+    });
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * CP-16: best-effort storage delete. Session deletion is a host event; a failing
+ * store must not turn cleanup into a crash, and must not leave an unhandled
+ * rejection behind. Mirrors guardedSet.
+ */
+function guardedRemove(store: unknown, key: string): void {
+  try {
+    Promise.resolve(
+      (store as { remove?: (k: string) => unknown } | undefined)?.remove?.(key),
     ).catch(() => {
       /* ignore */
     });
@@ -1550,16 +1603,19 @@ export const __test__ = {
   },
   sanitizeLabel,
   summaryCacheKey,
+  digestOwners,
   // CP-1..CP-11 verification seams.
   resolveConfig,
   globalConfigDirs,
   configCandidatePaths,
   guardedSet,
+  guardedRemove,
   valueToText,
   statelessTest,
   compilePatterns,
   isProtected,
   writeUnit,
+  cloneForRequest,
   budgetFor,
   makeStub,
   stubMemoSize: (): number => stubMemo.size,
@@ -2114,6 +2170,24 @@ function summaryCacheKey(topic: string, source: string): string {
   return `summary:${hash32(`${VERSION}\0${sanitizeLabel(topic)}\0${source}`)}`;
 }
 
+/**
+ * CP-18: sessions a digest cache entry belongs to. Entries written since this
+ * field existed carry `sessions`; older entries do not and are reclaimed by the
+ * count cap instead (never by session deletion). Only real session ids count, so
+ * the `"unknown"` fallback can never make an entry look attributable.
+ */
+function digestOwners(value: unknown): string[] {
+  if (!isPlainObject(value)) return [];
+  const raw = (value as AnyRecord).sessions;
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    const sid = typeof item === "string" ? item : "";
+    if (/^ses/.test(sid) && !out.includes(sid)) out.push(sid);
+  }
+  return out;
+}
+
 function summaryPrompt(source: string, topic: string, reason: string, protectedBlocks: string[]): string {
   const focus = topic || "the conversation so far";
   return [
@@ -2366,14 +2440,162 @@ export default Plugin.define({
         return undefined;
       }
     };
+    /** CP-16/17: page through every entry under a prefix (bounded, best-effort). */
+    const scanStore = async (prefix: string): Promise<Array<{ key: string; value: unknown }>> => {
+      const scan = (c.storage as { scan?: (o: { prefix: string; after?: string }) => Promise<{ entries?: Array<{ key: string; value?: unknown }>; next?: string }> } | undefined)?.scan;
+      if (typeof scan !== "function") return [];
+      const out: Array<{ key: string; value: unknown }> = [];
+      let after: string | undefined;
+      // Bounded so a looping scan can never spin forever at startup.
+      for (let page = 0; page < 1000; page++) {
+        const res = await scan({ prefix, after });
+        const entries = Array.isArray(res?.entries) ? res.entries : [];
+        for (const entry of entries) {
+          const key = String(entry?.key ?? "");
+          if (key) out.push({ key, value: entry?.value });
+        }
+        if (!res?.next) break;
+        after = res.next;
+      }
+      return out;
+    };
+    let writesSinceGc = 0;
+    /**
+     * CP-17: bound the non-session caches. `summary:<hash>` digests and
+     * `calibration:<model>` ratios have no delete event, so they are capped by
+     * count, oldest first. Best-effort: never throws into its caller.
+     */
+    const gcStorage = async (): Promise<void> => {
+      if (!cfg.storageGc) return;
+      const cap = async (
+        prefix: string,
+        max: number,
+        at: (v: unknown) => number,
+        isOurs: (v: unknown) => boolean,
+      ): Promise<void> => {
+        if (max <= 0) return;
+        // Shape guard: even if the host ever returned keys outside our
+        // namespace, GC must only ever remove entries this plugin wrote.
+        const entries = (await scanStore(prefix)).filter((e) => isOurs(e.value));
+        if (entries.length <= max) return;
+        entries.sort((a, b) => at(a.value) - at(b.value) || a.key.localeCompare(b.key));
+        for (const entry of entries.slice(0, entries.length - max)) guardedRemove(c.storage, entry.key);
+      };
+      await cap(
+        "summary:",
+        cfg.summaryCacheMax,
+        (v) => num((v as AnyRecord | undefined)?.at),
+        (v) => isPlainObject(v) && typeof (v as AnyRecord).text === "string",
+      );
+      await cap(
+        "calibration:",
+        cfg.calibrationMax,
+        (v) => num((v as AnyRecord | undefined)?.updatedAt),
+        (v) => isPlainObject(v) && typeof (v as AnyRecord).r === "number",
+      );
+    };
     // CP-1: storage writes are best-effort — a rejecting store must never
     // surface as an unhandled rejection.
     const writeStore = (key: string, value: unknown): void => {
       guardedSet(c.storage, key, value);
+      // CP-17: keep the bounded caches bounded during a long-lived process, not
+      // just at startup. Reclaim at most once per batch of writes.
+      if (cfg.storageGc && (key.startsWith("summary:") || key.startsWith("calibration:"))) {
+        if (++writesSinceGc >= 100) {
+          writesSinceGc = 0;
+          void gcStorage().catch(() => {
+            /* ignore */
+          });
+        }
+      }
     };
     // CP-2: per-session persist chain — serializes recall read-modify-write
     // so overlapping flushes cannot clobber each other.
     const persistChains = new Map<string, Promise<void>>();
+    // CP-16: every key context-pruner keeps for one session. Deleting a session
+    // must drop all of them, or they linger for the life of the profile.
+    const SESSION_KEYS = (sid: string): string[] => [`epoch:${sid}`, `recall:${sid}`, `summaries:${sid}`];
+    /**
+     * CP-16: forget everything about one session. Called when the host reports
+     * `session.deleted` and by the startup sweep; best-effort so a bad store
+     * cannot break the caller.
+     */
+    const forgetSession = (sessionID: string): void => {
+      if (!sessionID) return;
+      sessions.delete(sessionID);
+      sessionModelKey.delete(sessionID);
+      persistChains.delete(sessionID);
+      for (const key of SESSION_KEYS(sessionID)) guardedRemove(c.storage, key);
+    };
+    /**
+     * CP-18: cached liveness probe. Session deletion can happen while opencode
+     * is closed (no event), so both passes probe `session.get`. A probe that
+     * fails for any reason counts as gone: this state is a cache, so reclaiming
+     * it costs at most one re-read, while leaking it is permanent.
+     */
+    const sessionDomain = c.session as { get?: (input: { sessionID: string }) => Promise<unknown> } | undefined;
+    const aliveCache = new Map<string, boolean>();
+    const isAlive = async (sid: string): Promise<boolean> => {
+      const cached = aliveCache.get(sid);
+      if (cached !== undefined) return cached;
+      let alive = false;
+      if (typeof sessionDomain?.get === "function") {
+        try {
+          const info = await sessionDomain.get({ sessionID: sid });
+          alive = Boolean(info && (info as AnyRecord).id);
+        } catch {
+          alive = false;
+        }
+      }
+      aliveCache.set(sid, alive);
+      return alive;
+    };
+    /**
+     * CP-18: reclaim digest-cache entries whose owning sessions are all gone.
+     * Entries shared by a live session survive; untagged legacy entries are
+     * left to the count-based GC (CP-17).
+     */
+    const purgeOrphanDigests = async (): Promise<void> => {
+      if (typeof sessionDomain?.get !== "function") return;
+      for (const entry of await scanStore("summary:")) {
+        const owners = digestOwners(entry.value);
+        if (owners.length === 0) continue;
+        let anyAlive = false;
+        for (const sid of owners) {
+          if (await isAlive(sid)) {
+            anyAlive = true;
+            break;
+          }
+        }
+        if (!anyAlive) {
+          debug(`reclaimed digest ${entry.key} (sessions: ${owners.join(", ")})`);
+          guardedRemove(c.storage, entry.key);
+        }
+      }
+    };
+    /**
+     * CP-16/18: drop session keys whose session no longer exists, then any
+     * digests left with no live owner. Runs once at setup so deletions that
+     * happened while opencode was closed are reclaimed too (the
+     * `session.deleted` event has no replay).
+     */
+    const sweepOrphanedState = async (): Promise<void> => {
+      if (typeof sessionDomain?.get !== "function") return;
+      const seen = new Set<string>();
+      for (const prefix of ["epoch:", "recall:", "summaries:"]) {
+        for (const entry of await scanStore(prefix)) {
+          const sid = entry.key.startsWith(prefix) ? entry.key.slice(prefix.length) : "";
+          if (sid) seen.add(sid);
+        }
+      }
+      for (const sid of seen) {
+        if (!(await isAlive(sid))) {
+          debug(`reclaimed orphaned state for deleted session ${sid}`);
+          forgetSession(sid);
+        }
+      }
+      await purgeOrphanDigests();
+    };
     // CP-8: memoize the per-request JSON.stringify(event.tools).
     let lastToolsRef: unknown;
     let lastToolsJson = "{}";
@@ -2615,7 +2837,7 @@ export default Plugin.define({
           if (!body && cfg.autoSummarizeStub) body = fallbackSummary(chosen);
           if (!body) return;
           totals.generations++;
-          writeStore(cacheKey, { text: body, topic: "auto", version: VERSION, at: Date.now() });
+          writeStore(cacheKey, { text: body, topic: "auto", version: VERSION, at: Date.now(), sessions: [sessionID] });
         }
 
         const prose = chosen.every((r) => r.kind === "text");
@@ -2683,6 +2905,13 @@ export default Plugin.define({
             const ratio = st.ratio;
             const rawMessages = (event as AnyRecord).messages;
             const messages = (Array.isArray(rawMessages) ? rawMessages : []) as MessageLike[];
+            // Detach the request from the stored transcript before any rewrite:
+            // the hook mutates in place by contract, and the host re-serialises
+            // `event.messages` after it returns. Replacing each slot with a
+            // structural clone leaves the stored messages untouched, so pruning
+            // stays request-only as promised. Array identity is preserved, which
+            // span collapse relies on when it truncates and refills `messages`.
+            for (let i = 0; i < messages.length; i++) messages[i] = cloneForRequest(messages[i]);
             const results = collectResults(messages, cfg, ratio);
             st.compressible = results;
             const protectTurns = Math.max(cfg.keepRecentTurns, cfg.turnProtection.enabled ? cfg.turnProtection.turns : 0);
@@ -2960,9 +3189,25 @@ export default Plugin.define({
 
     // ----------------------------------------------------------------- usage
     if (typeof c.event?.subscribe === "function") {
-      const onUsage = (event: AnyRecord): void => {
+      const onEvent = (event: AnyRecord): void => {
         try {
-          if (event?.type !== "session.usage.updated") return;
+          const type = event?.type;
+          // CP-16: the host announces deletion; drop our per-session keys so
+          // nothing is left behind in the profile store.
+          if (type === "session.deleted") {
+            const deleted = String(((event.data ?? {}) as AnyRecord).sessionID ?? "");
+            if (deleted) {
+              // CP-18: pin the id dead so the digest purge below cannot re-probe
+              // it as live, then forget its keys and any digest it alone owned.
+              aliveCache.set(deleted, false);
+              forgetSession(deleted);
+              void purgeOrphanDigests().catch(() => {
+                /* ignore */
+              });
+            }
+            return;
+          }
+          if (type !== "session.usage.updated") return;
           const data = (event.data ?? {}) as AnyRecord;
           const sessionID = String(data.sessionID ?? "unknown");
           const st = stateFor(sessionID);
@@ -3018,11 +3263,11 @@ export default Plugin.define({
       // the function declares a parameter.
       try {
         const subscribe = c.event.subscribe as (...args: unknown[]) => unknown;
-        const stream = subscribe.length > 0 ? subscribe(onUsage) : (subscribe as () => unknown)();
+        const stream = subscribe.length > 0 ? subscribe(onEvent) : (subscribe as () => unknown)();
         if (stream && typeof (stream as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function") {
           void (async () => {
             try {
-              for await (const event of stream as AsyncIterable<AnyRecord>) onUsage(event);
+              for await (const event of stream as AsyncIterable<AnyRecord>) onEvent(event);
             } catch {
               /* stream closed */
             }
@@ -3335,7 +3580,7 @@ export default Plugin.define({
           return { content: "The model returned an empty summary; nothing was compressed." };
         }
         totals.generations++;
-        writeStore(cacheKey, { text: body, topic, version: VERSION, at: Date.now() });
+        writeStore(cacheKey, { text: body, topic, version: VERSION, at: Date.now(), sessions: [sessionID] });
       }
 
       const prose = targets.every((r) => r.kind === "text");
@@ -3449,6 +3694,15 @@ export default Plugin.define({
         }),
       );
     }
+
+    // CP-16/17: reclaim keys for sessions deleted while this plugin was not
+    // running (no event replay), then bound the non-session caches. Best-effort
+    // and off the critical path so setup never blocks.
+    void sweepOrphanedState()
+      .then(() => gcStorage())
+      .catch(() => {
+        /* ignore */
+      });
 
     log(
       `ready (budgetRatio=${cfg.budgetRatio}, targetRatio=${cfg.targetRatio}, keepRecent=${cfg.keepRecent}, relaxRecentFloor=${cfg.relaxRecentFloor}, minReplanTokens=${cfg.minReplanTokens}, compress=${cfg.compressEnabled ? "range" : "off"}${cfg.compressEnabled && cfg.compressText ? "+text" : ""}, collapse=${cfg.collapseRanges ? (cfg.collapseStubs ? "stubs" : "on") : "off"}${cfg.configPath ? `, config=${cfg.configPath}` : ""})`,

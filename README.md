@@ -528,6 +528,11 @@ nudges. It reads optional config from
 `~/.config/opencode/context-pruner.jsonc` (global), and can also read a DCP
 `dcp.jsonc` for migration.
 
+Session-scoped state and the digests a session produced are reclaimed when the
+host reports `session.deleted`, with a startup sweep covering sessions deleted
+while opencode was closed. The non-session digest/calibration caches are capped
+by count (`storageGc`).
+
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
 | `enabled` | `OPENCODE_CONTEXT_PRUNER_ENABLED` | `true` | Turn pruning off without uninstalling |
@@ -570,6 +575,9 @@ nudges. It reads optional config from
 | `recall` | `OPENCODE_CONTEXT_PRUNER_RECALL` | `true` | Keep pruned output locally so it can be recalled instead of re-run |
 | `recallKeep` | `OPENCODE_CONTEXT_PRUNER_RECALL_KEEP` | `50` | Most pruned outputs kept per session |
 | `recallMaxChars` | `OPENCODE_CONTEXT_PRUNER_RECALL_MAX_CHARS` | `200000` | Max characters returned by a single recall |
+| `storageGc` | `OPENCODE_CONTEXT_PRUNER_STORAGE_GC` | `true` | Bound the non-session KV caches (digest + calibration) |
+| `summaryCacheMax` | `OPENCODE_CONTEXT_PRUNER_SUMMARY_CACHE_MAX` | `500` | Max persisted digest-cache entries (`0` = unlimited) |
+| `calibrationMax` | `OPENCODE_CONTEXT_PRUNER_CALIBRATION_MAX` | `256` | Max persisted calibration entries (`0` = unlimited) |
 | `compressEnabled` | `OPENCODE_CONTEXT_PRUNER_COMPRESS` | `true` | Enable the model-callable `compress` tool |
 | `compressMaxSourceChars` | `OPENCODE_CONTEXT_PRUNER_COMPRESS_MAX_CHARS` | `24000` | Max characters sent to the summariser per call |
 | `protectTags` | `OPENCODE_CONTEXT_PRUNER_PROTECT_TAGS` | `true` | Preserve `<protect>` blocks during summarisation |
