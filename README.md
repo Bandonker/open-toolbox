@@ -202,7 +202,7 @@ Click any plugin name to jump to its expandable documentation below.
 
 | Plugin | Tools | Description |
 | :-- | :--: | :-- |
-| **[opencode-sessions](#plugin-opencode-sessions)** | 7 | Spawn child sessions, wait for them, read results, send follow-ups, answer permission prompts, cancel them — and **hand off the current working point into a fresh session**. Created sessions are real opencode sessions, so they show up in the Desktop session switcher as if you'd pressed `+`. |
+| **[opencode-sessions](#plugin-opencode-sessions)** | 9 | Spawn child sessions, wait for them, read results, send follow-ups, answer permission prompts, cancel them — and **hand off the current working point into a fresh session**. Created sessions are real opencode sessions, so they show up in the Desktop session switcher as if you'd pressed `+`. Also adds **targeted project presence**: a brief about only the sessions that bear on yours, and file-collision warnings so two agents don't write the same file at once. |
 | **[decision-log](#plugin-decision-log)** | 5 | Record and search architectural decisions in a local SQLite FTS5 database. `decision_log`, `decision_search`, `decision_list`, `decision_get`, `decision_update`. |
 | **[error-journal](#plugin-error-journal)** | 5 | Log errors with context, search past ones, and record resolutions so you stop re-debugging the same failure. |
 | **[snippet-library](#plugin-snippet-library)** | 5 | Save reusable code snippets and search them by language, tag, or full text. |
@@ -238,9 +238,17 @@ session switcher.
 It also adds **project presence**: any session working in a repo can see the
 other sessions in that repo — including ones this plugin did not spawn — and can
 message them. opencode has no `session.list()`, so peers are discovered from the
-server-wide event stream and announced by each session on its first turn. A short
-notice is injected into each request when peers exist, so an agent learns a
-change may be someone else's before it explains it away.
+server-wide event stream and announced by each session on its first turn.
+
+The brief injected into each request is **targeted, not a roster**: a session is
+told about a peer only when that peer could affect its work — it holds a file this
+session is writing, it is in this session's lineage, it is mid-turn, or it declared
+overlapping work. When nothing is relevant, nothing is injected. With
+`fileLocks: "enforce"` two agents about to write the same file don't just get told
+to take turns — the write actually waits for the holder, and fails loudly naming
+who has it if the wait runs out. A peer that has gone quiet is **verified with
+`session.get`** rather than assumed dead, and a session you closed or deleted is
+confirmed absent and dropped from the list instead of lingering as a ghost.
 
 Tools: 9. See the [opencode-sessions package documentation](opencode-sessions/README.md)
 for the complete tool list and configuration knobs.

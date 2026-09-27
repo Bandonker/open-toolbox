@@ -8,14 +8,20 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import path from "node:path";
 import {
   asBool,
   clampInt,
   deriveTitle,
+  extractEditPaths,
   formatUnsupported,
+  isFileMutatingTool,
+  normalizeClaimPath,
   parseJsonFromText,
   parseModelString,
   schemaInstruction,
+  taskTokens,
+  tasksOverlap,
   truncate,
 } from "./helpers.ts";
 
@@ -90,4 +96,83 @@ test("parseModelString splits provider/model and rejects malformed input", () =>
   assert.ok("error" in parseModelString("noslash"));
   assert.ok("error" in parseModelString("/x"));
   assert.ok("error" in parseModelString("x/"));
+});
+
+// --- concurrent-edit helpers -------------------------------------------
+
+test("isFileMutatingTool recognises write tools and ignores read-only ones", () => {
+  for (const t of ["edit", "write", "patch", "multiedit", "apply_patch"]) {
+    assert.ok(isFileMutatingTool(t), `${t} should write`);
+  }
+  // Namespaced and MCP spellings must be caught too.
+  for (const t of ["fs.write_file", "mcp__fs__edit_file", "str_replace_editor"]) {
+    assert.ok(isFileMutatingTool(t), `${t} should write`);
+  }
+  for (const t of ["read", "grep", "glob", "list", "webfetch", "session_send", "bash"]) {
+    assert.ok(!isFileMutatingTool(t), `${t} should not write`);
+  }
+  // "rewrite" ends in "write" but is not a file tool: the verb must be
+  // segment-delimited, not a bare substring.
+  assert.ok(!isFileMutatingTool("some_rewrite_tool"));
+});
+
+test("extractEditPaths finds plain path fields and diff headers", () => {
+  assert.deepEqual(extractEditPaths({ filePath: "/p/src/a.ts" }), ["/p/src/a.ts"]);
+  assert.deepEqual(extractEditPaths({ file: "a.ts", content: "x" }), ["a.ts"]);
+  // Nested, as a multi-edit tool would send it.
+  assert.deepEqual(extractEditPaths({ edits: [{ path: "a.ts" }, { path: "b.ts" }] }), [
+    "a.ts",
+    "b.ts",
+  ]);
+  // A unified diff names its file in a header, not in a field.
+  const diff = "--- a/src/c.ts\n+++ b/src/c.ts\n@@ -1 +1 @@\n-x\n+y\n";
+  assert.ok(extractEditPaths({ patch: diff }).includes("src/c.ts"));
+  const apply = "*** Begin Patch\n*** Update File: src/d.ts\n@@\n-a\n+b\n";
+  assert.ok(extractEditPaths({ patch: apply }).includes("src/d.ts"));
+  // Nothing to find, and nothing to choke on.
+  assert.deepEqual(extractEditPaths({ oldString: "a", newString: "b" }), []);
+  assert.deepEqual(extractEditPaths(null), []);
+  assert.deepEqual(extractEditPaths("a string"), []);
+  // Deduplicated, and a long junk payload cannot blow up the walk.
+  assert.deepEqual(extractEditPaths({ path: "a", filePath: "a" }), ["a"]);
+  const deep = { a: { b: { c: { d: { e: { f: { path: "deep.ts" } } } } } } };
+  assert.deepEqual(extractEditPaths(deep), [], "must not scan past the depth limit");
+});
+
+test("normalizeClaimPath makes relative and absolute paths collide", () => {
+  const dir = path.resolve("/proj");
+  const abs = normalizeClaimPath(path.join(dir, "src/a.ts"), dir);
+  assert.equal(abs, "src/a.ts");
+  // The same file named three ways must produce one key, or the collision is
+  // missed on the common case.
+  assert.equal(normalizeClaimPath("./src/a.ts", dir), abs);
+  assert.equal(normalizeClaimPath("src/./a.ts", dir), abs);
+  assert.equal(normalizeClaimPath("src/a.ts", dir), abs);
+  // Quoting survives, as a shell-ish tool may send it.
+  assert.equal(normalizeClaimPath('"src/a.ts"', dir), abs);
+  // Rejects nothing useful, ignores junk.
+  assert.equal(normalizeClaimPath("   ", dir), undefined);
+  assert.equal(normalizeClaimPath("x".repeat(5000), dir), undefined);
+  // A file outside the project still gets a stable key rather than being
+  // dropped, so two agents writing the same shared file still collide.
+  const outside = normalizeClaimPath("/etc/hosts", dir);
+  assert.ok(outside && outside.length > 0, "outside path still keyed");
+});
+
+test("taskTokens drops generic verbs so a shared verb is not shared work", () => {
+  const t = taskTokens("updating the auth module");
+  assert.ok(t.has("auth") && t.has("module"));
+  assert.ok(!t.has("updating"), "'updating' is generic and must be dropped");
+  assert.ok(!t.has("the"));
+  // Two-character noise is not a content word.
+  assert.ok(!taskTokens("do a js fix").has("js"));
+  assert.deepEqual([...taskTokens(undefined)], []);
+});
+
+test("tasksOverlap only fires on a genuine content-word overlap", () => {
+  const mine = taskTokens("refactoring the auth module");
+  assert.ok(tasksOverlap("auth module cleanup", mine), "shares 'auth'");
+  // Same verbs, different subject: must not count as related.
+  assert.ok(!tasksOverlap("updating the install docs", taskTokens("refactoring the auth module")));
+  assert.ok(!tasksOverlap(undefined, mine));
 });

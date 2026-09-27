@@ -27,18 +27,23 @@ function check(name, ok, detail = "") {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  - " + detail : ""}`);
 }
 
-/** Stub ctx that captures tools registered through tool.transform. */
+/**
+ * Stub ctx that captures tools registered through tool.transform.
+ *
+ * `extra` is merged per key rather than spread wholesale, so a call site can
+ * add one seam to `tool` (e.g. `hook` for write observation) without silently
+ * dropping `transform` and losing every registered tool.
+ */
 function stubCtx(tools, extra = {}) {
+  const baseTransform = async (cb) => {
+    cb({ add: (t) => tools.push(t) });
+    return { dispose: async () => {} };
+  };
   return {
     options: {},
     location: { directory: tmpdir() },
-    tool: {
-      transform: async (cb) => {
-        cb({ add: (t) => tools.push(t) });
-        return { dispose: async () => {} };
-      },
-    },
     ...extra,
+    tool: { transform: baseTransform, ...(extra.tool ?? {}) },
   };
 }
 
@@ -2007,6 +2012,7 @@ const toolCtx = {
   // and the awareness path is silently untested here (covered in depth by
   // verify-project-presence.mjs).
   const awarenessHooks = [];
+  const toolHooks = [];
   const ctx = stubCtx(tools, {
     event: {
       // Never yields; cleanup() aborts and the process exits at the end.
@@ -2023,12 +2029,19 @@ const toolCtx = {
       context: async () => [],
       interrupt: async () => {},
     },
+    // Concurrent-edit tracking hooks tool.execute.before during setup.
+    tool: { hook: async (name, cb) => void toolHooks.push({ name, cb }) },
   });
   const cleanup = await mod.default.setup(ctx);
   check(
     "opencode-sessions registers a peer-awareness context hook",
     awarenessHooks.some((h) => h.name === "context"),
     awarenessHooks.map((h) => h.name).join(",") || "none",
+  );
+  check(
+    "opencode-sessions registers a write hook for concurrent-edit detection",
+    toolHooks.some((h) => h.name === "execute.before"),
+    toolHooks.map((h) => h.name).join(",") || "none",
   );
   const names = tools.map((t) => t.name).sort();
   check(

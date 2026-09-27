@@ -152,20 +152,42 @@ round-trip. Peers are also announced by the session itself on its first turn, so
 brand-new idle session is visible before it does anything.
 
 Presence is mirrored through `ctx.storage`, so a session in a standalone
-`opencode` process sees peers from the Desktop app (and vice versa).
+`opencode` process sees peers from the Desktop app (and vice versa). Each peer
+gets **its own key** rather than sharing one array: a single key is
+last-writer-wins, so two processes would overwrite each other's view of who
+exists. The registry is re-read on a heartbeat, not once at startup, so a session
+opened after this process started still turns up.
 
 ### `project_sessions`
 
-`{ task? }` — lists other sessions in this session's project directory, with each
-peer's state (`running`/`idle`), how long since it was last active, and any task
-it declared. Passing `task` declares what *this* session is working on; it is also
-the claim path for a session that only ever uses tools.
+`{ task?, forget? }` — lists other sessions in this session's project directory,
+with each peer's state (`running`/`idle`), how long since it was last active, any
+task it declared, and any files it is currently editing. Passing `task` declares
+what *this* session is working on; it is also the claim path for a session that
+only ever uses tools.
+
+`forget` takes session ids (comma-separated) and drops them from the registry, so a
+session you closed or deleted stops being listed **and** stops being a message
+target. The plugin also does this by itself on `session.deleted`; `forget` is for
+the cases the event stream cannot see — a session deleted before the plugin
+loaded, or one ghosted in from another process.
+
+A peer that has gone quiet is **verified, not assumed**. `session.get` is used to
+ask the server whether it still exists, which distinguishes the two cases a timer
+cannot: a session mid-way through one long command (alive, and worth messaging)
+versus one that was deleted or crashed (gone). Confirmed-gone peers are dropped
+from the registry on the spot, so asking a question about the list heals it.
+`session.deleted` does the same for the common case, and `forget` covers what the
+event stream cannot see. Verdict wording is deliberate: `alive, idle` is a fact,
+not a guess.
 
 ### `session_broadcast`
 
-`{ text, noReply? }` — sends one message to every other session in the project.
-Use before a wide-reaching change so peers do not duplicate or fight the work.
-Prefer `session_send` when you mean one specific session.
+`{ text, noReply? }` — sends one message to every **reachable** session in
+the project. Use before a wide-reaching change so peers do not duplicate or fight
+the work. Prefer `session_send` when you mean one specific session. Peers
+confirmed gone are dropped and named in the result; peers confirmed alive but
+idle are messaged and named as woken.
 
 ### `session_send` on peers
 
@@ -173,23 +195,121 @@ Prefer `session_send` when you mean one specific session.
 children: `ctx.session.synthetic` and `ctx.session.prompt` address any session, so
 the old refusal was a plugin-level restriction rather than a platform one.
 Spawned children still route through `startTurn` so a failed send is reported. An
-id that is neither a spawned child nor a known peer is still refused.
+id that is neither a spawned child nor a known peer is still refused, and so is a
+stale peer (see above).
+
+### Concurrent-edit awareness
+
+Every session in a project can be editing at once, and two agents writing the same
+file produce a diff that belongs to neither. The plugin records which file each
+session is writing from the `tool.execute.before` seam — server-wide, so a write by
+a spawned child counts just as much as one by a hand-opened session — and the
+awareness brief then says so:
+
+```
+[1 relevant session in this project]
+- ses_aaaaaa | idle | 40s ago | refactoring auth | editing src/auth.ts
+CONCURRENT EDIT: you and ses_aaaaaa both hold src/auth.ts. Only one of you should write it — wait for them to release it, or session_send to agree who takes it.
+```
+
+A claim is an observation, not a lease — it expires after `claimStaleSec` and is
+released the moment the session goes idle — so a session that dies mid-edit cannot
+block its peers forever. Paths are compared project-relative and case-folded where
+the filesystem requires it, so `src/auth.ts` and `./src/auth.ts` collide, and so do
+`README.md` and `readme.md` on macOS and Windows.
+
+#### Making the wait real
+
+The brief above depends on the model obeying it, and a model that has already
+decided to edit will edit. `fileLocks: "enforce"` removes that dependency: the
+plugin wraps the host's own file-mutating tools (`edit`, `write`, `patch`, …) and,
+on a collision, the write **waits** for the other write to finish.
+
+Two different questions need two different records, which is why the wait is short
+by construction:
+
+| record | question | used for |
+| --- | --- | --- |
+| `Peer.claims` | did this session write this file *during its current turn*? | the awareness brief |
+| in-flight | is a write to this file happening *right now*? | the lock |
+
+Keying the lock to the turn-scoped record instead would block a writer for the
+whole remainder of the other session's turn — and a turn continues well past the
+edit, into tests and output — so the waiter would routinely time out against a
+session that was no longer touching the file. The lock is keyed to the real tool
+lifecycle instead: marked in flight before the call, cleared in a `finally` so
+even a failed write cannot keep a file locked.
+
+The wait is still bounded by `lockWaitSec`, but that budget now only covers a
+write that *itself* never returns — a wedged tool call. On expiry the call
+**fails loudly**, naming the holder and the file: `Gave up waiting 60s for
+another session to finish writing src/auth.ts. Still being written by ses_aaaaaa.
+Do not edit it anyway: either wait and retry, or session_send that session to
+agree who takes this file.` The wait is cancellable, so an interrupted turn leaves
+no timer running.
+
+`advise` (the default) only tracks and briefs; `off` tracks nothing. The gate is
+installed on the pre-existing tool set, never on this plugin's own tools.
+
+#### Across processes
+
+`ctx.storage` is shared by every opencode process on the same config directory,
+so an in-flight write is also published there — one key per session, found via
+`storage.scan`, so two processes writing different files cannot clobber each
+other's marker. A standalone `opencode` run alongside the Desktop app is
+therefore covered too.
+
+Be clear about what this is: a **best-effort signal, not a distributed lock.**
+The store offers no compare-and-set, so a lost update is corrected by the
+holder's next publish, and a process that dies mid-write leaves a marker that
+only expires. It fails *open* — a missed marker means no wait, never a wait on a
+lie — and `inflightTtlSec` bounds how long a crash can hold a file.
+
+#### When a write cannot proceed
+
+A write covering **more than one file** can deadlock: `a` holds `f1` and wants
+`f2`, `b` holds `f2` and wants `f1`. Waiting cannot break that, because a write
+covers all its paths in one call and there is no compare-and-set to acquire them
+one at a time. A single-file write can never invert.
+
+So it is not papered over with a generic timeout. A blocked write publishes what
+it is trying to acquire, and on timeout checks whether the peer holding it is
+itself waiting on something this write holds. If so the failure says so:
+
+> `Deadlock: you and ses_wrb_ are each holding a file the other is trying to write (src/f1.ts, src/f2.ts), so neither can proceed. Do not retry the same set. Either write one file at a time, or session_send to agree which of you takes which file.`
+
+An intent is dropped as soon as the write gets what it wanted, and left to expire
+only when it did not — two sessions in a cycle time out milliseconds apart, and
+the first to report would otherwise erase the evidence the second needs.
 
 ### Ambient awareness
 
-Beyond the tools, the plugin injects a short notice into each request when peers
-exist, so an agent learns about a peer *before* it explains the change away:
+Beyond the tools, the plugin injects a short notice into each request — but only
+about the peers that bear on *this* session, never a roster of the whole project. A
+peer is surfaced when it holds a file this session is writing, is in this session's
+lineage (its parent, its children, its siblings), is mid-turn right now, or declared
+a task sharing a content word with this session's. Everything else is counted in
+one line and left out:
 
 ```
-[2 other sessions active in this project]
+[2 of 5 relevant sessions in this project; 1 unrelated]
 - ses_aaaaaa | running | 40s ago | refactoring auth
-- ses_bbbbbb | idle | 6m ago | build
-Changes in this project may be theirs, not yours. `project_sessions` for detail, `session_send` to coordinate, `session_broadcast` to warn everyone.
+- ses_bbbbbb | idle | 6m ago | auth module cleanup (related task)
+Changes here may be theirs, not yours. project_sessions for the full list, session_send to coordinate, session_broadcast to warn everyone.
 ```
+
+When nothing is relevant, nothing is injected at all. When the brief has not
+changed, the previous copy is left where it is rather than re-appended, so a stable
+roster costs no tokens and does not churn the cached prompt prefix.
 
 It hooks `context` (so it survives compaction), strips its own previous injection
-by sentinel before re-adding, and is **removed** when peers disappear rather than
-going stale. Set `peerAwareness: false` to keep the tools but drop the injection.
+by sentinel, and is **removed** when its peers are gone rather than going stale.
+Set `peerAwareness: false` to keep the tools but drop the injection.
+
+> Task matching is deliberately conservative. `taskTokens` drops a stopword list
+> that includes the everyday verbs agents put in a task string ("updating",
+> "fixing"), so a shared verb is not mistaken for shared work. A false positive
+> costs one line of context; a false negative costs a clobbered edit.
 
 ## Config knobs
 
@@ -207,10 +327,16 @@ Plugin `options` (or the matching env var) are read at load time and clamped:
 | `injectPermissionNotices` | — | `true` | Post a notice when a tracked child is blocked on a permission. |
 | `peerAwareness` | `OPENCODE_SESSIONS_PEER_AWARENESS` | `true` | Inject the peer notice into requests. Tools still work when off. |
 | `peerStaleSec` | `OPENCODE_SESSIONS_PEER_STALE_SEC` | `900` | Drop peers unheard from for this long. |
-| `maxPeers` | `OPENCODE_SESSIONS_MAX_PEERS` | `8` | Cap peers in the injected notice. |
+| `maxPeers` | `OPENCODE_SESSIONS_MAX_PEERS` | `4` | Cap peers in the injected notice. The rest are counted, not listed. |
 | `peerTaskChars` | `OPENCODE_SESSIONS_PEER_TASK_CHARS` | `120` | Truncation for a declared task. |
 | `peerHeartbeatSec` | `OPENCODE_SESSIONS_PEER_HEARTBEAT_SEC` | `60` | How often a session refreshes its presence. |
 | `maxClaimedPeers` | `OPENCODE_SESSIONS_MAX_CLAIMED_PEERS` | `2000` | Bound on the registry. |
+| `fileLocks` | `OPENCODE_SESSIONS_FILE_LOCKS` | `advise` | `advise` records writes and briefs collisions; `enforce` also makes a colliding write wait; `off` tracks nothing. |
+| `lockWaitSec` | `OPENCODE_SESSIONS_LOCK_WAIT_SEC` | `60` | Cap on how long an enforced write waits for another write *in progress* to finish. Only a wedged tool call reaches this. |
+| `inflightTtlSec` | `OPENCODE_SESSIONS_INFLIGHT_TTL_SEC` | `3` | How long another opencode process's in-flight marker is honoured. Only reached if that process dies mid-write. |
+| `claimStaleSec` | `OPENCODE_SESSIONS_CLAIM_STALE_SEC` | `600` | A file claim older than this is treated as released. |
+| `maxClaimPathsInNotice` | `OPENCODE_SESSIONS_MAX_CLAIM_PATHS` | `3` | Files named per peer in the brief before summarising the rest. |
+| `peerLiveSec` | `OPENCODE_SESSIONS_PEER_LIVE_SEC` | `90` | Below this a peer is "quiet" and gets verified with `session.get` before anything is sent. |
 
 ## Why it doesn't block the event loop (reentrancy)
 
