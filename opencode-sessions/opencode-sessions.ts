@@ -884,11 +884,14 @@ export default Plugin.define({
               // Announce what this session is trying to acquire, so a peer that
               // ends up blocked by *this* write can recognise the cycle rather
               // than reporting plain contention. Only ever read on a timeout.
-              // Announce what this session is trying to acquire, so a peer that
-              // ends up blocked by *this* write can recognise the cycle rather
-              // than reporting plain contention. Only ever read on a timeout.
               publishWaitIntent(selfId, keys);
-              const outcome = await waitForRelease(
+              // Atomic in-process reservation BEFORE the first await. JS runs
+              // synchronously up to here, so the first reserver wins and a
+              // simultaneous second writer sees the holder and waits instead of
+              // both observing an empty set and writing concurrently.
+              // acquireWrite keeps the reservation held across the remote wait
+              // and retries it if this session lost the gap after waiting.
+              const outcome = await acquireWrite(
                 selfId,
                 directory,
                 keys,
@@ -925,17 +928,32 @@ export default Plugin.define({
               if (waited) {
                 log("debug", `write to ${keys.join(", ")} waited for a peer's write to finish`);
               }
-              // Turn-scoped claim first (that is what the brief reads), then
-              // mark this write in flight for exactly as long as it runs.
-              // Claiming before the wait would make this session a writer of
-              // the very file it is waiting for.
+              // Turn-scoped claim first (that is what the brief reads). The
+              // in-flight reservation is already held by acquireWrite, and it
+              // stays held for exactly as long as the write runs: claiming
+              // before the wait would have made this session a writer of the
+              // very file it was waiting for, which is why the wait comes first.
               claimFilesFor(selfId, id, rawPaths);
-              markInFlight(selfId, directory, keys);
+              // Renew the cross-process marker while the write runs. The marker
+              // is otherwise written once and expires after inflightTtlSec, so
+              // a write slower than the TTL looked like a crashed writer and a
+              // second process could enter the same file concurrently.
+              const renewMs = Math.max(
+                500,
+                Math.min(2000, Math.floor((cfg.inflightTtlSec * 1000) / 2)),
+              );
+              const renewTimer = setInterval(() => {
+                markInFlight(selfId, directory, keys);
+              }, renewMs);
+              if (typeof (renewTimer as unknown as { unref?: unknown }).unref === "function") {
+                (renewTimer as unknown as { unref: () => void }).unref();
+              }
               try {
                 return await inner(input, toolCtx as never);
               } finally {
                 // A failed or hung write must not keep the file locked.
-                clearInFlight(selfId);
+                clearInterval(renewTimer);
+                releaseReservedKeys(selfId, keys);
               }
             };
             ok = true;
@@ -1015,6 +1033,92 @@ export default Plugin.define({
       void Promise.resolve(peerStore?.remove?.(inflightKey(sessionId))).catch(
         (err: unknown) => log("debug", `in-flight release failed: ${describeError(err)}`),
       );
+    };
+
+    /**
+     * Drop just `keys` from a session's reservation, republishing what remains.
+     * `clearInFlight` drops the whole entry, which over-releases when one
+     * session has two writes in flight at once; the failure and finish paths
+     * only ever release the write they acquired.
+     */
+    const releaseReservedKeys = (sessionId: string, keys: string[]): void => {
+      const held = inFlight.get(sessionId);
+      if (!held) return;
+      for (const k of keys) held.delete(k);
+      if (held.size === 0) {
+        inFlight.delete(sessionId);
+        void Promise.resolve(peerStore?.remove?.(inflightKey(sessionId))).catch(() => undefined);
+        return;
+      }
+      const directory = peers.get(peerKey(sessionId))?.directory ?? defaultDirectory;
+      void Promise.resolve(
+        peerStore?.set?.(inflightKey(sessionId), {
+          sessionId,
+          directory,
+          paths: [...held],
+          at: Date.now(),
+        }),
+      ).catch(() => undefined);
+    };
+
+    /**
+     * Synchronous in-process reservation. Returns true and holds `keys` when no
+     * *other* session in this process holds an overlapping key; returns false
+     * without holding anything otherwise. Must run with no await before it, so
+     * two writes starting in the same tick cannot both observe an empty set.
+     */
+    const tryReserveInFlight = (sessionId: string, directory: string, keys: string[]): boolean => {
+      if (!sessionId || keys.length === 0) return false;
+      const want = new Set(keys);
+      for (const [otherId, held] of inFlight) {
+        if (otherId === sessionId) continue;
+        for (const k of held) {
+          if (want.has(k)) return false;
+        }
+      }
+      markInFlight(sessionId, directory, keys);
+      return true;
+    };
+
+    /**
+     * Reserve `keys` for `selfId` and wait for holders to release, returning the
+     * wait outcome with the local reservation held on success. A session that
+     * loses the initial reservation waits unreserved (so it is never mistaken
+     * for a writer of the file it wants), then retries; a session that holds
+     * the reservation but times out releases exactly what it took.
+     */
+    const acquireWrite = async (
+      selfId: string,
+      directory: string,
+      keys: string[],
+      budgetMs: number,
+      signal?: AbortSignal,
+    ): Promise<{
+      cleared: boolean;
+      holders: Array<{ label: string; sessionId: string; remote: boolean }>;
+      waited: boolean;
+    }> => {
+      const deadline = Date.now() + budgetMs;
+      let waited = false;
+      for (;;) {
+        if (tryReserveInFlight(selfId, directory, keys)) {
+          const remaining = deadline - Date.now();
+          if (remaining <= 0 || signal?.aborted) {
+            releaseReservedKeys(selfId, keys);
+            return { cleared: false, holders: await writersOf(directory, selfId, keys), waited: true };
+          }
+          const outcome = await waitForRelease(selfId, directory, keys, remaining, signal);
+          if (!outcome.cleared) releaseReservedKeys(selfId, keys);
+          return { ...outcome, waited: outcome.waited || waited };
+        }
+        const remaining = deadline - Date.now();
+        if (remaining <= 0 || signal?.aborted) {
+          return { cleared: false, holders: await writersOf(directory, selfId, keys), waited: true };
+        }
+        const outcome = await waitForRelease(selfId, directory, keys, remaining, signal);
+        waited = true;
+        if (!outcome.cleared) return outcome;
+      }
     };
 
     /** Drop any in-flight keys this process published, so cleanup is not abrupt. */
@@ -2937,7 +3041,17 @@ export default Plugin.define({
       // Drop presence entries this instance claimed, so a closed session stops
       // being advertised as a peer immediately rather than at the stale cutoff.
       // ctx exposes no self id, so the ids we claimed are tracked as we go.
-      for (const id of selfSessionIDs) peers.delete(peerKey(id));
+      // Removal must hit shared storage too: mirrorPeers only writes, so
+      // deleting from the local map alone would leave the published record
+      // visible to other processes until peerStaleSec elapses.
+      if (peerMirrorTimer !== undefined) clearTimeout(peerMirrorTimer);
+      peerMirrorTimer = undefined;
+      for (const id of selfSessionIDs) {
+        peers.delete(peerKey(id));
+        const key = peerStorageKey(id);
+        publishedPeers.delete(key);
+        void Promise.resolve(peerStore?.remove?.(key)).catch(() => undefined);
+      }
       selfSessionIDs.clear();
       // Drop this instance's in-flight markers, so a reloaded plugin does not
       // leave a file looking like it is mid-write.
@@ -2945,7 +3059,7 @@ export default Plugin.define({
       clearOwnWaitIntents();
       if (remotePeerTimer !== undefined) clearInterval(remotePeerTimer);
       if (peerMirrorTimer !== undefined) clearTimeout(peerMirrorTimer);
-      mirrorPeers();
+      peerMirrorTimer = undefined;
       peers.clear();
     };
   },
