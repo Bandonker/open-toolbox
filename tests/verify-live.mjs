@@ -219,7 +219,35 @@ async function scenarioCompaction() {
   );
 }
 
+/**
+ * Is the title short-circuit enabled *in the running server*?
+ *
+ * It is opt-in (`titleShortCircuit` / `OPENCODE_CONTEXT_PRUNER_TITLE`, default
+ * false) and the plugin is loaded once for the whole server, so a scenario
+ * cannot turn it on for itself. Only the config file is a source of truth both
+ * this process and the server can see: an env var set here would say nothing
+ * about the already-running server, and reading it would produce a false
+ * "enabled" and a bogus failure. Set it in
+ * `~/.config/opencode/context-pruner.jsonc` and reload to exercise it.
+ */
+function titleShortCircuitEnabled() {
+  const file = join(homedir(), ".config", "opencode", "context-pruner.jsonc");
+  try {
+    const m = readFileSync(file, "utf8").match(/"titleShortCircuit"\s*:\s*(true|false|"[^"]*")/i);
+    if (!m) return false;
+    return !/^(0|false|off|no)$/i.test(m[1].replace(/"/g, ""));
+  } catch {
+    return false;
+  }
+}
+
 async function scenarioTitle() {
+  if (!titleShortCircuitEnabled()) {
+    note(
+      "title short-circuit is disabled (titleShortCircuit defaults to false) — skipping rather than reporting a failure for an opt-in feature that never ran",
+    );
+    return;
+  }
   const probe = "TITLESHORTCIRCUIT-PROBE-AlphaBravoCharlieDeltaEchoFoxtrotGolfHotelIndiaJuliet";
   const sid = await newSession();
   await send(sid, `${probe} reply with the single word ACK.`);
