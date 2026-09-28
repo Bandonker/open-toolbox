@@ -15,25 +15,12 @@ redaction, and a lifetime usage dashboard.
 
 ## Contents
 
-- [Getting started](#getting-started)
-  - [Quick start](#quick-start)
-  - [Verify](#verify)
-  - [Layout](#layout)
+- [Getting started](#getting-started) — install, verify, layout
 - [Plugins](#plugins) — the 15 plugins at a glance
-- [Plugin details](#plugin-details) — what each one does
+- [Plugin details](#plugin-details) — what each one does, with its options
 - [Reference](#reference)
   - [Commands](#commands)
-  - [Configuration](#configuration)
-  - [tool-audit options](#config-tool-audit)
-  - [context-pruner options](#config-context-pruner)
-  - [session-export options](#config-session-export)
-  - [memory options](#config-memory)
-  - [goal options](#config-goal)
-  - [secret-shield options](#config-secret-shield)
-  - [finish-guard options](#config-finish-guard)
-  - [usage-stats options](#config-usage-stats)
-- [Development](#development)
-  - [Publishing](#publishing)
+- [Development](#development) — repo workflow and publishing
 - [FAQ](#faq)
 - [Contributing](#contributing)
 - [License](#license)
@@ -223,8 +210,29 @@ Click any plugin name to jump to its expandable documentation below.
 
 ## Plugin details
 
-Expand a plugin to read its purpose and key capabilities. Configuration options
-are documented in [Configuration](#configuration).
+Expand a plugin to read what it does and how to configure it — every plugin
+with options documents them in its own table below.
+
+Zero config is required: everything loads with defaults. Each knob is read
+from the plugin `options` object (npm installs) or its env var (always works),
+when the plugin loads, so restart opencode after changing values:
+
+```jsonc
+{
+  "plugins": [
+    // a bare package name
+    "@bandonker/opencode-context-pruner",
+    // or an object carrying options
+    { "package": "@bandonker/opencode-tool-audit", "options": { "retentionDays": 90 } },
+    // a name starting with "-" removes that plugin
+    { "package": "-some-plugin" }
+  ]
+}
+```
+
+> **Local `.ts` plugins take no `options`.** The loader rejects a bare file
+> path with `configured plugin path must be a directory`, and files in
+> `plugins/` load with defaults — that is why every knob below has an env var.
 
 <a id="plugin-opencode-sessions"></a>
 <details>
@@ -311,6 +319,27 @@ touch disk.
 
 Tools: `trace_query`, `trace_stats`, and `trace_export`.
 
+#### Options
+
+<a id="config-tool-audit"></a>
+
+
+Each option is read from the plugin `options` object (npm installs) or the env
+var (always works):
+
+| Option | Env var | Default | Meaning |
+| :-- | :-- | :-- | :-- |
+| `dir` | `OPENCODE_TOOL_AUDIT_DIR` | `~/.opencode-plugins/tool-audit` | Where the SQLite DB lives |
+| `enabled` | `OPENCODE_TOOL_AUDIT_ENABLED` | `true` | Turn recording off without uninstalling |
+| `redact` | `OPENCODE_TOOL_AUDIT_REDACT` | `true` | Scrub secrets from arguments before writing |
+| `maxInputChars` | `OPENCODE_TOOL_AUDIT_MAX_INPUT_CHARS` | `2000` | Per-call argument cap |
+| `retentionDays` | `OPENCODE_TOOL_AUDIT_RETENTION_DAYS` | `30` | Prune rows older than this (`0` = keep forever) |
+| `ignoreTools` | `OPENCODE_TOOL_AUDIT_IGNORE` | `todowrite` + its own tools | Comma-separated tools to skip |
+
+Values are read when the plugin loads, so restart opencode after changing them.
+`opencode-sessions` has its own knobs — see
+[its README](opencode-sessions/README.md#config-knobs).
+
 </details>
 
 <a id="plugin-command-pack"></a>
@@ -339,181 +368,10 @@ Use `context_pruner_stats` to inspect savings, `context_report` to inspect the
 active budget and epoch, and `context_pruner_recall` to retrieve pruned output
 without re-running the original tool.
 
-</details>
-
-<a id="plugin-session-export"></a>
-<details>
-<summary><strong>session-export</strong> — transcript exports</summary>
-
-Export session transcripts to Markdown, JSON, JSONL, or text with a model and
-usage header. Exports support role and tool filters, optional reasoning,
-per-part truncation, secret redaction, and safe non-overwriting filenames.
-
-`session_export` writes a file or returns the export inline;
-`session_export_info` reports the current configuration and last export.
-
-</details>
-
-<a id="plugin-memory"></a>
-<details>
-<summary><strong>memory</strong> — local-first long-term memory</summary>
-
-Store and recall durable local memories without an embedding API, cloud service,
-or network request. Relevant memories are injected into each request within a
-character budget and deduplicated per session.
-
-Tools: `memory_remember`, `memory_recall`, `memory_forget`, `memory_list`, and
-`memory_stats`. The database lives at
-`~/.opencode-plugins/memory/memory.db`.
-
-</details>
-
-<a id="plugin-goal"></a>
-<details>
-<summary><strong>goal</strong> — persistent autonomous goal loops</summary>
-
-Start an objective with `/goal <objective>` and optional `- ` success
-criteria. The goal is re-injected into requests and the model is automatically
-continued when a turn ends, until `goal_complete`, `goal_blocked`, an
-interrupt, a stall, repeated failures, or the iteration/time budget stops it.
-
-Goal state is persisted per session, so it survives plugin reloads and long
-turns. Tools: `goal_complete`, `goal_blocked`, and `goal_progress`.
-
-</details>
-
-<a id="plugin-secret-shield"></a>
-<details>
-<summary><strong>secret-shield</strong> — secret detection and redaction</strong>
-
-Detect and redact secrets across outbound HTTP bodies, prompts, tool arguments
-and results, and child-process environments. Choose `observe`, `redact`, or
-`block` mode, with high-precision rules, entropy fallback detection, allowlists,
-and a hashed JSONL audit that never stores the secret value.
-
-Tools: `secret_shield_scan`, `secret_shield_stats`, `secret_shield_shape`, and
-`secret_shield_keys`.
-
-</details>
-
-<a id="plugin-finish-guard"></a>
-<details>
-<summary><strong>finish-guard</strong> — resilient SSE stream handling</summary>
-
-Normalise OpenAI-compatible SSE streams when a content, reasoning, or tool delta
-arrives after the provider's `finish_reason` chunk. This prevents invalid
-provider-output failures and the follow-on failed-session-drain cascade for
-reasoning models behind strict gateways.
-
-</details>
-
-<a id="plugin-strip-skills-catalog"></a>
-<details>
-<summary><strong>strip-skills-catalog</strong> — smaller system prompts</summary>
-
-Strips the `<available_skills>` catalog from the system prompt to save tokens.
-The `skill` tool remains available on demand, so agents can still load a skill
-when they need it.
-
-</details>
-
-<a id="plugin-usage-stats"></a>
-<details>
-<summary><strong>usage-stats</strong> — lifetime usage dashboard</summary>
-
-Track lifetime tokens, cost, tool calls, model usage, and background title or
-compaction spend in local SQLite. Use `stats_summary`, `stats_tools`,
-`stats_tokens`, `stats_heatmap`, or `/stats` for the data, and `stats_dashboard`
-to write a self-contained HTML dashboard.
-
-The dashboard includes an activity heatmap, a 30-day token chart, tool and model
-tables, exact hover breakdowns for daily activity and chart bars, searchable
-multi-select model filtering, responsive layout, and automatic refresh without
-spending model tokens.
-
-### Dashboard screenshots
-
-![Usage-stats dashboard overview](images/usage-stats.PNG)
-
-![Usage-stats dashboard with a populated activity chart](images/usage-stats2.PNG)
-
-![Usage-stats dashboard details](images/usage-stats3.PNG)
-
-</details>
-
-## Reference
-
-### Commands
-
-`command-pack` adds these to your command palette (`usage-stats` adds `/stats`, `goal` adds `/goal`):
-
-| Command | Does |
-| :-- | :-- |
-| `/handoff` | Hand the current working point off to a fresh session |
-| `/decide` | Record a decision in the decision log |
-| `/journal` | Log a bug or recurring failure in the error journal |
-| `/recall` | Search past decisions, errors, snippets and indexed code |
-| `/index` | Index this project for full-text code search |
-| `/trace` | Inspect the tool-call audit log |
-| `/toolbox` | Show which pack tools are installed in this session |
-| `/stats` | Refresh and open the usage dashboard — runs server-side, so it costs **zero model tokens** |
-| `/goal` | Set an objective the agent keeps working toward until it is reached (`/goal status`, `pause`, `resume`, `done`, `clear` manage it) |
-
-Each command injects a short instruction into the current session, so the agent
-does the work with its normal tools. If a command's tool isn't installed, the
-instruction says so instead of failing silently.
-
-### Configuration
-
-Zero config is required — files in `plugins/` load with defaults. The `plugins`
-array in `opencode.jsonc` is for **npm packages** (and directory-based plugin
-packages); entries are a package name or an object carrying `options`:
-
-```jsonc
-{
-  "plugins": [
-    // a bare package name
-    "@bandonker/opencode-context-pruner",
-    // or an object carrying options
-    { "package": "@bandonker/opencode-tool-audit", "options": { "retentionDays": 90 } },
-    // a name starting with "-" removes that plugin
-    { "package": "-some-plugin" }
-  ]
-}
-```
-
-A string starting with `-` removes a plugin.
-
-> **Local `.ts` plugins take no `options`.** The loader rejects a bare file path
-> with `configured plugin path must be a directory`, and files in `plugins/` are
-> loaded with defaults. To tune a local plugin, use its env vars — that is why
-> every knob below has one.
-
-<a id="config-tool-audit"></a>
-<details>
-<summary><strong>tool-audit options</strong></summary>
-
-Each option is read from the plugin `options` object (npm installs) or the env
-var (always works):
-
-| Option | Env var | Default | Meaning |
-| :-- | :-- | :-- | :-- |
-| `dir` | `OPENCODE_TOOL_AUDIT_DIR` | `~/.opencode-plugins/tool-audit` | Where the SQLite DB lives |
-| `enabled` | `OPENCODE_TOOL_AUDIT_ENABLED` | `true` | Turn recording off without uninstalling |
-| `redact` | `OPENCODE_TOOL_AUDIT_REDACT` | `true` | Scrub secrets from arguments before writing |
-| `maxInputChars` | `OPENCODE_TOOL_AUDIT_MAX_INPUT_CHARS` | `2000` | Per-call argument cap |
-| `retentionDays` | `OPENCODE_TOOL_AUDIT_RETENTION_DAYS` | `30` | Prune rows older than this (`0` = keep forever) |
-| `ignoreTools` | `OPENCODE_TOOL_AUDIT_IGNORE` | `todowrite` + its own tools | Comma-separated tools to skip |
-
-Values are read when the plugin loads, so restart opencode after changing them.
-`opencode-sessions` has its own knobs — see
-[its README](opencode-sessions/README.md#config-knobs).
-
-</details>
+#### Options
 
 <a id="config-context-pruner"></a>
-<details>
-<summary><strong>context-pruner options</strong></summary>
+
 
 `context-pruner` is a *context compiler*: it trims stale tool output from the
 outgoing request only. The session transcript on disk is unchanged, and a pruned
@@ -602,9 +460,21 @@ by count (`storageGc`).
 
 </details>
 
-<a id="config-session-export"></a>
+<a id="plugin-session-export"></a>
 <details>
-<summary><strong>session-export options</strong></summary>
+<summary><strong>session-export</strong> — transcript exports</summary>
+
+Export session transcripts to Markdown, JSON, JSONL, or text with a model and
+usage header. Exports support role and tool filters, optional reasoning,
+per-part truncation, secret redaction, and safe non-overwriting filenames.
+
+`session_export` writes a file or returns the export inline;
+`session_export_info` reports the current configuration and last export.
+
+#### Options
+
+<a id="config-session-export"></a>
+
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -618,9 +488,22 @@ by count (`storageGc`).
 
 </details>
 
-<a id="config-memory"></a>
+<a id="plugin-memory"></a>
 <details>
-<summary><strong>memory options</strong></summary>
+<summary><strong>memory</strong> — local-first long-term memory</summary>
+
+Store and recall durable local memories without an embedding API, cloud service,
+or network request. Relevant memories are injected into each request within a
+character budget and deduplicated per session.
+
+Tools: `memory_remember`, `memory_recall`, `memory_forget`, `memory_list`, and
+`memory_stats`. The database lives at
+`~/.opencode-plugins/memory/memory.db`.
+
+#### Options
+
+<a id="config-memory"></a>
+
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -635,9 +518,22 @@ by count (`storageGc`).
 
 </details>
 
-<a id="config-goal"></a>
+<a id="plugin-goal"></a>
 <details>
-<summary><strong>goal options</strong></summary>
+<summary><strong>goal</strong> — persistent autonomous goal loops</summary>
+
+Start an objective with `/goal <objective>` and optional `- ` success
+criteria. The goal is re-injected into requests and the model is automatically
+continued when a turn ends, until `goal_complete`, `goal_blocked`, an
+interrupt, a stall, repeated failures, or the iteration/time budget stops it.
+
+Goal state is persisted per session, so it survives plugin reloads and long
+turns. Tools: `goal_complete`, `goal_blocked`, and `goal_progress`.
+
+#### Options
+
+<a id="config-goal"></a>
+
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -665,9 +561,22 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 
 </details>
 
-<a id="config-secret-shield"></a>
+<a id="plugin-secret-shield"></a>
 <details>
-<summary><strong>secret-shield options</strong></summary>
+<summary><strong>secret-shield</strong> — secret detection and redaction</summary>
+
+Detect and redact secrets across outbound HTTP bodies, prompts, tool arguments
+and results, and child-process environments. Choose `observe`, `redact`, or
+`block` mode, with high-precision rules, entropy fallback detection, allowlists,
+and a hashed JSONL audit that never stores the secret value.
+
+Tools: `secret_shield_scan`, `secret_shield_stats`, `secret_shield_shape`, and
+`secret_shield_keys`.
+
+#### Options
+
+<a id="config-secret-shield"></a>
+
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -680,9 +589,19 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 
 </details>
 
-<a id="config-finish-guard"></a>
+<a id="plugin-finish-guard"></a>
 <details>
-<summary><strong>finish-guard options</strong></summary>
+<summary><strong>finish-guard</strong> — resilient SSE stream handling</summary>
+
+Normalise OpenAI-compatible SSE streams when a content, reasoning, or tool delta
+arrives after the provider's `finish_reason` chunk. This prevents invalid
+provider-output failures and the follow-on failed-session-drain cascade for
+reasoning models behind strict gateways.
+
+#### Options
+
+<a id="config-finish-guard"></a>
+
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -693,9 +612,34 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 
 </details>
 
-<a id="config-usage-stats"></a>
+<a id="plugin-strip-skills-catalog"></a>
 <details>
-<summary><strong>usage-stats options</strong></summary>
+<summary><strong>strip-skills-catalog</strong> — smaller system prompts</summary>
+
+Strips the `<available_skills>` catalog from the system prompt to save tokens.
+The `skill` tool remains available on demand, so agents can still load a skill
+when they need it.
+
+</details>
+
+<a id="plugin-usage-stats"></a>
+<details>
+<summary><strong>usage-stats</strong> — lifetime usage dashboard</summary>
+
+Track lifetime tokens, cost, tool calls, model usage, and background title or
+compaction spend in local SQLite. Use `stats_summary`, `stats_tools`,
+`stats_tokens`, `stats_heatmap`, or `/stats` for the data, and `stats_dashboard`
+to write a self-contained HTML dashboard.
+
+The dashboard includes an activity heatmap, a 30-day token chart, tool and model
+tables, exact hover breakdowns for daily activity and chart bars, searchable
+multi-select model filtering, responsive layout, and automatic refresh without
+spending model tokens.
+
+#### Options
+
+<a id="config-usage-stats"></a>
+
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -711,16 +655,13 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 | `openOnStart` | `OPENCODE_USAGE_STATS_OPEN` | `false` | Open the dashboard in your browser when opencode starts |
 | `log` | `OPENCODE_USAGE_STATS_LOG` | `false` | Log plugin activity to stderr |
 
-**The dashboard.** `stats_dashboard` (and `/stats`) writes a self-contained HTML
-report to `~/.opencode-plugins/usage-stats/dashboard.html` — a GitHub-style
-activity heatmap, a 30-day bar chart, top-tools and per-model tables, and a
-separate background (title/compaction) section. Hovering an activity day shows
-its token categories, tool calls, model usage and cost; hovering a bar shows
-its exact token total; and the Models table can be filtered by model. It has
-no external scripts, CDN or network access; a small inline script powers the
-model filter, it auto-switches light/dark with your OS theme, and reloads itself
-every `autoRefreshSec` so it stays current **without spending any model
-tokens** (the plugin runs in the server process, not the model).
+### Dashboard screenshots
+
+![Usage-stats dashboard overview](images/usage-stats.PNG)
+
+![Usage-stats dashboard with a populated activity chart](images/usage-stats2.PNG)
+
+![Usage-stats dashboard details](images/usage-stats3.PNG)
 
 **Cost is computed from the provider's real price list.** The plugin reads each
 model's published per-million-token rates via `ctx.model.list()` and shows both
@@ -737,15 +678,32 @@ for you directly from the server process — it never calls the model. Set
 `OPENCODE_USAGE_STATS_OPEN=true` to open it automatically at startup, or
 `OPENCODE_USAGE_STATS_NO_OPEN=1` to suppress browser launches (headless).
 
-<details>
-<summary><b>Why does the published JSON schema say <code>plugin</code>?</b></summary>
-
-`https://opencode.ai/config.json` describes the TUI's settings, not the server
-config. The server validates a `plugins` (plural) array — that is the key the
-runtime reads, confirmed in the server log when the config is reloaded.
+> **Note:** `https://opencode.ai/config.json` describes the TUI's settings, not the server
+> config. The server validates a `plugins` (plural) array — that is the key the
+> runtime reads, confirmed in the server log when the config is reloaded.
 </details>
 
-</details>
+## Reference
+
+### Commands
+
+`command-pack` adds these to your command palette (`usage-stats` adds `/stats`, `goal` adds `/goal`):
+
+| Command | Does |
+| :-- | :-- |
+| `/handoff` | Hand the current working point off to a fresh session |
+| `/decide` | Record a decision in the decision log |
+| `/journal` | Log a bug or recurring failure in the error journal |
+| `/recall` | Search past decisions, errors, snippets and indexed code |
+| `/index` | Index this project for full-text code search |
+| `/trace` | Inspect the tool-call audit log |
+| `/toolbox` | Show which pack tools are installed in this session |
+| `/stats` | Refresh and open the usage dashboard — runs server-side, so it costs **zero model tokens** |
+| `/goal` | Set an objective the agent keeps working toward until it is reached (`/goal status`, `pause`, `resume`, `done`, `clear` manage it) |
+
+Each command injects a short instruction into the current session, so the agent
+does the work with its normal tools. If a command's tool isn't installed, the
+instruction says so instead of failing silently.
 
 ## Development
 
