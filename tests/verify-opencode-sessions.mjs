@@ -20,12 +20,16 @@ const ctx = {
   location: { directory: process.cwd() },
   event: { subscribe: () => (async function* () {})() },
   tool: {
+    // Concurrent-edit tracking hooks this seam. The plugin must also survive a
+    // context that lacks it, so it is registered defensively.
+    hook: async () => ({ dispose: async () => {} }),
     transform: async (cb) => {
       cb({ add: (t) => void (tools[t.name] = t) });
       return { dispose: async () => {} };
     },
   },
   session: {
+    hook: async () => ({ dispose: async () => {} }),
     get: async ({ sessionID }) => ({
       id: sessionID,
       title: "[spawned:abc123] some task",

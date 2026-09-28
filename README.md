@@ -13,57 +13,186 @@ redaction, and a lifetime usage dashboard.
 
 ---
 
-## Quick start
+## Contents
+
+- [Getting started](#getting-started)
+  - [Quick start](#quick-start)
+  - [Verify](#verify)
+  - [Layout](#layout)
+- [Plugins](#plugins) — the 15 plugins at a glance
+- [Plugin details](#plugin-details) — what each one does
+- [Reference](#reference)
+  - [Commands](#commands)
+  - [Configuration](#configuration)
+  - [tool-audit options](#config-tool-audit)
+  - [context-pruner options](#config-context-pruner)
+  - [session-export options](#config-session-export)
+  - [memory options](#config-memory)
+  - [goal options](#config-goal)
+  - [secret-shield options](#config-secret-shield)
+  - [finish-guard options](#config-finish-guard)
+  - [usage-stats options](#config-usage-stats)
+- [Development](#development)
+  - [Publishing](#publishing)
+- [FAQ](#faq)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Getting started
+
+### Quick start
+
+> **Requires opencode v2.** On v2 the plugins must be installed as **packages**
+> registered in the `plugins` array. Copying the loose `.ts` files into
+> `~/.config/opencode/plugins/` does **not** work here — opencode's
+> auto-discovery of that directory does not resolve bare npm specifiers, so
+> every plugin fails with `Cannot find package '@opencode/plugin'`. If you
+> followed an older copy-paste-into-`plugins/` guide, see
+> [FAQ](#faq).
 
 ```bash
 git clone https://github.com/Bandonker/open-toolbox.git
 cd open-toolbox
+npm install
+npm run build:packages        # emits packages/<name>/ (package.json + index.js)
 
-# copy all three pieces into your opencode config (see "Layout" below)
+## install the packages under your opencode config dir
 CFG="$HOME/.config/opencode"
-mkdir -p "$CFG/plugins" "$CFG/lib" "$CFG/opencode-sessions"
-cp plugins/*.ts          "$CFG/plugins/"
-cp lib/sqlite.ts         "$CFG/lib/"
-cp opencode-sessions/helpers.ts "$CFG/opencode-sessions/"
-cp package.json          "$CFG/package.json"
+mkdir -p "$CFG/toolbox"
+cp -r packages/* "$CFG/toolbox/"
 
-cd "$CFG" && npm install     # or: bun install
+## one shared dependency install for all 15 packages
+cat > "$CFG/toolbox/package.json" <<'JSON'
+{
+  "name": "open-toolbox-runtime",
+  "private": true,
+  "type": "module",
+  "dependencies": { "@opencode/plugin": "^2.0.11", "zod": "4.1.8" }
+}
+JSON
+(cd "$CFG/toolbox" && npm install)      # or: bun install
+
+## each package must see node_modules from its own directory
+for d in "$CFG"/toolbox/*/; do ln -sfn ../node_modules "$d/node_modules"; done
 ```
 
-Restart opencode. Done — every tool below is now available to your agent.
+Register the packages in the global config. This **merges** into an existing
+`opencode.jsonc` rather than overwriting it:
+
+```bash
+node -e '
+const fs=require("fs"),os=require("os"),path=require("path");
+const cfgDir=path.join(os.homedir(),".config/opencode");
+const tb=path.join(cfgDir,"toolbox"), file=path.join(cfgDir,"opencode.jsonc");
+const raw=fs.existsSync(file)?fs.readFileSync(file,"utf8"):"{}";
+const cfg=JSON.parse(raw.replace(/\/\*[\s\S]*?\*\//g,"").replace(/^\s*\/\/.*$/gm,""));
+cfg.plugins=fs.readdirSync(tb).filter(n=>fs.existsSync(path.join(tb,n,"package.json"))).sort().map(n=>path.join(tb,n));
+fs.writeFileSync(file,JSON.stringify(cfg,null,2)+"\n");
+console.log("registered "+cfg.plugins.length+" plugins -> "+file);
+'
+```
+
+Then reload opencode (`opencode reload`, or restart the app). Every tool
+below is now available to your agent.
 
 <details>
 <summary><b>Windows / PowerShell</b></summary>
 
+The package layout is identical; only the path syntax differs. Run the POSIX
+steps above in WSL/Git Bash, or adapt:
+
 ```powershell
-git clone https://github.com/Bandonker/open-toolbox.git
-cd open-toolbox
-
 $CFG = "$HOME\.config\opencode"
-New-Item -ItemType Directory "$CFG\plugins", "$CFG\lib", "$CFG\opencode-sessions" -Force | Out-Null
-Copy-Item plugins\*.ts              "$CFG\plugins\"
-Copy-Item lib\sqlite.ts             "$CFG\lib\"
-Copy-Item opencode-sessions\helpers.ts "$CFG\opencode-sessions\"
-Copy-Item package.json              "$CFG\package.json"
-
-Set-Location $CFG; npm install   # or: bun install
+New-Item -ItemType Directory "$CFG\toolbox" -Force | Out-Null
+Copy-Item -Recurse -Force packages\* "$CFG\toolbox\"
+Set-Location "$CFG\toolbox"; npm install
 ```
+
+Registering the `plugins` array uses the same `node -e` snippet — it relies on
+`os.homedir()` and `path.join()`, so it is platform-neutral. Note that a
+backslashed path in JSON must be escaped (`C:\\path\\to`); the snippet emits
+forward slashes, which opencode accepts on Windows.
 
 </details>
 
 <details>
 <summary><b>Project-local (one repo instead of globally)</b></summary>
 
-Same files, under `<repo>/.opencode/` instead of `$HOME/.config/opencode/`:
+Same packages, but under `<repo>/.opencode/toolbox/` instead of
+`$HOME/.config/opencode/toolbox/`, and registered in the **project**
+`opencode.jsonc` rather than the global one:
 
 ```bash
-mkdir -p .opencode/plugins .opencode/lib .opencode/opencode-sessions
-cp /path/to/open-toolbox/plugins/*.ts          .opencode/plugins/
-cp /path/to/open-toolbox/lib/sqlite.ts         .opencode/lib/
-cp /path/to/open-toolbox/opencode-sessions/helpers.ts .opencode/opencode-sessions/
-cp /path/to/open-toolbox/package.json          .opencode/package.json
-cd .opencode && npm install
+mkdir -p .opencode/toolbox
+cp -r /path/to/open-toolbox/packages/* .opencode/toolbox/
+(cd .opencode/toolbox && npm install)
+for d in .opencode/toolbox/*/; do ln -sfn ../node_modules "$d/node_modules"; done
 ```
+
+</details>
+
+### Verify
+
+From the repo root — no opencode server needed:
+
+```bash
+npm install --no-audit --no-fund
+npm test          # helper unit tests + mock-context checks for the pack
+npm run typecheck # tsc --noEmit over plugins/ and lib/
+```
+
+The same two commands run on every push in [CI](.github/workflows/ci.yml).
+
+### Layout
+
+After `npm run build:packages` and installing, this is what your config dir
+looks like. Each plugin is a **package directory** registered in the
+`plugins` array — not a loose `.ts` file in `plugins/`:
+
+```
+~/.config/opencode/        # or <repo>/.opencode/ — this is under your HOME dir,
+                           # not relative to the repo
+├── opencode.jsonc         # the "plugins" array pointing at toolbox/*/
+└── toolbox/               # one directory per plugin
+    ├── package.json       # shared dependency manifest
+    ├── node_modules/      # one install, shared by all 15
+    ├── opencode-sessions/ # index.js + helpers.js
+    │   └── node_modules -> ../node_modules
+    ├── memory/
+    │   ├── package.json
+    │   ├── index.js
+    │   ├── lib/sqlite.js
+    │   └── node_modules -> ../node_modules
+    ├── context-pruner/
+    ├── secret-shield/
+    └── … 15 in total
+```
+
+<details>
+<summary><b>Why a directory per plugin, and not loose files in <code>plugins/</code>?</b></summary>
+
+Two independent reasons, both of which make the flat layout fail:
+
+1. **Resolution.** opencode v2 auto-discovers loose `.ts` files under
+   `plugins/`, but does not resolve bare npm specifiers from the config
+   directory for them. A plugin that does `import { Plugin } from
+   "@opencode/plugin"` fails to load with `Cannot find package
+   '@opencode/plugin'`. Registered as a package directory, it resolves
+   normally.
+2. **The loader treats every export as a plugin factory.** A stray helper
+   export in `plugins/` fails the load with `prompt.split is not a function`
+   and cascades into config/provider errors. Keeping helpers in their own
+   files outside `plugins/` avoids that entirely.
+
+</details>
+
+<details>
+<summary><b>Why does every package need its own <code>node_modules</code> symlink?</b></summary>
+
+Because resolution is anchored at the package directory, not hoisted to the
+config root. A single `npm install` in `toolbox/` populates the shared copy;
+the per-package symlink is what makes it reachable from each plugin. This is
+the same layout pnpm uses.
 
 </details>
 
@@ -73,7 +202,7 @@ Click any plugin name to jump to its expandable documentation below.
 
 | Plugin | Tools | Description |
 | :-- | :--: | :-- |
-| **[opencode-sessions](#plugin-opencode-sessions)** | 7 | Spawn child sessions, wait for them, read results, send follow-ups, answer permission prompts, cancel them — and **hand off the current working point into a fresh session**. Created sessions are real opencode sessions, so they show up in the Desktop session switcher as if you'd pressed `+`. |
+| **[opencode-sessions](#plugin-opencode-sessions)** | 9 | Spawn child sessions, wait for them, read results, send follow-ups, answer permission prompts, cancel them — and **hand off the current working point into a fresh session**. Created sessions are real opencode sessions, so they show up in the Desktop session switcher as if you'd pressed `+`. Also adds **targeted project presence**: a brief about only the sessions that bear on yours, and file-collision warnings so two agents don't write the same file at once. |
 | **[decision-log](#plugin-decision-log)** | 5 | Record and search architectural decisions in a local SQLite FTS5 database. `decision_log`, `decision_search`, `decision_list`, `decision_get`, `decision_update`. |
 | **[error-journal](#plugin-error-journal)** | 5 | Log errors with context, search past ones, and record resolutions so you stop re-debugging the same failure. |
 | **[snippet-library](#plugin-snippet-library)** | 5 | Save reusable code snippets and search them by language, tag, or full text. |
@@ -106,7 +235,22 @@ prompts, cancel them, and hand off the current working point into a fresh
 session. Created sessions are real opencode sessions and appear in the Desktop
 session switcher.
 
-Tools: 7. See the [opencode-sessions package documentation](opencode-sessions/README.md)
+It also adds **project presence**: any session working in a repo can see the
+other sessions in that repo — including ones this plugin did not spawn — and can
+message them. opencode has no `session.list()`, so peers are discovered from the
+server-wide event stream and announced by each session on its first turn.
+
+The brief injected into each request is **targeted, not a roster**: a session is
+told about a peer only when that peer could affect its work — it holds a file this
+session is writing, it is in this session's lineage, it is mid-turn, or it declared
+overlapping work. When nothing is relevant, nothing is injected. With
+`fileLocks: "enforce"` two agents about to write the same file don't just get told
+to take turns — the write actually waits for the holder, and fails loudly naming
+who has it if the wait runs out. A peer that has gone quiet is **verified with
+`session.get`** rather than assumed dead, and a session you closed or deleted is
+confirmed absent and dropped from the list instead of lingering as a ghost.
+
+Tools: 9. See the [opencode-sessions package documentation](opencode-sessions/README.md)
 for the complete tool list and configuration knobs.
 
 </details>
@@ -297,7 +441,9 @@ spending model tokens.
 
 </details>
 
-## Commands
+## Reference
+
+### Commands
 
 `command-pack` adds these to your command palette (`usage-stats` adds `/stats`, `goal` adds `/goal`):
 
@@ -317,7 +463,7 @@ Each command injects a short instruction into the current session, so the agent
 does the work with its normal tools. If a command's tool isn't installed, the
 instruction says so instead of failing silently.
 
-## Configuration
+### Configuration
 
 Zero config is required — files in `plugins/` load with defaults. The `plugins`
 array in `opencode.jsonc` is for **npm packages** (and directory-based plugin
@@ -343,7 +489,9 @@ A string starting with `-` removes a plugin.
 > loaded with defaults. To tune a local plugin, use its env vars — that is why
 > every knob below has one.
 
-### tool-audit options
+<a id="config-tool-audit"></a>
+<details>
+<summary><strong>tool-audit options</strong></summary>
 
 Each option is read from the plugin `options` object (npm installs) or the env
 var (always works):
@@ -361,7 +509,11 @@ Values are read when the plugin loads, so restart opencode after changing them.
 `opencode-sessions` has its own knobs — see
 [its README](opencode-sessions/README.md#config-knobs).
 
-### context-pruner options
+</details>
+
+<a id="config-context-pruner"></a>
+<details>
+<summary><strong>context-pruner options</strong></summary>
 
 `context-pruner` is a *context compiler*: it trims stale tool output from the
 outgoing request only. The session transcript on disk is unchanged, and a pruned
@@ -383,6 +535,11 @@ nudges. It reads optional config from
 `.opencode/context-pruner.jsonc` (project) then
 `~/.config/opencode/context-pruner.jsonc` (global), and can also read a DCP
 `dcp.jsonc` for migration.
+
+Session-scoped state and the digests a session produced are reclaimed when the
+host reports `session.deleted`, with a startup sweep covering sessions deleted
+while opencode was closed. The non-session digest/calibration caches are capped
+by count (`storageGc`).
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -426,6 +583,9 @@ nudges. It reads optional config from
 | `recall` | `OPENCODE_CONTEXT_PRUNER_RECALL` | `true` | Keep pruned output locally so it can be recalled instead of re-run |
 | `recallKeep` | `OPENCODE_CONTEXT_PRUNER_RECALL_KEEP` | `50` | Most pruned outputs kept per session |
 | `recallMaxChars` | `OPENCODE_CONTEXT_PRUNER_RECALL_MAX_CHARS` | `200000` | Max characters returned by a single recall |
+| `storageGc` | `OPENCODE_CONTEXT_PRUNER_STORAGE_GC` | `true` | Bound the non-session KV caches (digest + calibration) |
+| `summaryCacheMax` | `OPENCODE_CONTEXT_PRUNER_SUMMARY_CACHE_MAX` | `500` | Max persisted digest-cache entries (`0` = unlimited) |
+| `calibrationMax` | `OPENCODE_CONTEXT_PRUNER_CALIBRATION_MAX` | `256` | Max persisted calibration entries (`0` = unlimited) |
 | `compressEnabled` | `OPENCODE_CONTEXT_PRUNER_COMPRESS` | `true` | Enable the model-callable `compress` tool |
 | `compressMaxSourceChars` | `OPENCODE_CONTEXT_PRUNER_COMPRESS_MAX_CHARS` | `24000` | Max characters sent to the summariser per call |
 | `protectTags` | `OPENCODE_CONTEXT_PRUNER_PROTECT_TAGS` | `true` | Preserve `<protect>` blocks during summarisation |
@@ -440,7 +600,11 @@ nudges. It reads optional config from
 | `protectedFilePatterns` | `OPENCODE_CONTEXT_PRUNER_PROTECTED_FILES` | (none) | Globs of file paths never pruned |
 | `debug` | `OPENCODE_CONTEXT_PRUNER_DEBUG` | `false` | Write a debug log under `~/.config/opencode/logs/context-pruner` |
 
-### session-export options
+</details>
+
+<a id="config-session-export"></a>
+<details>
+<summary><strong>session-export options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -452,7 +616,11 @@ nudges. It reads optional config from
 | `maxCharsPerPart` | `OPENCODE_SESSION_EXPORT_MAX_PART_CHARS` | `4000` | Truncate each part to this many chars |
 | `redact` | `OPENCODE_SESSION_EXPORT_REDACT` | `true` | Scrub secrets; rewrite home paths to `~` |
 
-### memory options
+</details>
+
+<a id="config-memory"></a>
+<details>
+<summary><strong>memory options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -465,7 +633,11 @@ nudges. It reads optional config from
 | `maxEntries` | `OPENCODE_MEMORY_MAX_ENTRIES` | `0` | Prune least-important rows beyond this (`0` = unlimited) |
 | `log` | `OPENCODE_MEMORY_LOG` | `false` | Log activity to stderr |
 
-### goal options
+</details>
+
+<a id="config-goal"></a>
+<details>
+<summary><strong>goal options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -491,7 +663,11 @@ reply is unchanged, after `maxFailures` consecutive execution errors, or when th
 iteration/time budget is exhausted. Goal state is persisted per session, so a
 paused or budget-stopped goal can be resumed with `/goal resume`.
 
-### secret-shield options
+</details>
+
+<a id="config-secret-shield"></a>
+<details>
+<summary><strong>secret-shield options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -502,7 +678,11 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 | `blockEnvReads` | `OPENCODE_SECRET_SHIELD_BLOCK_ENV_READS` | `true` | In `block` mode, deny protected secret-file reads |
 | `log` | `OPENCODE_SECRET_SHIELD_LOG` | `false` | Emit diagnostics to stderr |
 
-### finish-guard options
+</details>
+
+<a id="config-finish-guard"></a>
+<details>
+<summary><strong>finish-guard options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -511,7 +691,11 @@ paused or budget-stopped goal can be resumed with `/goal resume`.
 | `retry` | `OPENCODE_FINISH_GUARD_RETRY` | `true` | Ask opencode to retry the turn when a stream is malformed |
 | `retryMax` | `OPENCODE_FINISH_GUARD_RETRY_MAX` | `3` | Maximum retry attempts before the turn is allowed to fail |
 
-### usage-stats options
+</details>
+
+<a id="config-usage-stats"></a>
+<details>
+<summary><strong>usage-stats options</strong></summary>
 
 | Option | Env var | Default | Meaning |
 | :-- | :-- | :-- | :-- |
@@ -561,57 +745,7 @@ config. The server validates a `plugins` (plural) array — that is the key the
 runtime reads, confirmed in the server log when the config is reloaded.
 </details>
 
-## Layout
-
-Copy all three folders into your config dir — **`plugins/` alone is not enough**,
-since some plugins import helpers that live outside it:
-
-```
-~/.config/opencode/        # or <repo>/.opencode/ — this is under your HOME dir,
-                           # not relative to the repo
-├── plugins/               # what opencode loads
-│   ├── opencode-sessions.ts
-│   ├── command-pack.ts
-│   ├── tool-audit.ts
-│   ├── decision-log.ts
-│   ├── error-journal.ts
-│   ├── snippet-library.ts
-│   ├── codebase-index.ts
-│   ├── context-pruner.ts
-│   ├── session-export.ts
-│   ├── memory.ts
-│   ├── secret-shield.ts
-│   ├── finish-guard.ts
-│   ├── usage-stats.ts
-│   ├── goal.ts
-│   └── strip-skills-catalog.ts
-├── lib/
-│   └── sqlite.ts          # used by the SQLite-backed plugins
-└── opencode-sessions/
-    └── helpers.ts         # used by opencode-sessions
-```
-
-<details>
-<summary><b>Why aren't the helpers inside <code>plugins/</code>?</b></summary>
-
-opencode treats **every export** of a file under `plugins/` as a plugin factory.
-A stray helper export therefore fails the load with
-`prompt.split is not a function` and cascades into config/provider errors.
-Keeping `lib/` and `opencode-sessions/` outside `plugins/` avoids that entirely.
-
 </details>
-
-## Verify
-
-From the repo root — no opencode server needed:
-
-```bash
-npm install --no-audit --no-fund
-npm test          # helper unit tests + mock-context checks for the pack
-npm run typecheck # tsc --noEmit over plugins/ and lib/
-```
-
-The same two commands run on every push in [CI](.github/workflows/ci.yml).
 
 ## Development
 
@@ -623,7 +757,7 @@ node opencode-sessions/sync.mjs        # install: repo -> plugins/ (fixes the he
 node opencode-sessions/sync.mjs pull   # pull:    plugins/ -> repo
 ```
 
-## Publishing
+### Publishing
 
 Each plugin also ships as its own scoped npm package (the v2 loader allows
 exactly one plugin per package). The build inlines each plugin's helpers and
@@ -648,26 +782,70 @@ packages have no runtime dependency on each other.
 ## FAQ
 
 <details>
-<summary>opencode logs <code>failed to load plugin</code> / <code>prompt.split is not a function</code></summary>
+<summary>opencode logs <code>failed to load plugin</code> / <code>Cannot find package '@opencode/plugin'</code></summary>
 
-A helper file ended up inside `plugins/`. Move `lib/` and `opencode-sessions/`
-out of `plugins/` and restart.
+The loose-file layout is the cause. If you copied `plugins/*.ts` into
+`~/.config/opencode/plugins/`, opencode v2 will discover those files but
+cannot resolve their npm imports from the config directory, so **every**
+plugin fails identically.
+
+Fix: install the built packages and register them instead. See
+[Quick start](#quick-start). Remove the old loose files afterwards — leaving
+them in place produces a load error per plugin per reload:
+
+```bash
+rm -rf ~/.config/opencode/plugins
+```
+
+</details>
+
+<details>
+<summary>opencode logs <code>prompt.split is not a function</code></summary>
+
+A helper file ended up inside `plugins/`. opencode treats **every export** of
+a file under `plugins/` as a plugin factory, so a stray helper export breaks
+the load. The package layout avoids this by construction; if you are on the
+flat layout, move `lib/` and `opencode-sessions/` out of `plugins/` and
+restart.
+
 </details>
 
 <details>
 <summary>Tools don't appear after installing</summary>
 
-Check that you copied all three folders (`plugins/`, `lib/`,
-`opencode-sessions/`), ran `npm install` in the config dir, and fully
-restarted opencode.
+1. `npm run build:packages` actually produced `packages/<name>/package.json`.
+2. `toolbox/node_modules` exists (one `npm install` at the `toolbox/` level).
+3. Every `toolbox/<name>/node_modules` symlink exists.
+4. The absolute paths in the `plugins` array of `opencode.jsonc` are the
+   **package directories**, not the `.ts` files.
+5. You reloaded (`opencode reload`) or restarted — a reload is required, and
+   for a fresh install a full restart is safer.
+
+Confirm what opencode actually registered:
+
+```bash
+opencode plugin list
+```
+
+`opencode plugin list` reports the *configured* plugin paths, including ones
+that failed to load. To verify a plugin truly loaded, check the log for
+`loading plugin` and confirm there is no matching `failed to load plugin`:
+
+```bash
+grep -E 'loading plugin|failed to load plugin' ~/.local/share/opencode/log/opencode.log | tail
+```
+
 </details>
 
 <details>
-<summary>An npm plugin fails to load</summary>
+<summary>A third-party npm plugin fails to load</summary>
 
-The `plugins` list in `opencode.jsonc` is for npm packages. Local plugins in the
-`plugins/` folder need no config entry. Many packages are still v1-only and will
-fail under v2 — verify a v2 release before adding one.
+Third-party packages are often still v1-only. A v1 plugin depends on
+`@opencode-ai/plugin` and/or exports `Plugin` differently, and will fail under
+v2. Check its `package.json` for a dependency on `@opencode/plugin` (v2) versus
+`@opencode-ai/plugin` (v1), and confirm the release you are installing
+predates the v2 migration, before adding it to the `plugins` array.
+
 </details>
 
 ## Contributing

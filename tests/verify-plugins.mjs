@@ -27,18 +27,23 @@ function check(name, ok, detail = "") {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? "  - " + detail : ""}`);
 }
 
-/** Stub ctx that captures tools registered through tool.transform. */
+/**
+ * Stub ctx that captures tools registered through tool.transform.
+ *
+ * `extra` is merged per key rather than spread wholesale, so a call site can
+ * add one seam to `tool` (e.g. `hook` for write observation) without silently
+ * dropping `transform` and losing every registered tool.
+ */
 function stubCtx(tools, extra = {}) {
+  const baseTransform = async (cb) => {
+    cb({ add: (t) => tools.push(t) });
+    return { dispose: async () => {} };
+  };
   return {
     options: {},
     location: { directory: tmpdir() },
-    tool: {
-      transform: async (cb) => {
-        cb({ add: (t) => tools.push(t) });
-        return { dispose: async () => {} };
-      },
-    },
     ...extra,
+    tool: { transform: baseTransform, ...(extra.tool ?? {}) },
   };
 }
 
@@ -2002,6 +2007,12 @@ const toolCtx = {
     mod.default.id === "opencode-sessions" && typeof mod.default.setup === "function",
   );
   const tools = [];
+  // session.hook and session.synthetic/prompt are called during setup for peer
+  // awareness, so the stub must provide them; without them setup logs a warning
+  // and the awareness path is silently untested here (covered in depth by
+  // verify-project-presence.mjs).
+  const awarenessHooks = [];
+  const toolHooks = [];
   const ctx = stubCtx(tools, {
     event: {
       // Never yields; cleanup() aborts and the process exits at the end.
@@ -2009,13 +2020,34 @@ const toolCtx = {
         await new Promise(() => {});
       },
     },
+    storage: { get: async () => undefined, set: async () => {} },
+    session: {
+      hook: async (name, cb) => void awarenessHooks.push({ name, cb }),
+      synthetic: async () => {},
+      prompt: async () => {},
+      get: async ({ sessionID }) => ({ id: sessionID, title: "t", parentID: "p" }),
+      context: async () => [],
+      interrupt: async () => {},
+    },
+    // Concurrent-edit tracking hooks tool.execute.before during setup.
+    tool: { hook: async (name, cb) => void toolHooks.push({ name, cb }) },
   });
   const cleanup = await mod.default.setup(ctx);
+  check(
+    "opencode-sessions registers a peer-awareness context hook",
+    awarenessHooks.some((h) => h.name === "context"),
+    awarenessHooks.map((h) => h.name).join(",") || "none",
+  );
+  check(
+    "opencode-sessions registers a write hook for concurrent-edit detection",
+    toolHooks.some((h) => h.name === "execute.before"),
+    toolHooks.map((h) => h.name).join(",") || "none",
+  );
   const names = tools.map((t) => t.name).sort();
   check(
-    "opencode-sessions registers its 7 tools",
+    "opencode-sessions registers its 9 tools",
     names.join(",") ===
-      "list_sessions,session_cancel,session_handoff,session_permission,session_result,session_send,spawn_session",
+      "list_sessions,project_sessions,session_broadcast,session_cancel,session_handoff,session_permission,session_result,session_send,spawn_session",
     names.join(", "),
   );
   if (typeof cleanup === "function") await cleanup();
