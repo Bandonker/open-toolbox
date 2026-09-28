@@ -325,6 +325,14 @@ function findCommandHit(value: unknown, depth = 0, seen?: WeakSet<object>): stri
           const hit = commandMentionsProtected(item);
           if (hit) return hit;
         }
+        // A command payload need not be a flat string: `{ command: { script } }`
+        // or `{ commands: [{ command }] }` shapes would otherwise skip the
+        // protected-file denial entirely, so recurse into anything the flat
+        // scan did not cover.
+        if (v !== null && typeof v === "object") {
+          const hit = findCommandHit(v, depth + 1, s);
+          if (hit) return hit;
+        }
       } else if (v !== null && typeof v === "object") {
         const hit = findCommandHit(v, depth + 1, s);
         if (hit) return hit;
@@ -419,15 +427,27 @@ export default Plugin.define({
       // SS-5: oversize input is scanned in head/tail windows (see
       // lib/redact.ts) — report the skipped middle instead of silently
       // covering just the prefix.
-      if (isScanTruncated(text)) {
-        log(`scan truncated to head/tail windows at ${location} (input ${text.length} chars, skipped ${JSON.stringify(scanGaps(text))})`);
+      let out = text;
+      let gapChars = 0;
+      if (isScanTruncated(out)) {
+        log(`scan truncated to head/tail windows at ${location} (input ${out.length} chars, skipped ${JSON.stringify(scanGaps(out))})`);
+        if (cfg.mode !== "observe") {
+          // Fail closed: a secret sitting in the unscanned middle would
+          // otherwise flow to the provider verbatim. Splice the gap out
+          // before scanning so every surviving char is actually scanned.
+          for (const [s, e] of [...scanGaps(out)].sort((a, b) => b[0] - a[0])) {
+            gapChars += e - s;
+            out = `${out.slice(0, s)}\n[secret-shield: ${e - s} unscanned chars removed]\n${out.slice(e)}`;
+          }
+        }
       }
-      const findings = collectFindings(text, location, cfg, allow);
-      if (!findings.length) return text;
+      const findings = collectFindings(out, location, cfg, allow);
+      if (gapChars > 0 && counter) counter.redacted += 1;
+      if (!findings.length) return out;
       audit.record(findings, location, cfg.mode === "observe" ? "detected" : action);
       if (cfg.mode === "observe") return text;
       if (counter) counter.redacted += findings.length;
-      return applyFindings(text, findings, makePlaceholder);
+      return applyFindings(out, findings, makePlaceholder);
     };
 
     /** Restore plugin placeholders, then redact any remaining raw secrets. */
@@ -699,8 +719,11 @@ export default Plugin.define({
         if (!cfg.enabled || event.status !== "completed") return;
         const location = `tool.execute.after:${event.tool}`;
         // SS-4: scrub the whole result — the old top-level content/output
-        // handling missed nested structures.
-        scrub(event.result, location, false);
+        // handling missed nested structures. The return value must be written
+        // back: scrub mutates objects/arrays in place but returns a new value
+        // for primitives, so a top-level string result would otherwise keep
+        // flowing to the transcript unredacted.
+        event.result = scrub(event.result, location, false) as typeof event.result;
       } catch (err) {
         log(`execute.after hook skipped: ${String(err)}`);
       }

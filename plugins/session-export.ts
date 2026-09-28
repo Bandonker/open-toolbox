@@ -216,11 +216,16 @@ function sanitize(text: string, cfg: ExportConfig): string {
   // X1/H4: scrub with the same detection core secret-shield uses
   // (lib/redact) — the old private pattern list was much weaker, and
   // exports are the leakiest surface in a leak-prevention pack.
-  return rewriteHome(redactSecrets(text));
+  // Neutralize inline `secret-shield:allow` markers first: they are honoured
+  // by the detection core, and transcript text is untrusted — a tool eching
+  // `<secret> // secret-shield:allow` would otherwise be written verbatim.
+  const neutralized = text.replace(/secret-shield\s*:\s*allow/gi, "secret-shield allow");
+  return rewriteHome(redactSecrets(neutralized));
 }
 
-function clamp(text: string, max: number): string {
+function clamp(text: string, max: number, hit?: { value: boolean }): string {
   if (text.length <= max) return text;
+  if (hit) hit.value = true;
   return `${text.slice(0, max)}\n… [truncated ${text.length - max} chars]`;
 }
 
@@ -302,9 +307,9 @@ function textBody(msg: LooseMessage): string | undefined {
   return undefined;
 }
 
-function normalize(msg: LooseMessage, index: number, args: ExportArgs, cfg: ExportConfig): { out: OutMessage | null; toolCalls: number } {
+function normalize(msg: LooseMessage, index: number, args: ExportArgs, cfg: ExportConfig): { out: OutMessage | null; toolCalls: number; partTruncated: boolean } {
   const role = msg.type ?? "unknown";
-  if (args.roles && args.roles.length > 0 && !args.roles.includes(role)) return { out: null, toolCalls: 0 };
+  if (args.roles && args.roles.length > 0 && !args.roles.includes(role)) return { out: null, toolCalls: 0, partTruncated: false };
   const out: OutMessage = { index, role };
   if (msg.id) out.id = msg.id;
   if (msg.time?.created) out.time = new Date(msg.time.created).toISOString();
@@ -315,26 +320,27 @@ function normalize(msg: LooseMessage, index: number, args: ExportArgs, cfg: Expo
   if (msg.tokens) out.tokens = tokenSummary(msg.tokens);
 
   let toolCalls = 0;
+  const hit = { value: false };
   if (role === "assistant") {
     const parts: OutPart[] = [];
     for (const part of msg.content ?? []) {
       if (part.type === "text" && typeof part.text === "string") {
-        parts.push({ kind: "text", text: clamp(sanitize(part.text, cfg), cfg.maxCharsPerPart) });
+        parts.push({ kind: "text", text: clamp(sanitize(part.text, cfg), cfg.maxCharsPerPart, hit) });
       } else if (part.type === "reasoning") {
         if (!args.includeReasoning) continue;
-        parts.push({ kind: "reasoning", text: clamp(sanitize(part.text ?? "", cfg), cfg.maxCharsPerPart) });
+        parts.push({ kind: "reasoning", text: clamp(sanitize(part.text ?? "", cfg), cfg.maxCharsPerPart, hit) });
       } else if (part.type === "tool") {
         if (!args.includeToolCalls) continue;
         const name = part.name ?? "tool";
         if (args.tools && args.tools.length > 0 && !args.tools.includes(name)) continue;
         const state = part.state ?? {};
         const rendered: OutPart = { kind: "tool", name, status: state.status ?? "unknown" };
-        if (state.input !== undefined) rendered.input = clamp(sanitize(safeJson(state.input), cfg), cfg.maxCharsPerPart);
+        if (state.input !== undefined) rendered.input = clamp(sanitize(safeJson(state.input), cfg), cfg.maxCharsPerPart, hit);
         if (args.includeToolResults) {
           if (state.status === "completed") {
-            rendered.output = clamp(sanitize(toolContentText(state.content), cfg), cfg.maxCharsPerPart);
+            rendered.output = clamp(sanitize(toolContentText(state.content), cfg), cfg.maxCharsPerPart, hit);
           } else if (state.status === "error") {
-            rendered.error = clamp(sanitize(errorText(state.error), cfg), cfg.maxCharsPerPart);
+            rendered.error = clamp(sanitize(errorText(state.error), cfg), cfg.maxCharsPerPart, hit);
           }
         }
         parts.push(rendered);
@@ -346,9 +352,9 @@ function normalize(msg: LooseMessage, index: number, args: ExportArgs, cfg: Expo
     out.parts = parts;
   } else {
     const body = textBody(msg);
-    if (body) out.text = clamp(sanitize(body, cfg), cfg.maxCharsPerPart);
+    if (body) out.text = clamp(sanitize(body, cfg), cfg.maxCharsPerPart, hit);
   }
-  return { out, toolCalls };
+  return { out, toolCalls, partTruncated: hit.value };
 }
 
 function buildExport(
@@ -367,10 +373,12 @@ function buildExport(
   let model: string | undefined;
   let agent: string | undefined;
   const truncated = windowed.length !== messages.length;
+  let partTruncated = false;
 
   for (const msg of windowed) {
-    const { out: entry, toolCalls: calls } = normalize(msg, out.length + 1, args, cfg);
+    const { out: entry, toolCalls: calls, partTruncated: entryTruncated } = normalize(msg, out.length + 1, args, cfg);
     if (!entry) continue;
+    if (entryTruncated) partTruncated = true;
     out.push(entry);
     countsByRole[entry.role] = (countsByRole[entry.role] ?? 0) + 1;
     toolCalls += calls;
@@ -397,7 +405,7 @@ function buildExport(
     countsByRole,
     toolCalls,
     redacted: cfg.redact,
-    truncated,
+    truncated: truncated || partTruncated,
   };
   if (model) meta.model = model;
   if (agent) meta.agent = agent;
@@ -484,7 +492,10 @@ function renderText(meta: ExportMeta, messages: OutMessage[]): string {
 
 function render(meta: ExportMeta, messages: OutMessage[], format: ExportFormat): string {
   if (format === "json") return JSON.stringify({ meta, messages }, null, 2) + "\n";
-  if (format === "jsonl") return messages.length ? messages.map((m) => JSON.stringify(m)).join("\n") + "\n" : "";
+  // The meta line carries sessionID, counts, redacted/truncated flags — without
+  // it a jsonl consumer cannot tell a windowed export from a complete one.
+  if (format === "jsonl")
+    return [JSON.stringify({ meta }), ...messages.map((m) => JSON.stringify(m))].join("\n") + "\n";
   if (format === "text") return renderText(meta, messages);
   return renderMarkdown(meta, messages);
 }
