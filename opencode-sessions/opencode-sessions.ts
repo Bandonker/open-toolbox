@@ -113,7 +113,6 @@ type FileClaim = {
  */
 type Peer = {
   sessionId: string;
-  shortId: string;
   directory: string;
   state: "running" | "idle";
   lastSeenAt: number;
@@ -703,7 +702,7 @@ export default Plugin.define({
       signal?: AbortSignal,
     ): Promise<{
       cleared: boolean;
-      holders: Array<{ shortId: string; sessionId: string; remote: boolean }>;
+      holders: Array<{ label: string; sessionId: string; remote: boolean }>;
       waited: boolean;
     }> => {
       let holders = await writersOf(directory, selfId, keys);
@@ -718,10 +717,13 @@ export default Plugin.define({
     };
 
     const describeHolders = (
-      holders: Array<{ shortId: string; sessionId: string; remote: boolean }>,
+      holders: Array<{ label: string; sessionId: string; remote: boolean }>,
     ): string =>
       holders
-        .map((h) => (h.remote ? `${h.shortId} (another opencode process)` : h.shortId))
+        .map((h) => {
+          const name = displayId(h.label, knownSessionIds());
+          return h.remote ? `${name} (another opencode process)` : name;
+        })
         .join("; ");
 
     /**
@@ -1068,21 +1070,21 @@ export default Plugin.define({
       directory: string,
       selfId: string,
       keys: string[],
-    ): Promise<Array<{ shortId: string; sessionId: string; remote: boolean }>> => {
+    ): Promise<Array<{ label: string; sessionId: string; remote: boolean }>> => {
       if (keys.length === 0) return [];
       prunePeers();
       const want = new Set(keys);
-      const out: Array<{ shortId: string; sessionId: string; remote: boolean }> = [];
+      const out: Array<{ label: string; sessionId: string; remote: boolean }> = [];
       for (const p of peers.values()) {
         if (p.directory !== directory || p.sessionId === selfId) continue;
         const held = inFlight.get(p.sessionId);
         if (held && [...held].some((k) => want.has(k))) {
-          out.push({ shortId: p.shortId, sessionId: p.sessionId, remote: false });
+          out.push({ label: p.sessionId, sessionId: p.sessionId, remote: false });
         }
       }
       for (const r of await remoteWriters(directory, selfId, keys)) {
         if (out.some((o) => o.sessionId === r.sessionId)) continue;
-        out.push({ shortId: r.sessionId.slice(0, 8), sessionId: r.sessionId, remote: true });
+        out.push({ label: r.sessionId, sessionId: r.sessionId, remote: true });
       }
       return out;
     };
@@ -1102,12 +1104,19 @@ export default Plugin.define({
         existing ??
         {
           sessionId,
-          shortId: sessionId.slice(0, 8),
           directory,
           state: "idle",
           lastSeenAt: now,
         };
-      const next: Peer = { ...base, ...patch, lastSeenAt: now, sessionId };
+      // `lastSeenAt` is a caller-supplied fact, not something this function may
+      // invent. A local event proves the session is alive *now*, so the event
+      // path passes nothing and gets `now`; a cross-process import only proves
+      // it was alive when the *other* process wrote the record, so that path
+      // passes the remote timestamp. Overwriting it here refreshed every peer on
+      // every rescan, so nothing ever aged out: deleted sessions were never
+      // detected, the staleness cutoffs never fired, and dead sessions kept
+      // reporting whatever state they had when last mirrored.
+      const next: Peer = { ...base, ...patch, lastSeenAt: patch.lastSeenAt ?? now, sessionId };
       if (next.task !== undefined) next.task = truncate(next.task, cfg.peerTaskChars);
       peers.set(peerKey(sessionId), next);
       // Bound growth: a long-lived server sees many session ids.
@@ -1181,7 +1190,19 @@ export default Plugin.define({
       const local = peers.get(peerKey(r.sessionId));
       if (local && local.lastSeenAt >= r.lastSeenAt) return;
       recordPeer(r.sessionId, r.directory, {
-        state: r.state === "running" ? "running" : "idle",
+        // Carried through verbatim: this is the moment the *other* process saw
+        // the session, and inventing a local `now` here is what made every peer
+        // look permanently fresh.
+        lastSeenAt: r.lastSeenAt,
+        // A session silent for longer than the live window cannot still be
+        // mid-turn — a running one emits events continuously — so a stored
+        // "running" on an old record is not to be believed. This also makes the
+        // registry self-healing against records left behind by an earlier
+        // version, which could persist a "running" flag indefinitely.
+        state:
+          r.state === "running" && r.lastSeenAt >= Date.now() - cfg.peerLiveSec * 1000
+            ? "running"
+            : "idle",
         agent: typeof r.agent === "string" ? r.agent : undefined,
         task: typeof r.task === "string" ? r.task : undefined,
         parentSessionID:
@@ -1251,10 +1272,58 @@ export default Plugin.define({
       return `${Math.round(m / 60)}h ago`;
     };
 
+    /**
+     * Shortest label that unambiguously names a session among the ones we know.
+     *
+     * opencode ids are time-derived, so two sessions opened in the same window
+     * share their first 8 characters — `ses_f1ab1063…` and `ses_f1ab33ac…` both
+     * read as `ses_f1ab`. A fixed-width slice is not merely ugly when it
+     * collides: the agent is shown two identical rows, and since it is only ever
+     * shown the short form, it cannot name the one it means. So widen the
+     * prefix until it is unique against every session currently known, and fall
+     * back to the full id rather than ever emit an ambiguous label.
+     */
+    const displayId = (sessionId: string, known: Iterable<string>): string => {
+      const MIN = 8;
+      if (sessionId.length <= MIN) return sessionId;
+      const rivals: string[] = [];
+      for (const id of known) if (id !== sessionId) rivals.push(id);
+      if (rivals.length === 0) return sessionId.slice(0, MIN);
+      for (let n = MIN + 1; n < sessionId.length; n++) {
+        const prefix = sessionId.slice(0, n);
+        if (!rivals.some((id) => id.startsWith(prefix))) return prefix;
+      }
+      return sessionId;
+    };
+
+    /** Ids the agent could be shown, so labels can be made unique against them. */
+    const knownSessionIds = (): string[] => [
+      ...peers.keys(),
+      ...[...tracked.values()].map((t) => t.childID),
+    ];
+
+    /**
+     * Is this peer mid-turn, as far as we can tell?
+     *
+     * The stored `state` is whatever the last event said, so it goes stale: a
+     * session that was running when we last looked and has since gone quiet is
+     * still recorded as `running`, and a rescan skips an unchanged record rather
+     * than re-evaluating it, so the flag can sit wrong indefinitely. Silence
+     * longer than the live window is itself proof that a session is not
+     * mid-turn — one that is running emits events continuously — so freshness is
+     * the invariant here and the flag is only believed while the peer is fresh.
+     *
+     * Without this a session that ended half an hour ago is still advertised as
+     * working, is still ranked as a relevant peer, and is still treated as
+     * reachable.
+     */
+    const isRunningPeer = (p: Peer): boolean =>
+      p.state === "running" && isFreshPeer(p);
+
     const describePeer = (p: Peer, claimPaths?: string[]): string => {
       const bits = [
-        `${p.shortId}`,
-        p.state === "running" ? "running" : "idle",
+        displayId(p.sessionId, knownSessionIds()),
+        isRunningPeer(p) ? "running" : "idle",
         agoText(p.lastSeenAt),
       ];
       if (p.task) bits.push(p.task);
@@ -1329,7 +1398,7 @@ export default Plugin.define({
         let rank: PeerRelevance | undefined;
         if (shared.length > 0) rank = "collision";
         else if (relation) rank = "lineage";
-        else if (p.state === "running") rank = "running";
+        else if (isRunningPeer(p)) rank = "running";
         else if (tasksOverlap(p.task, remit)) rank = "related";
         if (!rank) continue;
         scored.push({ p, rank, shared, relation });
@@ -1382,9 +1451,9 @@ export default Plugin.define({
       if (colliding.length > 0) {
         const first = colliding[0];
         lines.push(
-          `CONCURRENT EDIT: you and ${first.p.shortId} both hold ${first.shared.join(", ")}. Only one of you should write it — wait for them to release it, or session_send to agree who takes it.`,
+          `CONCURRENT EDIT: you and ${displayId(first.p.sessionId, knownSessionIds())} both hold ${first.shared.join(", ")}. Only one of you should write it — wait for them to release it, or session_send to agree who takes it.`,
         );
-        const more = colliding.slice(1).map((s) => s.p.shortId);
+        const more = colliding.slice(1).map((s) => displayId(s.p.sessionId, knownSessionIds()));
         if (more.length > 0) lines.push(`Also colliding: ${more.join(", ")}.`);
       } else {
         lines.push(
@@ -1895,10 +1964,48 @@ export default Plugin.define({
       return t;
     };
 
+    /**
+     * Resolve a session reference to a real id.
+     *
+     * Presence output names a session by the shortest prefix that is unique
+     * among those on show, which is wider than 8 characters exactly when 8 would
+     * be ambiguous. So the id the agent was *shown* is not always the id it has
+     * to *send*: an exact match wins, otherwise the reference must match exactly
+     * one known session. An ambiguous prefix is refused with the candidates
+     * rather than silently picking the first, since picking wrong would message
+     * a stranger.
+     *
+     * Returns null when the reference matches nothing, so callers can fall back
+     * to their own "unknown session" handling.
+     */
+    const resolveSessionRef = (
+      ref: string,
+    ): { id: string } | { ambiguous: string } | null => {
+      if (!ref) return null;
+      if (tracked.has(ref) || peers.has(peerKey(ref))) return { id: ref };
+      const candidates = [
+        ...new Set([...[...tracked.values()].map((t) => t.childID), ...peers.keys()]),
+      ].filter((id) => id.startsWith(ref));
+      if (candidates.length === 1) return { id: candidates[0] };
+      if (candidates.length > 1) {
+        const known = knownSessionIds();
+        return {
+          ambiguous:
+            `"${ref}" matches ${candidates.length} sessions (${candidates
+              .map((id) => displayId(id, known))
+              .join(", ")}). Use more characters of the id.`,
+        };
+      }
+      return null;
+    };
+
     const requireTracked = async (
       sessionId: string,
     ): Promise<{ t: Tracked } | { message: string }> => {
-      const t = tracked.get(sessionId) ?? (await hydrate(sessionId));
+      const resolved = resolveSessionRef(sessionId);
+      if (resolved && "ambiguous" in resolved) return { message: resolved.ambiguous };
+      const id = resolved ? resolved.id : sessionId;
+      const t = tracked.get(id) ?? (await hydrate(id));
       if (!t) {
         return {
           message: `Unknown session "${sessionId}". Pass a session spawned by this plugin (list_sessions) or a peer in this project (project_sessions).`,
@@ -2406,7 +2513,7 @@ export default Plugin.define({
       editor.add({
         name: "session_send",
         description:
-          "Send a message to another session. Works for sessions this plugin spawned and for any other session in this project (see project_sessions) — use the full id, not the 8-char prefix. With noReply:true it injects context without triggering a new assistant turn.",
+          "Send a message to another session. Works for sessions this plugin spawned and for any other session in this project (see project_sessions) — pass the id it showed you; an unambiguous prefix is accepted, and an ambiguous one is refused rather than guessed. With noReply:true it injects context without triggering a new assistant turn.",
         input: z.object({
           sessionId: z.string().describe("Session id (child or peer)."),
           text: z.string().describe("Message text."),
@@ -2414,12 +2521,18 @@ export default Plugin.define({
         }),
         execute: async (input) => {
           const args = input as { sessionId: string; text: string; noReply?: boolean };
-          const found = await requireTracked(args.sessionId);
+          // Accept the label the agent was shown, not only a full id: presence
+          // output widens a prefix when 8 characters would be ambiguous, so the
+          // two differ exactly when it matters.
+          const resolved = resolveSessionRef(args.sessionId);
+          if (resolved && "ambiguous" in resolved) return { content: resolved.ambiguous };
+          const target = resolved ? resolved.id : args.sessionId;
+          const found = await requireTracked(target);
           if ("message" in found) {
             // Not a session we spawned. It may still be a known peer in this
             // project: ctx.session.synthetic/prompt address any session, so
             // refusing here was a plugin-level restriction, not a platform one.
-            const peer = peers.get(peerKey(args.sessionId));
+            const peer = peers.get(peerKey(target));
             if (peer && peer.directory === defaultDirectory) {
               // Verify before messaging rather than trusting a timer. A quiet
               // peer may be mid-command (perfectly reachable) or deleted (not
@@ -2427,11 +2540,11 @@ export default Plugin.define({
               const verdict = await verifyPeer(peer);
               if (verdict === "gone") {
                 return {
-                  content: `Not sent: ${peer.shortId} is gone — the server reports no such session. It has been removed from the presence list.`,
+                  content: `Not sent: ${displayId(peer.sessionId, knownSessionIds())} is gone — the server reports no such session. It has been removed from the presence list.`,
                 };
               }
               try {
-                const how = await deliverToSession(args.sessionId, args.text, args.noReply === true);
+                const how = await deliverToSession(target, args.text, args.noReply === true);
                 // Announce the delivery so the peer's own awareness line shows
                 // that someone reached out, rather than context appearing.
                 recordPeer(peer.sessionId, peer.directory, { state: "running" });
@@ -2464,7 +2577,7 @@ export default Plugin.define({
           // Await the prompt handoff so a failed send is reported instead of
           // silently claiming the child is running again (see startTurn).
           try {
-            const how = await deliverToSession(args.sessionId, args.text, false);
+            const how = await deliverToSession(target, args.text, false);
             return { content: `${how} Use session_result(wait:true) to await completion.` };
           } catch (err) {
             return { content: `Failed to send follow-up to ${t.childID}: ${describeError(err)}` };
@@ -2668,12 +2781,20 @@ export default Plugin.define({
           // Let the list be corrected: a session deleted in the UI can still be
           // mirrored from another process, and a ghost entry would otherwise
           // keep being a broadcast target until the stale cutoff.
+          const preamble: string[] = [];
           const forgotten: string[] = [];
           for (const raw of (args.forget ?? "").split(",")) {
             const id = raw.trim();
             if (!id) continue;
-            if (forgetPeer(id)) forgotten.push(id);
-            selfSessionIDs.delete(id);
+            // Same rule as session_send: accept the label that was shown.
+            const resolved = resolveSessionRef(id);
+            if (resolved && "ambiguous" in resolved) {
+              preamble.push(`Not forgotten: ${resolved.ambiguous}`);
+              continue;
+            }
+            const target = resolved ? resolved.id : id;
+            if (forgetPeer(target)) forgotten.push(target);
+            selfSessionIDs.delete(target);
           }
           if (forgotten.length > 0) {
             // Also clear any tracked child so session_result stops reporting a
@@ -2699,10 +2820,9 @@ export default Plugin.define({
           const verdicts = await verifyAll(suspects);
           const confirmedGone = suspects
             .filter((p) => verdicts.get(p.sessionId) === "gone")
-            .map((p) => p.shortId);
+            .map((p) => displayId(p.sessionId, knownSessionIds()));
           const remaining = others.filter((p) => verdicts.get(p.sessionId) !== "gone");
 
-          const preamble: string[] = [];
           if (forgotten.length > 0) {
             preamble.push(
               `Removed ${forgotten.length} session(s) from the presence list: ${forgotten.join(", ")}.`,
@@ -2762,10 +2882,10 @@ export default Plugin.define({
           const quiet: string[] = [];
           for (const p of all) {
             const v = verdicts.get(p.sessionId);
-            if (v === "gone") vanished.push(p.shortId);
+            if (v === "gone") vanished.push(displayId(p.sessionId, knownSessionIds()));
             else {
               reachable.push(p);
-              if (v === "busy") quiet.push(p.shortId);
+              if (v === "busy") quiet.push(displayId(p.sessionId, knownSessionIds()));
             }
           }
           if (reachable.length === 0) {
@@ -2786,7 +2906,7 @@ export default Plugin.define({
               recordPeer(p.sessionId, p.directory, { state: "running" });
               delivered += 1;
             } catch (err) {
-              failed.push(`${p.shortId} (${describeError(err)})`);
+              failed.push(`${displayId(p.sessionId, knownSessionIds())} (${describeError(err)})`);
             }
           }
           mirrorPeers();

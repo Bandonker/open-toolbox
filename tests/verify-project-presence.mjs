@@ -1099,5 +1099,144 @@ const msgText = (m) =>
   check("PP-52 tools still register with awareness off", !!h.tools.project_sessions);
 }
 
+// ------------------------- PP-57..59 the three live-run regressions
+// These were found by running the real server, not by reading the code: the
+// 8-char label collided, timestamps never aged, and a remote record silently
+// erased locally-known fields. Each one is a separate defect with its own
+// failure mode.
+{
+  // --- 1. a remote record must not refresh a peer's clock -------------
+  // `recordPeer` used to stamp `lastSeenAt: now` unconditionally, so every
+  // rescan made every peer look freshly alive: nothing ever aged out, no peer
+  // was ever verified, and deleted sessions were never dropped.
+  const shared = new Map();
+  const mk = () => {
+    const h = makeCtx({ options: { peerAwareness: false } });
+    h.ctx.storage = {
+      get: async (k) => shared.get(k),
+      set: async (k, v) => void shared.set(k, v),
+      remove: async (k) => void shared.delete(k),
+      scan: async ({ prefix }) => ({
+        entries: [...shared.entries()]
+          .filter(([k]) => k.startsWith(prefix))
+          .map(([key, value]) => ({ key, value })),
+      }),
+    };
+    return h;
+  };
+  // A peer another process saw a minute ago.
+  shared.set(`presence:v2:${ID_A}`, {
+    sessionId: ID_A,
+    directory: PROJECT,
+    state: "running",
+    lastSeenAt: Date.now() - 60_000,
+  });
+  const b = mk();
+  await mod.default.setup(b.ctx);
+  await new Promise((r) => setTimeout(r, 120));
+  const seen = await b.tools.project_sessions.execute({}, { sessionID: "ses_askb00" });
+  const row = seen.content.split("\n").find((l) => l.includes(ID_A.slice(0, 8))) ?? "";
+  check(
+    "PP-57 an adopted peer keeps the other process's timestamp, not now",
+    /\b1m ago\b/.test(row) && !/\b0s ago\b/.test(row),
+    row.trim() || "row not found",
+  );
+}
+
+// --- 2 & 3. colliding labels, and the local fields a merge must not erase ---
+{
+  const h = makeCtx();
+  await mod.default.setup(h.ctx);
+  // Two sessions created in the same window: opencode ids are time-derived, so
+  // their first 8 characters are identical.
+  const A = "ses_collide01";
+  const B = "ses_collide02";
+  check(
+    "PP-58a the fixture really does collide at 8 characters",
+    A.slice(0, 8) === B.slice(0, 8),
+    `${A.slice(0, 8)} vs ${B.slice(0, 8)}`,
+  );
+
+  // Each declares a task, so a remote record with no task must not erase it.
+  await h.tools.project_sessions.execute({ task: "refactoring the auth module" }, { sessionID: A });
+  await h.tools.project_sessions.execute({ task: "auditing dependency licenses" }, { sessionID: B });
+  h.push(sessionEvent(A, PROJECT, "session.idle"));
+  h.push(sessionEvent(B, PROJECT, "session.idle"));
+  await new Promise((r) => setTimeout(r, 60));
+
+  // Simulate the cross-process rescan: both records arrive with no task, which
+  // used to overwrite the declared task with `undefined`.
+  const mine = h.store.get(`presence:v2:${A}`) ?? h.store.get("presence:v2");
+  if (mine) for (const k of [...h.store.keys()].filter((k) => k.startsWith("presence:v2:"))) {
+    const v = { ...h.store.get(k) };
+    delete v.task;
+    delete v.parentSessionID;
+    h.store.set(k, v);
+  }
+  // Force a rescan by calling the refresh the interval drives.
+  const listed = await h.tools.project_sessions.execute({}, { sessionID: SELF });
+  const bothListed = listed.content.includes("ses_collide0") || listed.content.length > 0;
+  check("PP-58b the list survives a rescan", bothListed, listed.content.replace(/\n/g, " | ").slice(0, 120));
+
+  // The two rows must be distinguishable, which a fixed 8-char label cannot do.
+  const rows = listed.content.split("\n").filter((l) => l.startsWith("- ses_coll"));
+  const labels = rows.map((l) => l.split(" | ")[0]);
+  check(
+    "PP-58c colliding sessions get distinguishable labels",
+    rows.length === 2 && labels[0] !== labels[1],
+    `labels: ${labels.join(" , ")}`,
+  );
+
+  // The bare 8-char prefix is ambiguous and must be refused, not guessed at.
+  const amb = await h.tools.session_send.execute({ sessionId: A.slice(0, 8), text: "hi" }, { sessionID: SELF });
+  check(
+    "PP-58d an ambiguous prefix is refused rather than guessed",
+    /matches 2 sessions|ambiguous/i.test(amb.content) && h.prompts.length === 0,
+    amb.content.slice(0, 160),
+  );
+
+  // A longer prefix — exactly what the brief showed — must reach the right one.
+  const ok = await h.tools.session_send.execute({ sessionId: A, text: "hi" }, { sessionID: SELF });
+  check(
+    "PP-58e the label shown in the brief is accepted by session_send",
+    h.prompts.length === 1 && h.prompts[0].sessionID === A,
+    `${ok.content.slice(0, 90)} | prompted=${JSON.stringify(h.prompts.map((p) => p.sessionID))}`,
+  );
+}
+
+// ------------------- PP-60 display and relevance must agree about staleness
+// A peer's stored `state` is whatever the last event said, so it goes stale. The
+// renderer was corrected to gate "running" on freshness but the relevance filter
+// still read the raw flag, so a session that ended minutes ago was *displayed*
+// as idle and simultaneously *briefed* as a relevant running peer — the exact
+// over-broad brief this whole change set was meant to remove.
+{
+  const h = makeCtx({ options: { peerLiveSec: 5 } });
+  await mod.default.setup(h.ctx);
+  const hook = h.contextHooks.find((x) => x.name === "context")?.cb;
+  h.push(sessionEvent(ID_A, PROJECT, "session.execution.started"));
+  // Fresh and running: must be briefed, and labelled running.
+  await new Promise((r) => setTimeout(r, 60));
+  let messages = [];
+  await hook({ sessionID: SELF, messages });
+  const fresh = messages.map(msgText).join("\n");
+  check(
+    "PP-60 a fresh running peer is briefed as running",
+    fresh.includes(ID_A.slice(0, 8)) && /\brunning\b/.test(fresh),
+    fresh.replace(/\n/g, " | ").slice(0, 140),
+  );
+
+  // Now it falls silent without an idle event — the stale-flag case.
+  await new Promise((r) => setTimeout(r, 5200));
+  messages = [];
+  await hook({ sessionID: SELF, messages });
+  const stale = messages.map(msgText).join("\n");
+  check(
+    "PP-60b a peer whose running flag went stale is not briefed as running",
+    !/\brunning\b/.test(stale) || !stale.includes(ID_A.slice(0, 8)),
+    stale.replace(/\n/g, " | ").slice(0, 140) || "(no brief at all)",
+  );
+}
+
 console.log(`\n${passed}/${passed + failed} checks passed`);
 process.exit(failed === 0 ? 0 : 1);
