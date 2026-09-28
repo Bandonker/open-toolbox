@@ -746,6 +746,13 @@ npm publish --access public                # scoped packages need --access publi
 `packages/` is generated and gitignored. Publish order does not matter — the
 packages have no runtime dependency on each other.
 
+**Release rule: one version for all 15.** Bump `version` in the root
+`package.json`; the build stamps that value onto every package, and they are
+always published in lockstep. Never publish packages at mixed versions — a
+user installing the pack over time would otherwise end up with an untested
+combination. Publish only from a green `main` (`npm test`, `typecheck`,
+`pack:check`), and use an Automation token so 2FA never blocks the loop.
+
 ## FAQ
 
 <details>
