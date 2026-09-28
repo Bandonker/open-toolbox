@@ -29,53 +29,30 @@ redaction, and a lifetime usage dashboard.
 
 ### Quick start
 
-> **Requires opencode v2.** On v2 the plugins must be installed as **packages**
-> registered in the `plugins` array. Copying the loose `.ts` files into
-> `~/.config/opencode/plugins/` does **not** work here — opencode's
-> auto-discovery of that directory does not resolve bare npm specifiers, so
-> every plugin fails with `Cannot find package '@opencode/plugin'`. If you
-> followed an older copy-paste-into-`plugins/` guide, see
-> [FAQ](#faq).
+> **Requires opencode v2.** Install the pack from npm — no clone, no build:
 
 ```bash
-git clone https://github.com/Bandonker/open-toolbox.git
-cd open-toolbox
-npm install
-npm run build:packages        # emits packages/<name>/ (package.json + index.js)
-
-## install the packages under your opencode config dir
 CFG="$HOME/.config/opencode"
-mkdir -p "$CFG/toolbox"
-cp -r packages/* "$CFG/toolbox/"
-
-## one shared dependency install for all 15 packages
-cat > "$CFG/toolbox/package.json" <<'JSON'
-{
-  "name": "open-toolbox-runtime",
-  "private": true,
-  "type": "module",
-  "dependencies": { "@opencode/plugin": "^2.0.11", "zod": "4.1.8" }
-}
-JSON
-(cd "$CFG/toolbox" && npm install)      # or: bun install
-
-## each package must see node_modules from its own directory
-for d in "$CFG"/toolbox/*/; do ln -sfn ../node_modules "$d/node_modules"; done
+mkdir -p "$CFG/toolbox" && cd "$CFG/toolbox"
+npm init -y >/dev/null 2>&1
+npm install @bandonker/opencode-sessions @bandonker/opencode-decision-log @bandonker/opencode-error-journal @bandonker/opencode-snippet-library @bandonker/opencode-codebase-index @bandonker/opencode-tool-audit @bandonker/opencode-command-pack @bandonker/opencode-context-pruner @bandonker/opencode-session-export @bandonker/opencode-memory @bandonker/opencode-goal @bandonker/opencode-secret-shield @bandonker/opencode-finish-guard @bandonker/opencode-strip-skills-catalog @bandonker/opencode-usage-stats
 ```
 
 Register the packages in the global config. This **merges** into an existing
-`opencode.jsonc` rather than overwriting it:
+`opencode.jsonc` rather than overwriting it (entries from other plugins are
+kept):
 
 ```bash
 node -e '
 const fs=require("fs"),os=require("os"),path=require("path");
 const cfgDir=path.join(os.homedir(),".config/opencode");
-const tb=path.join(cfgDir,"toolbox"), file=path.join(cfgDir,"opencode.jsonc");
+const scope=path.join(cfgDir,"toolbox","node_modules","@bandonker"), file=path.join(cfgDir,"opencode.jsonc");
 const raw=fs.existsSync(file)?fs.readFileSync(file,"utf8"):"{}";
 const cfg=JSON.parse(raw.replace(/\/\*[\s\S]*?\*\//g,"").replace(/^\s*\/\/.*$/gm,""));
-cfg.plugins=fs.readdirSync(tb).filter(n=>fs.existsSync(path.join(tb,n,"package.json"))).sort().map(n=>path.join(tb,n));
+const mine=fs.readdirSync(scope).filter(n=>fs.existsSync(path.join(scope,n,"package.json"))).sort().map(n=>path.join(scope,n));
+cfg.plugins=[...(cfg.plugins??[]).filter(p=>typeof p!=="string"||!p.includes("@bandonker/opencode-")),...mine];
 fs.writeFileSync(file,JSON.stringify(cfg,null,2)+"\n");
-console.log("registered "+cfg.plugins.length+" plugins -> "+file);
+console.log("registered "+mine.length+" plugins -> "+file);
 '
 ```
 
@@ -83,22 +60,55 @@ Then reload opencode (`opencode reload`, or restart the app). Every tool
 below is now available to your agent.
 
 <details>
-<summary><b>Windows / PowerShell</b></summary>
+<summary><b>Install just one plugin</b></summary>
 
-The package layout is identical; only the path syntax differs. Run the POSIX
-steps above in WSL/Git Bash, or adapt:
+Each plugin is its own package — install only what you want and register its
+directory:
 
-```powershell
-$CFG = "$HOME\.config\opencode"
-New-Item -ItemType Directory "$CFG\toolbox" -Force | Out-Null
-Copy-Item -Recurse -Force packages\* "$CFG\toolbox\"
-Set-Location "$CFG\toolbox"; npm install
+```bash
+CFG="$HOME/.config/opencode"
+mkdir -p "$CFG/toolbox" && cd "$CFG/toolbox"
+npm init -y >/dev/null 2>&1
+npm install @bandonker/opencode-memory
 ```
 
-Registering the `plugins` array uses the same `node -e` snippet — it relies on
-`os.homedir()` and `path.join()`, so it is platform-neutral. Note that a
-backslashed path in JSON must be escaped (`C:\\path\\to`); the snippet emits
-forward slashes, which opencode accepts on Windows.
+Then add `"$CFG/toolbox/node_modules/@bandonker/opencode-memory"` to the
+`plugins` array in `opencode.jsonc` and reload.
+
+</details>
+
+<details>
+<summary><b>Build from source instead</b></summary>
+
+Clone the repo and build the packages locally — same layout `npm install`
+produces, useful for development or offline installs:
+
+```bash
+git clone https://github.com/Bandonker/open-toolbox.git
+cd open-toolbox
+npm install
+npm run build:packages        # emits packages/<name>/ (package.json + index.js)
+
+CFG="$HOME/.config/opencode"
+mkdir -p "$CFG/toolbox"
+cp -r packages/* "$CFG/toolbox/"
+(cd "$CFG/toolbox" && npm install)
+```
+
+Then register with the same `node -e` snippet above (it scans
+`toolbox/node_modules/@bandonker/`), and reload.
+
+</details>
+
+<details>
+<summary><b>Windows / PowerShell</b></summary>
+
+`npm install` works identically on Windows — run the first snippet in
+PowerShell (with `$CFG = "$HOME\.config\opencode"`), or in WSL/Git Bash
+unchanged. Registering the `plugins` array uses the same `node -e` snippet —
+it relies on `os.homedir()` and `path.join()`, so it is platform-neutral. Note
+that a backslashed path in JSON must be escaped (`C:\\path\\to`); the
+snippet emits forward slashes, which opencode accepts on Windows.
 
 </details>
 
@@ -110,10 +120,9 @@ Same packages, but under `<repo>/.opencode/toolbox/` instead of
 `opencode.jsonc` rather than the global one:
 
 ```bash
-mkdir -p .opencode/toolbox
-cp -r /path/to/open-toolbox/packages/* .opencode/toolbox/
-(cd .opencode/toolbox && npm install)
-for d in .opencode/toolbox/*/; do ln -sfn ../node_modules "$d/node_modules"; done
+mkdir -p .opencode/toolbox && cd .opencode/toolbox
+npm init -y >/dev/null 2>&1
+npm install @bandonker/opencode-sessions @bandonker/opencode-memory
 ```
 
 </details>
