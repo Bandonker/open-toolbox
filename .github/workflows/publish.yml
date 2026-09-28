@@ -1,0 +1,46 @@
+name: publish
+
+# Tag-driven release: pushing vX.Y.Z builds, verifies, and publishes all 15
+# packages with that exact version via OIDC trusted publishing (no npm token).
+#
+#   npm version minor   # bumps root package.json (build stamps it onto all 15)
+#   git push origin main
+#   git tag v1.2.0 && git push origin v1.2.0
+#
+# One-time setup per package (npmjs.com → package → Settings → Trusted
+# publisher): GitHub Actions, this repo, workflow file "publish.yml".
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run build:packages
+      - run: npm run pack:check
+      - name: Publish all packages
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          ROOT_VER="$(node -p "require('./package.json').version")"
+          if [ "$ROOT_VER" != "$TAG" ]; then
+            echo "tag v$TAG does not match root package.json version $ROOT_VER"
+            exit 1
+          fi
+          for d in packages/*/; do
+            echo "--- publishing $d ---"
+            (cd "$d" && npm publish --access public --provenance)
+          done

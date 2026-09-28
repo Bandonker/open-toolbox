@@ -751,7 +751,24 @@ packages have no runtime dependency on each other.
 always published in lockstep. Never publish packages at mixed versions — a
 user installing the pack over time would otherwise end up with an untested
 combination. Publish only from a green `main` (`npm test`, `typecheck`,
-`pack:check`), and use an Automation token so 2FA never blocks the loop.
+`pack:check`).
+
+**Releases go through the `publish` workflow, not `npm publish` by hand.**
+Pushing a tag `vX.Y.Z` runs the full gate (tests, typecheck, pack check),
+refuses to publish when the tag disagrees with the root version, then
+publishes all 15 with provenance via OIDC trusted publishing — no npm token
+involved, so the 2FA-token restrictions don't apply:
+
+```bash
+npm version minor   # or major/patch; bumps root package.json
+git push origin main
+git tag v1.2.0 && git push origin v1.2.0
+```
+
+One-time setup, per package: npmjs.com → package → Settings → Trusted
+publisher → GitHub Actions, this repo, workflow `publish.yml`. Until that is
+done for a package, its publish step fails and the workflow stops — add all
+15 before the first tagged release.
 
 ## FAQ
 
