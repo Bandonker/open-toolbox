@@ -326,6 +326,57 @@ try {
       keys,
     );
   }
+
+  console.log("regression: top-level result write-back");
+  {
+    // A tool whose result IS a top-level string must still be scrubbed: scrub
+    // returns a new value for primitives, so dropping the return leaks it.
+    const { hooks } = await boot({ OPENCODE_SECRET_SHIELD_MODE: "redact" });
+    const sk = `sk-${"f".repeat(32)}`;
+    const event = {
+      tool: "bash",
+      status: "completed",
+      result: `done ${sk}`,
+      sessionID: "s",
+      agent: "a",
+      messageID: "m",
+      id: "c",
+      input: {},
+    };
+    await hooks.tool["execute.after"](event);
+    check("execute.after redacts a top-level string result", typeof event.result === "string" && !event.result.includes(sk), String(event.result).slice(0, 80));
+  }
+
+  console.log("regression: nested command payloads");
+  {
+    // `{ command: { script } }` / `{ commands: [{ command }] }` shapes must hit
+    // the protected-file denial just like the flat string form.
+    const { hooks } = await boot({ OPENCODE_SECRET_SHIELD_MODE: "block", OPENCODE_SECRET_SHIELD_BLOCK_ENV_READS: "true" });
+    const attempt = async (input) => {
+      try {
+        await hooks.tool["execute.before"]({ tool: "bash", input, sessionID: "s", agent: "a", messageID: "m", id: "c" });
+        return null;
+      } catch (err) {
+        return err;
+      }
+    };
+    const nested = await attempt({ command: { script: "cat .env" } });
+    check("block mode denies a nested command.script read", nested instanceof Error && /protected secret/.test(nested.message), nested && nested.message);
+    const listed = await attempt({ commands: [{ command: "cat .env" }] });
+    check("block mode denies a commands[] entry read", listed instanceof Error && /protected secret/.test(listed.message), listed && listed.message);
+  }
+
+  console.log("regression: oversize input gap");
+  {
+    // A secret in the unscanned middle of a >2MB input must not pass through
+    // in redact mode: the gap is spliced out before scanning.
+    const { hooks } = await boot({ OPENCODE_SECRET_SHIELD_MODE: "redact" });
+    const sk = `sk-${"g".repeat(32)}`;
+    const pad = "x".repeat(1_100_000);
+    const event = { prompt: { text: `${pad}${sk}${pad}` }, sessionID: "s", messageID: "m" };
+    await hooks.session.prompt(event);
+    check("oversize prompt gap is removed, not passed through", !event.prompt.text.includes(sk) && event.prompt.text.includes("unscanned chars removed"), `len=${event.prompt.text.length}`);
+  }
 } catch (err) {
   failed += 1;
   console.log(`FAIL   unexpected exception — ${err && err.stack ? err.stack : String(err)}`);
