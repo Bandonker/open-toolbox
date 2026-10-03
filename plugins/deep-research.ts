@@ -117,6 +117,8 @@ type Config = {
   enabled: boolean;
   dir: string;
   maxConcurrent: number;
+  /** Explicit "provider/model" override for research children. */
+  model?: string;
 };
 
 function defaultDir(): string {
@@ -135,6 +137,7 @@ function loadConfig(raw?: Record<string, unknown>): Config {
       8,
       Math.max(1, asInt(o.maxConcurrent, asInt(envStr("OPENCODE_DEEP_RESEARCH_CONCURRENCY"), 4))),
     ),
+    model: (typeof o.model === "string" && o.model) || envStr("OPENCODE_DEEP_RESEARCH_MODEL") || undefined,
   };
 }
 
@@ -201,16 +204,36 @@ const withTimeout = async <T>(p: Promise<T>, ms: number, label: string): Promise
 };
 
 function assistantTextOf(message: unknown): string {
-  const content = (message as { content?: unknown })?.content;
-  if (typeof content === "string") return content.trim();
-  if (Array.isArray(content)) {
-    return content
-      .filter((p) => p && typeof p === "object" && (p as { type?: string }).type === "text")
-      .map((p) => String((p as { text?: unknown }).text ?? ""))
-      .join("\n")
-      .trim();
-  }
-  return "";
+  if (typeof message === "string") return message.trim();
+  const m = (message ?? {}) as Record<string, unknown>;
+
+  // Content may be a plain string, an array of typed parts, a single part, or
+  // absent while the text lives under `parts`/`text` instead. Being strict here
+  // made every real assistant message read as empty.
+  const collect = (content: unknown): string => {
+    if (typeof content === "string") return content;
+    if (Array.isArray(content)) {
+      return content
+        .map((p) => {
+          if (typeof p === "string") return p;
+          if (p && typeof p === "object") {
+            const po = p as Record<string, unknown>;
+            if (typeof po.text === "string") return po.text;
+          }
+          return "";
+        })
+        .filter(Boolean)
+        .join("\n")
+        .trim();
+    }
+    if (content && typeof content === "object") {
+      const co = content as Record<string, unknown>;
+      if (typeof co.text === "string") return co.text.trim();
+    }
+    return "";
+  };
+
+  return collect(m.content) || collect(m.parts) || (typeof m.text === "string" ? m.text.trim() : "");
 }
 
 function newestAssistantText(messages: unknown): string {
@@ -222,6 +245,34 @@ function newestAssistantText(messages: unknown): string {
     if (text) return text;
   }
   return "";
+}
+
+/**
+ * Normalise whatever session.context() returned into a message array.
+ *
+ * Hosts differ: some return the array directly, others wrap it as
+ * {messages: [...]} or {data: [...]}. Treating a non-array as "no output"
+ * (the previous behaviour) made every child look like it had produced nothing
+ * for its entire deadline.
+ */
+function extractMessages(raw: unknown): unknown[] {
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object") {
+    for (const key of ["messages", "data", "items", "parts"]) {
+      const v = (raw as Record<string, unknown>)[key];
+      if (Array.isArray(v)) return v;
+    }
+  }
+  return [];
+}
+
+/** Short description of an unexpected shape, for failure reporting. */
+function describeShape(raw: unknown): string {
+  if (Array.isArray(raw)) return `array(${raw.length})`;
+  if (raw && typeof raw === "object") {
+    return `object{${Object.keys(raw as Record<string, unknown>).slice(0, 6).join(",")}}`;
+  }
+  return typeof raw;
 }
 
 /** Best-effort idle detection; unknown shapes simply mean "keep waiting". */
@@ -443,6 +494,56 @@ function digestClaims(all: Claim[]): { digest: string; unique: number; conflicts
 
 type ChildSpec = { angle: { id: string; brief: string }; prompt: string };
 
+/** Agent/model a child session is created with. */
+type Resolved = {
+  agent?: string;
+  model?: { modelID: string; providerID: string };
+};
+
+/**
+ * Decide what agent/model the research children run under.
+ *
+ * Preference order: the parent's own model (so research costs the same as the
+ * conversation), then a config override, then the first model the host reports.
+ * Returning nothing leaves the host to choose, which in practice meant children
+ * idling for the full per-child deadline and returning nothing.
+ */
+async function resolveAgentModel(c: any, cfg: Config, parent: ParentInfo): Promise<Resolved> {
+  const out: Resolved = {};
+  if (parent?.agent) out.agent = String(parent.agent);
+  if (parent?.model?.modelID && parent?.model?.providerID) {
+    out.model = { modelID: parent.model.modelID, providerID: parent.model.providerID };
+    return out;
+  }
+  if (cfg.model) {
+    const slash = cfg.model.indexOf("/");
+    if (slash > 0) {
+      out.model = { providerID: cfg.model.slice(0, slash), modelID: cfg.model.slice(slash + 1) };
+      return out;
+    }
+  }
+  try {
+    const list = (await withTimeout(c.model?.list?.(), 10_000, "model.list")) as
+      | { data?: Array<Record<string, unknown>> }
+      | undefined;
+    const first = list?.data?.[0];
+    if (first) {
+      const raw = String(first.id ?? "");
+      const modelID = String(first.modelID ?? raw);
+      const providerID = String(first.providerID ?? (raw.includes("/") ? raw.split("/")[0] : ""));
+      if (modelID && providerID) out.model = { modelID, providerID };
+    }
+  } catch {
+    /* leave the choice to the host */
+  }
+  return out;
+}
+
+type ParentInfo = {
+  model?: { modelID?: string; providerID?: string };
+  agent?: string;
+};
+
 type ChildHandle = {
   spec: ChildSpec;
   id: string;
@@ -455,6 +556,7 @@ async function runChild(
   parentID: string,
   deadlineMs: number,
   perChildMs: number,
+  resolved: Resolved,
 ): Promise<ChildResult> {
   const started = Date.now();
   let childID: string;
@@ -462,6 +564,13 @@ async function runChild(
     const created = (await withTimeout(
       c.session.create({
         title: `deep-research:${spec.angle.id}`,
+        // A child created without an explicit agent/model does not reliably
+        // pick one up: the sessions plugin always passes both, and without
+        // them the child sits idle and never produces a reply.
+        ...(resolved.agent ? { agent: resolved.agent } : {}),
+        ...(resolved.model
+          ? { model: { id: resolved.model.modelID, providerID: resolved.model.providerID } }
+          : {}),
         metadata: { parentSessionID: parentID, spawnedBy: "deep-research" },
       }),
       15_000,
@@ -498,6 +607,9 @@ async function runChild(
   let text = "";
   let lastLen = -1;
   let stableSince = 0;
+  let lastPollError = "";
+  let shapeSample = "";
+  let consecutivePollErrors = 0;
   while (Date.now() < hardStop) {
     try {
       const info = await withTimeout(c.session.get({ sessionID: childID }), 10_000, "session.get");
@@ -506,11 +618,30 @@ async function runChild(
         10_000,
         "session.context",
       );
-      text = newestAssistantText(messages);
-      // A completed reply is detectable without a status probe: the child was
-      // told to end with a GAPS: section (or produce no text at all).
-      const looksDone = /\bGAPS\s*:/i.test(text) || /^\s*$/.test(text);
-      if (looksDone || looksIdle(info)) break;
+      consecutivePollErrors = 0;
+      text = newestAssistantText(extractMessages(messages));
+      // Keep a shape sample so an empty result is diagnosable: whether the
+      // child produced nothing, or context() returned a shape we mis-parse.
+      if (!text) shapeSample = describeShape(messages);
+      if (!text && Array.isArray(messages)) {
+        const a = [...messages].reverse().find((m) => (m as { type?: string })?.type === "assistant");
+        if (a && typeof a === "object") {
+          const keys = Object.keys(a as Record<string, unknown>);
+          shapeSample += ` | assistant keys: ${keys.slice(0, 10).join(",")}`;
+          for (const k of keys.slice(0, 10)) {
+            const v = (a as Record<string, unknown>)[k];
+            shapeSample += ` [${k}=${Array.isArray(v) ? "array" + v.length : typeof v}]`;
+          }
+        }
+      }
+      // A child is done when it emits the contract's GAPS: section, or the
+      // host reports it idle. Empty output is NOT done — a freshly prompted
+      // child has not produced anything yet, and treating that as completion
+      // made every child exit on its first poll and return nothing.
+      const looksDone = /\bGAPS\s*:/i.test(text);
+      // A just-prompted child can report idle before work starts, so give the
+      // status probe a grace period before trusting it.
+      if (looksDone || (Date.now() - started > 2_000 && looksIdle(info))) break;
       // Growing text that has stopped moving is a reasonable secondary exit,
       // but only after it has been stable for a few polls.
       if (text.length === lastLen && text.length > 0) {
@@ -521,8 +652,18 @@ async function runChild(
       }
       lastLen = text.length;
     } catch (err) {
-      log(`child ${spec.angle.id}: poll failed: ${String(err)}`);
-      break;
+      // A child that has only just been prompted commonly rejects the first
+      // context reads. Breaking here discarded every agent within a second and
+      // orphaned the sessions, so keep polling until the deadline instead and
+      // only give up if the reads keep failing outright.
+      lastPollError = String(err);
+      consecutivePollErrors += 1;
+      if (consecutivePollErrors === 1) {
+        log(`child ${spec.angle.id}: poll failed, retrying: ${lastPollError}`);
+      }
+      if (consecutivePollErrors > 8) break;
+      await new Promise((r) => setTimeout(r, 2_000));
+      continue;
     }
     await new Promise((r) => setTimeout(r, 2_000));
   }
@@ -537,7 +678,17 @@ async function runChild(
     }
   }
 
-  return parseChild(text, spec.angle, Date.now() - started);
+  const parsed = parseChild(text, spec.angle, Date.now() - started);
+  // Surface why a child produced nothing: a bare "no assistant text" hides
+  // whether the session never started, the reads failed, or the model ignored
+  // the output contract.
+  if (!parsed.ok) {
+    const extra = [lastPollError ? `poll error: ${lastPollError}` : "", shapeSample]
+      .filter(Boolean)
+      .join(" | ");
+    parsed.error = `${parsed.error ?? "no findings"}${extra ? ` (${extra})` : ""}`;
+  }
+  return parsed;
 }
 
 /** Run a batch with a concurrency ceiling, aborting cleanly on cancellation. */
@@ -548,6 +699,7 @@ async function runBatch(
   deadlineMs: number,
   perChildMs: number,
   limit: number,
+  resolved: Resolved,
 ): Promise<ChildResult[]> {
   const out: ChildResult[] = [];
   let next = 0;
@@ -555,7 +707,7 @@ async function runBatch(
     while (next < specs.length) {
       if (Date.now() >= deadlineMs) return;
       const spec = specs[next++]!;
-      out.push(await runChild(c, spec, parentID, deadlineMs, perChildMs));
+      out.push(await runChild(c, spec, parentID, deadlineMs, perChildMs, resolved));
     }
   });
   await Promise.all(workers);
@@ -665,11 +817,18 @@ export default Plugin.define({
       topic: string,
       depth: Depth,
       parentID: string,
-    ): Promise<{ runId: string; text: string }> => {
+      parentInfo?: ParentInfo,
+    ): Promise<{ runId: string; text: string; claims: number; failureDetail: string }> => {
       const budget = BUDGETS[depth];
       const runId = randomUUID().replace(/-/g, "").slice(0, 8);
       const startedAt = Date.now();
       const deadline = startedAt + budget.totalSec * 1000;
+      // Resolve once per run so every child is comparable and the model list is
+      // not re-fetched per agent.
+      const resolved = await resolveAgentModel(c, cfg, parentInfo ?? {});
+      log(
+        `run ${runId}: children will use ${resolved.model ? `${resolved.model.providerID}/${resolved.model.modelID}` : "host default"}`,
+      );
       storeRun(getDb(), {
         id: runId,
         topic,
@@ -738,6 +897,7 @@ export default Plugin.define({
           deadline,
           budget.perChildSec * 1000,
           cfg.maxConcurrent,
+          resolved,
         );
         results.push(...batch);
         for (const b of batch) covered.push(keywords(`${b.angle} ${b.brief}`));
@@ -785,7 +945,11 @@ export default Plugin.define({
         rounds: stats.rounds,
         failures,
       });
-      return { runId, text };
+      const failureDetail = results
+        .filter((r) => !r.ok)
+        .map((r) => `- ${r.angle}: ${r.error ?? "unknown"}`)
+        .join("\n");
+      return { runId, text, claims: unique, failureDetail };
     };
 
     c.tool?.transform?.(
@@ -807,7 +971,25 @@ export default Plugin.define({
             if (topic.length < 3) return { content: "deep_research failed: topic is too short" };
             const parentID = toolCtx.sessionID;
             try {
-              const { runId, text } = await orchestrator(topic, depth, parentID);
+              const { runId, text, claims, failureDetail } = await orchestrator(topic, depth, parentID, {
+                model: toolCtx?.model,
+                agent: toolCtx?.agent,
+              });
+              // Handing the session an empty digest produces a confident report
+              // with nothing behind it. Report the failure instead.
+              if (claims === 0) {
+                return {
+                  content: [
+                    `deep research produced no findings: ${runId}`,
+                    `topic: ${topic}`,
+                    "",
+                    "Per-agent results:",
+                    failureDetail || "(none recorded)",
+                    "",
+                    `No findings were handed to this session. Report: ${join(cfg.dir, runId + ".md")}`,
+                  ].join("\n"),
+                };
+              }
               await c.session.prompt({ sessionID: parentID, text });
               return {
                 content: [
