@@ -43,6 +43,13 @@ import { envStr, asBool, asInt } from "../lib/config.ts";
 const DB_NAME = "stats.db";
 const DASHBOARD_NAME = "dashboard.html";
 
+/**
+ * US-7/TA-6: upper bound on remembered swept call ids (see `sweptPending`).
+ * Generous compared to `pending`, because overflowing only costs us the
+ * old "drop a very late after" behaviour — never a wrong duration.
+ */
+const PENDING_SWEEP_ID_CAP = 10_000;
+
 type HeatMetric = "tokens" | "cost" | "calls";
 
 type Config = {
@@ -89,6 +96,14 @@ interface UsageState {
    * recordToolCall knows which session to attribute the call to.
    */
   pending: Map<string, { tool: string; startedMs: number; unknownDuration?: boolean; sessionID?: string }>;
+  /**
+   * US-7/TA-6: call ids evicted from `pending` by the hard-TTL sweep. Their
+   * `execute.after` may still arrive hours later, and must NOT be silently
+   * dropped — the id is remembered here so the after hook can still record
+   * the call, with an unknown (null) duration. Bounded like `pending`, and
+   * insertion-ordered so the oldest id is the first to be forgotten.
+   */
+  sweptPending: Set<string>;
   /** Last US-6 threshold-gated pending sweep (epoch ms). */
   lastPendingSweep: number;
   /** Whether the event subscription pump is currently alive. */
@@ -106,6 +121,7 @@ function createState(): UsageState {
     dirty: false,
     sessionModels: new Map(),
     pending: new Map(),
+    sweptPending: new Set(),
     lastPendingSweep: 0,
     lastSessionModelsSweep: 0,
     eventPumpAlive: false,
@@ -1054,14 +1070,35 @@ function numOrNull(v: unknown): number | null {
 }
 
 /**
- * US-7/TA-6: denominator for average durations — timed calls only, so
- * unknown-duration (swept) calls never drag the average toward zero. Rows
- * written before the timed_calls column existed report 0 timed calls while
- * holding accumulated durations; those fall back to `calls` so their
- * pre-existing averages keep rendering as before.
+ * US-7/TA-6: average duration over *timed* calls only, so unknown-duration
+ * (swept) calls never drag the average toward zero. Returns null when the
+ * average is genuinely unknown — every call so far had no measurable
+ * duration — so callers render "?" instead of a misleading "0ms".
+ *
+ * Rows written before the timed_calls column existed report 0 timed calls
+ * while holding accumulated durations; those keep averaging over all calls
+ * so their pre-existing numbers render exactly as before.
  */
-function avgDenominator(timedCalls: number, calls: number): number {
-  return timedCalls > 0 ? timedCalls : calls;
+function avgMsOrNull(totalMs: number, timedCalls: number, calls: number): number | null {
+  if (timedCalls > 0) return totalMs / timedCalls;
+  // Legacy row: durations were accumulated before timed_calls existed.
+  if (totalMs > 0) return calls > 0 ? totalMs / calls : null;
+  // No timed calls and no accumulated time: the average is unknown, not 0.
+  return null;
+}
+
+/**
+ * US-7/TA-6: the same "unknown, not instantaneous" rule for the maximum. A
+ * row whose only calls had unknown durations has no meaningful max; the
+ * stored 0 is a sentinel, not a measurement, so it renders as "?".
+ */
+function maxMsOrNull(maxMs: number, timedCalls: number): number | null {
+  return timedCalls > 0 || maxMs > 0 ? maxMs : null;
+}
+
+/** Render a possibly-unknown duration for text output. */
+function fmtMsOrUnknown(ms: number | null): string {
+  return ms === null ? "?" : `${fmtInt(ms)}ms`;
 }
 
 function totalsOf(r: Record<string, unknown> | null | undefined): UsageTotals {
@@ -1214,12 +1251,13 @@ function toolsText(database: AnyDatabase, limit: number): string {
   const lines = [`Tool usage (${rows.length} tools)`];
   for (const r of rows) {
     const calls = num(r.calls);
-    // US-7/TA-6: average over timed calls only; legacy rows (no timed data)
-    // fall back to averaging over all calls, matching pre-fix behavior.
-    const timed = avgDenominator(num(r.timed_calls), calls);
-    const avg = timed > 0 ? num(r.total_ms) / timed : 0;
+    // US-7/TA-6: average/maximum cover timed calls only, and render as "?"
+    // when every call so far had an unknown duration — "0ms" would read as
+    // instantaneous for a call that was actually still running.
+    const timed = num(r.timed_calls);
+    const avg = avgMsOrNull(num(r.total_ms), timed, calls);
     lines.push(
-      `  ${String(r.tool)}: calls=${fmtInt(calls)} ok=${fmtInt(num(r.succeeded))} failed=${fmtInt(num(r.failed))} avg=${Math.round(avg)}ms max=${fmtInt(num(r.max_ms))}ms`,
+      `  ${String(r.tool)}: calls=${fmtInt(calls)} ok=${fmtInt(num(r.succeeded))} failed=${fmtInt(num(r.failed))} avg=${avg === null ? "?" : `${Math.round(avg)}ms`} max=${fmtMsOrUnknown(maxMsOrNull(num(r.max_ms), timed))}`,
     );
   }
   return lines.join("\n");
@@ -1335,8 +1373,9 @@ type DayToolUsage = {
   calls: number;
   succeeded: number;
   failed: number;
-  avgMs: number;
-  maxMs: number;
+  /** US-7/TA-6: null when every call that day had an unknown duration. */
+  avgMs: number | null;
+  maxMs: number | null;
 };
 type DayBreakdown = { models: DayModelUsage[]; tools: DayToolUsage[] };
 
@@ -1383,12 +1422,11 @@ function dayBreakdowns(database: AnyDatabase, grid: HeatGrid): Map<string, DayBr
       calls,
       succeeded: num(row.succeeded),
       failed: num(row.failed),
-      // US-7/TA-6: average over timed calls only (legacy rows fall back to
-      // calls), so unknown-duration calls do not drag the mean down.
-      avgMs: avgDenominator(num(row.timed_calls), calls) > 0
-        ? num(row.total_ms) / avgDenominator(num(row.timed_calls), calls)
-        : 0,
-      maxMs: num(row.max_ms),
+      // US-7/TA-6: average/maximum cover timed calls only (legacy rows fall
+      // back to calls), and are null when every call had an unknown duration
+      // so an in-flight call never reads as instantaneous.
+      avgMs: avgMsOrNull(num(row.total_ms), num(row.timed_calls), calls),
+      maxMs: maxMsOrNull(num(row.max_ms), num(row.timed_calls)),
     });
   }
   return result;
@@ -1435,7 +1473,7 @@ function heatmapDayTitle(
   lines.push(`Tools: ${fmtInt(row.tool_calls)} calls (${fmtInt(row.tool_ok)} ok, ${fmtInt(row.tool_fail)} failed)`);
   for (const tool of breakdown?.tools ?? []) {
     lines.push(
-      `  ${tool.tool}: ${fmtInt(tool.calls)} calls (${fmtInt(tool.succeeded)} ok, ${fmtInt(tool.failed)} failed), avg ${Math.round(tool.avgMs)}ms, max ${fmtInt(tool.maxMs)}ms`,
+      `  ${tool.tool}: ${fmtInt(tool.calls)} calls (${fmtInt(tool.succeeded)} ok, ${fmtInt(tool.failed)} failed), avg ${tool.avgMs === null ? "?" : `${Math.round(tool.avgMs)}ms`}, max ${fmtMsOrUnknown(tool.maxMs)}`,
     );
   }
   lines.push(`Models: ${breakdown?.models.length ?? 0} used`);
@@ -1758,17 +1796,17 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     >
   ).map((r) => {
     const calls = num(r.calls);
-    // US-7/TA-6: average over timed calls only (legacy rows fall back to
-    // calls) — unknown-duration calls must not drag the mean down.
-    const timed = avgDenominator(num(r.timed_calls), calls);
-    const avg = timed > 0 ? num(r.total_ms) / timed : 0;
+    // US-7/TA-6: timed calls only, and "?" when no call had a known duration
+    // — a call still in flight must not render as a 0ms instant call.
+    const timed = num(r.timed_calls);
+    const avg = avgMsOrNull(num(r.total_ms), timed, calls);
     return [
       String(r.tool),
       compactCell(calls),
       compactCell(num(r.succeeded)),
       compactCell(num(r.failed)),
-      `${Math.round(avg)}ms`,
-      `${fmtInt(num(r.max_ms))}ms`,
+      avg === null ? "?" : `${Math.round(avg)}ms`,
+      fmtMsOrUnknown(maxMsOrNull(num(r.max_ms), timed)),
     ];
   });
 
@@ -2423,8 +2461,21 @@ export default Plugin.define({
               if (!v.unknownDuration) {
                 if (v.startedMs < markCutoff) v.unknownDuration = true;
               } else if (v.startedMs < dropCutoff) {
+                // US-7/TA-6: dropping the entry must not lose the call.
+                // Remember the id (bounded, oldest-first) so a very late
+                // execute.after is still recorded with a null duration
+                // instead of being silently discarded.
                 state.pending.delete(k);
+                state.sweptPending.add(k);
               }
+            }
+            // Keep the swept-id memory bounded like `pending` itself. The
+            // cap is generous: a forgotten id only degrades back to the old
+            // "drop very late after" behaviour, never to a wrong duration.
+            while (state.sweptPending.size > PENDING_SWEEP_ID_CAP) {
+              const oldest = state.sweptPending.values().next();
+              if (oldest.done) break;
+              state.sweptPending.delete(oldest.value);
             }
           }
           // US-6: sweep stale sessionModels entries so the map cannot grow
@@ -2457,17 +2508,24 @@ export default Plugin.define({
         try {
           const key = String(event.id ?? "");
           const entry = key ? state.pending.get(key) : undefined;
-          if (!entry) return;
-          state.pending.delete(key);
-          const tool = String(event.tool ?? entry.tool ?? "unknown");
+          if (entry) state.pending.delete(key);
+          // US-7/TA-6: a call whose entry the sweep already evicted still has
+          // to be counted. Before this, `if (!entry) return` dropped it, so a
+          // call outliving the TTL never reached tool_totals/daily.tool_calls.
+          // The duration is unknown here (no retained startedMs), so record a
+          // null duration: it counts toward calls/ok/fail and is excluded from
+          // every duration aggregate.
+          const swept = !entry && key !== "" && state.sweptPending.delete(key);
+          if (!entry && !swept) return;
+          const tool = String(event.tool ?? entry?.tool ?? "unknown");
           // US-7/TA-6: a swept (unknown-duration) entry still records the
           // call — with a null duration instead of a bogus number.
-          const duration = entry.unknownDuration ? null : Date.now() - entry.startedMs;
+          const duration = entry && !entry.unknownDuration ? Date.now() - entry.startedMs : null;
           const status = String((event as { status?: unknown }).status ?? "completed");
           // US-3: prefer the after event's sessionID, fall back to the one
           // captured at execute.before (some hosts only send it there).
           const sessionID =
-            String((event as { sessionID?: unknown }).sessionID ?? "") || entry.sessionID || "";
+            String((event as { sessionID?: unknown }).sessionID ?? "") || entry?.sessionID || "";
           recordToolCall(database(), tool, status === "completed", duration, sessionID, state);
         } catch (err) {
           logDbError(`execute.after failed: ${String(err)}`);
@@ -2902,6 +2960,7 @@ export default Plugin.define({
         }
       }
       state.pending.clear();
+      state.sweptPending.clear();
       for (const timer of timers) clearInterval(timer);
       if (state.db) {
         try {
