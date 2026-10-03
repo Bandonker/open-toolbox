@@ -112,6 +112,8 @@ interface TrendData {
   previousCount: number;
   currentCount: number;
   message: string;
+  /** False when the window held a single review, so nothing was compared. */
+  comparable: boolean;
 }
 
 interface CustomRule {
@@ -197,7 +199,53 @@ const BASENAME_ALLOW = new Set([
   "jenkinsfile", "cmakelists.txt",
 ]);
 
-function* walkDir(dir: string, seen = new Set<string>()): Generator<string> {
+/**
+ * Walk-time include/exclude filtering.
+ *
+ * These were applied after the walk, so every excluded file was still read,
+ * stat-ed and yielded, and `maxFiles` spent its budget on files the caller was
+ * about to throw away — a review capped at 10 files could read 200 and keep 3.
+ * The patterns are substring tests against the project-relative path, so the
+ * same decision can be made during the walk.
+ */
+interface WalkFilter {
+  /** Walk root, used to build the relative path the patterns are matched against. */
+  root: string;
+  excludePatterns: string[];
+  includePatterns: string[];
+}
+
+function buildWalkFilter(rootPath: string, cfg: CodeReviewConfig): WalkFilter {
+  return { root: rootPath, excludePatterns: cfg.excludePatterns, includePatterns: cfg.includePatterns };
+}
+
+/** Project-relative, separator-normalized path — the form the patterns are written against. */
+function walkRelPath(filter: WalkFilter, fullPath: string): string {
+  return relative(filter.root, fullPath).split(sep).join("/");
+}
+
+/**
+ * Excludes are substring tests, so a matching directory only ever matches by
+ * itself: every descendant's relative path contains the directory's, so pruning
+ * it here yields exactly the files the old post-walk filter would have kept.
+ * Includes are not prunable — a directory can miss the pattern while a file
+ * inside it matches — so they only ever filter files.
+ */
+function excludedByWalkFilter(filter: WalkFilter, fullPath: string): boolean {
+  if (filter.excludePatterns.length === 0) return false;
+  const rel = walkRelPath(filter, fullPath);
+  return filter.excludePatterns.some((p) => rel.includes(p));
+}
+
+/** Both rules, as `reviewProject` used to apply them after the walk. */
+function keptByWalkFilter(filter: WalkFilter, fullPath: string): boolean {
+  if (excludedByWalkFilter(filter, fullPath)) return false;
+  if (filter.includePatterns.length === 0) return true;
+  const rel = walkRelPath(filter, fullPath);
+  return filter.includePatterns.some((p) => rel.includes(p));
+}
+
+function* walkDir(dir: string, seen = new Set<string>(), filter?: WalkFilter): Generator<string> {
   try {
     const realPath = realpathSync(dir);
     if (seen.has(realPath)) return;
@@ -210,11 +258,13 @@ function* walkDir(dir: string, seen = new Set<string>()): Generator<string> {
       if (entry.isDirectory()) {
         if (SKIP_DIRS.has(entry.name.toLowerCase())) continue;
         if (entry.name.startsWith(".")) continue;
-        yield* walkDir(fullPath, seen);
+        if (filter && excludedByWalkFilter(filter, fullPath)) continue;
+        yield* walkDir(fullPath, seen, filter);
       } else if (entry.isFile()) {
         if (SKIP_FILES.has(entry.name.toLowerCase())) continue;
         const ext = extname(entry.name).toLowerCase();
         if (!DEFAULT_EXTS.has(ext) && (ext !== "" || !BASENAME_ALLOW.has(entry.name.toLowerCase()))) continue;
+        if (filter && !keptByWalkFilter(filter, fullPath)) continue;
         yield fullPath;
       } else {
         try {
@@ -223,11 +273,13 @@ function* walkDir(dir: string, seen = new Set<string>()): Generator<string> {
             if (SKIP_FILES.has(entry.name.toLowerCase())) continue;
             const ext = extname(entry.name).toLowerCase();
             if (!DEFAULT_EXTS.has(ext) && (ext !== "" || !BASENAME_ALLOW.has(entry.name.toLowerCase()))) continue;
+            if (filter && !keptByWalkFilter(filter, fullPath)) continue;
             yield fullPath;
           } else if (st.isDirectory()) {
             if (SKIP_DIRS.has(entry.name.toLowerCase())) continue;
             if (entry.name.startsWith(".")) continue;
-            yield* walkDir(fullPath, seen);
+            if (filter && excludedByWalkFilter(filter, fullPath)) continue;
+            yield* walkDir(fullPath, seen, filter);
           }
         } catch {
           // broken symlink or vanished
@@ -2425,13 +2477,8 @@ function reviewProject(
   // Build the prepared rule array once for the whole project instead of per file.
   const preparedRules = buildRules(cfg, dbRules, severityFilter);
 
-  for (const filePath of walkDir(rootPath)) {
+  for (const filePath of walkDir(rootPath, new Set<string>(), buildWalkFilter(rootPath, cfg))) {
     if (filesReviewed >= max) break;
-
-    // Check exclude/include patterns
-    const relPath = relative(rootPath, filePath).split(sep).join("/");
-    if (cfg.excludePatterns.some((p) => relPath.includes(p))) continue;
-    if (cfg.includePatterns.length > 0 && !cfg.includePatterns.some((p) => relPath.includes(p))) continue;
 
     const findings = reviewFile(filePath, cfg, severityFilter, dbRules, skipped, preparedRules);
     allFindings.push(...findings);
@@ -2546,71 +2593,122 @@ function collectWorkingTreeDiff(dir: string): { diff: string; notes: string[] } 
 
 // --- Trend analysis ---
 
-async function getTrendData(currentFindings: number): Promise<TrendData | null> {
+/**
+ * CR-15: one trend definition, shared by `code_review_trends`,
+ * `/code-review trends` and the line a finished review appends.
+ *
+ * Two computations used to disagree. The tool compared the newest review in its
+ * window against the oldest, while `getTrendData` compared the count handed to
+ * it against a single previous row (`LIMIT 1 OFFSET 1`) — and it was called
+ * after the current review was stored, so that row was often the review being
+ * reported, which made a review compare against itself. The window semantics
+ * are the definition: the newest stored review is the current one, the oldest
+ * review in the window is the baseline.
+ */
+const TREND_WINDOW_DEFAULT = 10;
+const TREND_WINDOW_MAX = 50;
+
+/** Findings may move this far either way before it counts as a trend. */
+const TREND_FLAT_PERCENT = 10;
+
+interface TrendRow {
+  id: number;
+  created_at: string;
+  finding_count: number;
+  file_count: number;
+}
+
+interface TrendReport {
+  /** Reviews in the window, newest first. */
+  rows: TrendRow[];
+  /** The window's comparison; `comparable` is false when it holds one review. */
+  overall: TrendData;
+  /** category/severity counts for the newest review in the window. */
+  breakdown: Array<{ category: string; severity: string; cnt: number }>;
+}
+
+async function readTrendReport(limit: number): Promise<TrendReport | null> {
   try {
-    const prev = await readDb(() => {
+    const window = clampLimit(limit, TREND_WINDOW_DEFAULT, TREND_WINDOW_MAX);
+    return await readDb(() => {
       const database = getDb();
-      const row = database
-        .query("SELECT finding_count FROM reviews ORDER BY id DESC LIMIT 1 OFFSET 1")
-        .get() as { finding_count: number } | null;
-      return row?.finding_count ?? null;
-    });
+      const rows = database
+        .query("SELECT id, created_at, finding_count, file_count FROM reviews ORDER BY id DESC LIMIT ?")
+        .all(window) as TrendRow[];
 
-    if (prev === null || prev === 0) {
+      const currentCount = rows[0]?.finding_count ?? 0;
+      const previousCount = rows.length >= 2 ? rows[rows.length - 1].finding_count : 0;
+      const comparable = rows.length >= 2;
+      const changePercent =
+        comparable && previousCount > 0 ? Math.round(((currentCount - previousCount) / previousCount) * 100) : 0;
+
+      let direction: TrendData["direction"] = "stable";
+      if (comparable && changePercent > TREND_FLAT_PERCENT) direction = "worsening";
+      else if (comparable && changePercent < -TREND_FLAT_PERCENT) direction = "improving";
+
+      const span = `the last ${rows.length} reviews`;
+      const message = !comparable
+        ? "No previous review data for comparison"
+        : direction === "improving"
+          ? `Findings decreased by ${Math.abs(changePercent)}% across ${span}`
+          : direction === "worsening"
+            ? `Findings increased by ${changePercent}% across ${span}`
+            : `Findings stable across ${span}`;
+
+      const breakdown = rows[0]
+        ? (database
+            .query(
+              "SELECT category, severity, COUNT(*) as cnt FROM review_findings WHERE review_id = ? GROUP BY category, severity",
+            )
+            .all(rows[0].id) as Array<{ category: string; severity: string; cnt: number }>)
+        : [];
+
       return {
-        direction: "stable",
-        changePercent: 0,
-        previousCount: prev ?? 0,
-        currentCount: currentFindings,
-        message: "No previous review data for comparison",
+        rows,
+        overall: { direction, changePercent, previousCount, currentCount, comparable, message },
+        breakdown,
       };
-    }
-
-    const change = currentFindings - prev;
-    const changePercent = Math.round((change / prev) * 100);
-
-    let direction: TrendData["direction"] = "stable";
-    if (changePercent > 10) direction = "worsening";
-    else if (changePercent < -10) direction = "improving";
-
-    const message =
-      direction === "improving"
-        ? `Findings decreased by ${Math.abs(changePercent)}% since last review`
-        : direction === "worsening"
-          ? `Findings increased by ${changePercent}% since last review`
-          : "Findings stable since last review";
-
-    return { direction, changePercent, previousCount: prev, currentCount: currentFindings, message };
+    });
   } catch {
     return null;
   }
 }
 
-// --- Peer-plugin integration ---
+/** The `code_review_trends` report — rendered once, for the tool and the command alike. */
+function renderTrendReport(report: TrendReport): string {
+  if (report.rows.length === 0) return "No review history found.";
 
-/**
- * CR-11: this plugin used to reach for four sibling plugins (memory,
- * error-journal, snippet-library, decision-log) via dynamic `.ts` specifiers and
- * pull `mod.__test__.remember / .log / .save` off them. No peer ever
- * exported those writers, so every call no-op'd inside `try {} catch {}`, and
- * the `.ts` specifiers do not resolve in a published build either. The dead
- * cross-plugin reach-through is deleted; findings live in this plugin's own
- * database, and the peers expose their own tools for anyone who wants them
- * recorded elsewhere.
- */
-let peerIntegrationsNoted = false;
+  const lines: string[] = [`## Code Review Trends (last ${report.rows.length} reviews)`];
 
-function notePeerIntegrationsUnwired(): void {
-  if (peerIntegrationsNoted) return;
-  peerIntegrationsNoted = true;
-  try {
-    console.debug(
-      "[code-review] peer integrations (memory, error-journal, snippet-library, decision-log) are not wired; " +
-        "findings are stored only in this plugin's database.",
-    );
-  } catch {
-    /* logging must never break a review */
+  if (report.overall.comparable) {
+    const { direction, changePercent } = report.overall;
+    if (direction === "improving") {
+      lines.push(`\nOverall: Improving (${Math.abs(changePercent)}% decrease in findings)`);
+    } else if (direction === "worsening") {
+      lines.push(`\nOverall: Worsening (${changePercent}% increase in findings)`);
+    } else {
+      lines.push(`\nOverall: Stable`);
+    }
   }
+
+  lines.push(`\n### Review History`);
+  for (const r of report.rows) {
+    lines.push(`  #${r.id}  ${formatAge(r.created_at)} ago  —  ${r.finding_count} findings in ${r.file_count} files`);
+  }
+
+  if (report.breakdown.length > 0) {
+    const byCat: Record<string, number> = {};
+    const bySev: Record<string, number> = {};
+    for (const f of report.breakdown) {
+      byCat[f.category] = (byCat[f.category] ?? 0) + f.cnt;
+      bySev[f.severity] = (bySev[f.severity] ?? 0) + f.cnt;
+    }
+    lines.push(`\n### Latest Review Breakdown`);
+    lines.push(`  By category: ${Object.entries(byCat).map(([k, v]) => `${k}: ${v}`).join(", ")}`);
+    lines.push(`  By severity: ${Object.entries(bySev).map(([k, v]) => `${k}: ${v}`).join(", ")}`);
+  }
+
+  return lines.join("\n");
 }
 
 // --- Formatting helpers ---
@@ -3340,8 +3438,11 @@ async function createChildSession(
   }
 }
 
-/** CR-9: identical snapshots required before a partial answer counts as final. */
+/** CR-9: unchanged reads that stand in for a completion signal the host cannot give. */
 const STABLE_SNAPSHOTS = 3;
+
+/** CR-9: the poll starts this short and doubles up to the caller's ceiling. */
+const MIN_POLL_MS = 250;
 
 /** CR-9: interpret an optional session-status probe as "this child is done". */
 function childLooksIdle(status: unknown): boolean {
@@ -3356,14 +3457,41 @@ function childLooksIdle(status: unknown): boolean {
 }
 
 /**
+ * CR-9: does this snapshot read like a finished answer rather than the
+ * paragraph a child pauses on mid-review?
+ *
+ * Only used when the host cannot report a child's status at all, where the sole
+ * other evidence is that the text stopped changing — which a "thinking" child
+ * does for tens of seconds. A finished answer ends with sentence punctuation, a
+ * closing bracket/backtick or a fence; anything else is treated as truncated.
+ */
+function looksFinished(text: string): boolean {
+  const trimmed = text.trimEnd();
+  if (!trimmed) return true;
+  if (trimmed.endsWith("```")) return true;
+  return /[.!?:;)\]}`>'"]$/u.test(trimmed);
+}
+
+/**
  * Poll a direct-mode child until its final message appears.
  *
- * CR-9: one unchanged snapshot used to end the wait, but a reviewer child
- * normally emits a paragraph and then spends far longer than 4 s still reading
- * files — that truncated text is what the fixer children received (or an empty
- * findings list when nothing had been written yet). The wait now ends only on
- * the reviewer sentinel, on the child reporting idle/completed, or after
- * STABLE_SNAPSHOTS consecutive identical reads, and always stops at the deadline.
+ * CR-9: three things used to make every review pay 8-12 s of pure latency and
+ * still truncate. The fixed 4 s tick meant a child that finished in 2 s was only
+ * noticed on the third tick, and `stable >= 3` was checked *before* the status
+ * probe, so a reviewer that paused mid-thought ("thinking" between two tool
+ * calls) read stable three times and its truncated paragraph — the very thing
+ * the fixers were handed — came back as final.
+ *
+ * Completion is now ranked by signal strength, and only ever by signal:
+ * 1. the reviewer sentinel `[[REVIEW_DONE]]`, which REVIEWER_PROMPT already
+ *    requires on its own final line — a pause can never contain it;
+ * 2. the host reporting the child idle/completed, probed *before* any fallback;
+ * 3. only when the host exposes no status at all: STABLE_SNAPSHOTS unchanged
+ *    reads *and* a snapshot that looks finished.
+ *
+ * "The text stopped changing" alone is never enough, and the deadline always
+ * wins. Polling backs off from MIN_POLL_MS to the caller's ceiling so a prompt
+ * finish is caught in a fraction of the old latency instead of a full tick.
  */
 async function waitForChildText(
   api: DirectSessionApi,
@@ -3372,11 +3500,15 @@ async function waitForChildText(
   pollMs = 4000,
 ): Promise<string> {
   if (typeof api.context !== "function") return "";
+  const statusProbe = typeof api.status === "function" ? api.status : null;
   const deadline = Date.now() + timeoutMs;
   let last = "";
   let stable = 0;
+  let interval = Math.max(1, Math.min(MIN_POLL_MS, pollMs));
   while (Date.now() < deadline) {
-    await delay(Math.max(1, Math.min(pollMs, deadline - Date.now())));
+    await delay(Math.max(1, Math.min(interval, deadline - Date.now())));
+    interval = Math.min(pollMs, interval * 2);
+
     let messages: unknown;
     try {
       messages = await api.context({ sessionID });
@@ -3394,14 +3526,25 @@ async function waitForChildText(
         stable = 1;
       }
     }
-    if (stable >= STABLE_SNAPSHOTS) return last;
-    if (typeof api.status === "function") {
+
+    // Signal 2: the host saying the child stopped working. Probed first, so a
+    // child that is demonstrably still busy can never exit on stability.
+    let statusKnown = false;
+    if (statusProbe) {
       try {
-        if (childLooksIdle(await api.status({ sessionID }))) return last;
+        statusKnown = true;
+        // `.call(api, …)`: the host may hand us a method that reads `this`.
+        if (childLooksIdle(await statusProbe.call(api, { sessionID }))) return last;
       } catch {
+        statusKnown = false;
         /* status is best-effort */
       }
     }
+
+    // Signal 3: stability, and only where there is no status to read. It is
+    // deliberately paired with looksFinished — an unchanged paragraph is what a
+    // mid-thought pause looks like, and returning it is the bug this replaced.
+    if (!statusKnown && stable >= STABLE_SNAPSHOTS && looksFinished(last)) return last;
   }
   return last;
 }
@@ -3627,9 +3770,6 @@ export default Plugin.define({
             const outcome = await storeReview(result, reviewSummary(result, "1 file"));
             const reviewId = outcome.reviewId ?? undefined;
 
-            // CR-11: no peer-plugin reach-through exists any more.
-            notePeerIntegrationsUnwired();
-
             return {
               content:
                 formatReviewResult(result, `Reviewed: ${args.path}`, reviewId) +
@@ -3671,9 +3811,6 @@ export default Plugin.define({
 
             const outcome = await storeReview(result, reviewSummary(result, "diff"));
             const reviewId = outcome.reviewId ?? undefined;
-
-            // CR-11: no peer-plugin reach-through exists any more.
-            notePeerIntegrationsUnwired();
 
             return {
               content:
@@ -3717,14 +3854,12 @@ export default Plugin.define({
             const outcome = await storeReview(result, reviewSummary(result, `${result.filesReviewed} files`));
             const reviewId = outcome.reviewId ?? undefined;
 
-            // CR-11: no peer-plugin reach-through exists any more.
-            notePeerIntegrationsUnwired();
-
-            // Trend analysis
+            // CR-15: the same windowed trend the tool reports, read after storing.
             let trendLine = "";
             if (cfg.enableTrendAnalysis) {
-              const trend = await getTrendData(result.findings.length);
-              if (trend) {
+              const report = await readTrendReport(TREND_WINDOW_DEFAULT);
+              if (report) {
+                const trend = report.overall;
                 trendLine = `\n\n### Trend\n  ${trend.message} (${trend.previousCount} → ${trend.currentCount})`;
               }
             }
@@ -3798,67 +3933,10 @@ export default Plugin.define({
         execute: async (input) => {
           const args = input as { limit?: number };
           try {
-            const limit = clampLimit(args.limit ?? 10, 10, 50);
-            const out = await readDb(() => {
-              const database = getDb();
-              const rows = database
-                .query("SELECT id, created_at, finding_count, file_count, summary FROM reviews ORDER BY id DESC LIMIT ?")
-                .all(limit) as Array<{
-                  id: number;
-                  created_at: string;
-                  finding_count: number;
-                  file_count: number;
-                  summary: string;
-                }>;
-
-              if (rows.length === 0) {
-                return "No review history found.";
-              }
-
-              const lines: string[] = [`## Code Review Trends (last ${rows.length} reviews)`];
-
-              // Overall trend
-              if (rows.length >= 2) {
-                const recent = rows[0].finding_count;
-                const older = rows[rows.length - 1].finding_count;
-                const change = recent - older;
-                const changePercent = older > 0 ? Math.round((change / older) * 100) : 0;
-
-                if (changePercent < -10) {
-                  lines.push(`\nOverall: Improving (${Math.abs(changePercent)}% decrease in findings)`);
-                } else if (changePercent > 10) {
-                  lines.push(`\nOverall: Worsening (${changePercent}% increase in findings)`);
-                } else {
-                  lines.push(`\nOverall: Stable`);
-                }
-              }
-
-              // Per-review breakdown
-              lines.push(`\n### Review History`);
-              for (const r of rows) {
-                lines.push(`  #${r.id}  ${formatAge(r.created_at)} ago  —  ${r.finding_count} findings in ${r.file_count} files`);
-              }
-
-              // Findings by category from most recent review
-              const latestFindings = database
-                .query("SELECT category, severity, COUNT(*) as cnt FROM review_findings WHERE review_id = ? GROUP BY category, severity")
-                .all(rows[0].id) as Array<{ category: string; severity: string; cnt: number }>;
-
-              if (latestFindings.length > 0) {
-                lines.push(`\n### Latest Review Breakdown`);
-                const byCat: Record<string, number> = {};
-                const bySev: Record<string, number> = {};
-                for (const f of latestFindings) {
-                  byCat[f.category] = (byCat[f.category] ?? 0) + f.cnt;
-                  bySev[f.severity] = (bySev[f.severity] ?? 0) + f.cnt;
-                }
-                lines.push(`  By category: ${Object.entries(byCat).map(([k, v]) => `${k}: ${v}`).join(", ")}`);
-                lines.push(`  By severity: ${Object.entries(bySev).map(([k, v]) => `${k}: ${v}`).join(", ")}`);
-              }
-
-              return lines.join("\n");
-            });
-            return { content: out };
+            // CR-15: same windowed report as `/code-review trends`.
+            const report = await readTrendReport(args.limit ?? TREND_WINDOW_DEFAULT);
+            if (!report) return { content: "Failed to read trends." };
+            return { content: renderTrendReport(report) };
           } catch (err) {
             return { content: `Failed to read trends: ${err instanceof Error ? err.message : String(err)}` };
           }
@@ -4628,64 +4706,9 @@ export default Plugin.define({
 
                 case "trends": {
                   try {
-                    const limit = arg ? parseInt(arg, 10) : 10;
-                    const out = await readDb(() => {
-                      const database = getDb();
-                      const rows = database
-                        .query("SELECT id, created_at, finding_count, file_count, summary FROM reviews ORDER BY id DESC LIMIT ?")
-                        .all(clampLimit(limit, 10, 50)) as Array<{
-                          id: number;
-                          created_at: string;
-                          finding_count: number;
-                          file_count: number;
-                          summary: string;
-                        }>;
-
-                      if (rows.length === 0) {
-                        return "No review history found.";
-                      }
-
-                      const lines: string[] = [`## Code Review Trends (last ${rows.length} reviews)`];
-
-                      if (rows.length >= 2) {
-                        const recent = rows[0].finding_count;
-                        const older = rows[rows.length - 1].finding_count;
-                        const change = recent - older;
-                        const changePercent = older > 0 ? Math.round((change / older) * 100) : 0;
-
-                        if (changePercent < -10) {
-                          lines.push(`\nOverall: Improving (${Math.abs(changePercent)}% decrease in findings)`);
-                        } else if (changePercent > 10) {
-                          lines.push(`\nOverall: Worsening (${changePercent}% increase in findings)`);
-                        } else {
-                          lines.push(`\nOverall: Stable`);
-                        }
-                      }
-
-                      lines.push(`\n### Review History`);
-                      for (const r of rows) {
-                        lines.push(`  #${r.id}  ${formatAge(r.created_at)} ago  —  ${r.finding_count} findings in ${r.file_count} files`);
-                      }
-
-                      const latestFindings = database
-                        .query("SELECT category, severity, COUNT(*) as cnt FROM review_findings WHERE review_id = ? GROUP BY category, severity")
-                        .all(rows[0].id) as Array<{ category: string; severity: string; cnt: number }>;
-
-                      if (latestFindings.length > 0) {
-                        lines.push(`\n### Latest Review Breakdown`);
-                        const byCat: Record<string, number> = {};
-                        const bySev: Record<string, number> = {};
-                        for (const f of latestFindings) {
-                          byCat[f.category] = (byCat[f.category] ?? 0) + f.cnt;
-                          bySev[f.severity] = (bySev[f.severity] ?? 0) + f.cnt;
-                        }
-                        lines.push(`  By category: ${Object.entries(byCat).map(([k, v]) => `${k}: ${v}`).join(", ")}`);
-                        lines.push(`  By severity: ${Object.entries(bySev).map(([k, v]) => `${k}: ${v}`).join(", ")}`);
-                      }
-
-                      return lines.join("\n");
-                    });
-                    await note(out);
+                    // CR-15: same windowed report as the code_review_trends tool.
+                    const report = await readTrendReport(arg ? parseInt(arg, 10) : TREND_WINDOW_DEFAULT);
+                    await note(report ? renderTrendReport(report) : "Failed to read trends.");
                   } catch (err) {
                     await note(`Failed to read trends: ${err instanceof Error ? err.message : String(err)}`);
                   }
@@ -4961,7 +4984,8 @@ export const __test__ = {
   walkDir,
   formatReviewResult,
   computeStats,
-  getTrendData,
+  readTrendReport,
+  renderTrendReport,
   persistReview,
   loadReviewFindings,
   listAvailableModels,

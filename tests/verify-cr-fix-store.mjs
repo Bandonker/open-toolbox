@@ -250,7 +250,11 @@ const run = (name, args) =>
     .replace(/(^|[^:"'`\\])\/\/[^\n]*/g, "$1");
   check("no dynamic .ts imports remain in the plugin (CR-11)", !/import\(\s*["'`]\.{1,2}\/[^"'`]*\.ts["'`]\s*\)/.test(code));
   check("no reach-through into peer plugins remains (CR-11)", !/integrateWith|__test__\.(remember|save)|await import\(/.test(code));
-  check("peer integrations are announced as unwired once (CR-11)", /not wired/.test(code));
+  // CR-11: the one-shot "not wired" console.debug was removed along with the
+  // reach-through it announced. The guarantee is now structural — the plugin
+  // must contain no peer-integration call sites at all — asserted by the two
+  // checks above rather than by a magic string inside a debug message.
+  check("the peer-integration notice is gone (CR-11)", !/not wired/.test(code));
   check("the dead fix_tracking schema is gone (CR-16)", !/CREATE TABLE IF NOT EXISTS fix_tracking/.test(code));
   check("every statement stays parameterized (SQL)", !/query\(\s*[`"'][^`"']*`\s*\+\s*/.test(code));
 }
