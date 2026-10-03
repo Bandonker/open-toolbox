@@ -1,7 +1,7 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { openDatabase, applyPragmas, type AnyDatabase } from "../lib/sqlite.ts";
@@ -59,6 +59,9 @@ const BUDGETS: Record<Depth, Budget> = {
   standard: { fanout: 7, maxChildren: 14, maxRounds: 2, perChildSec: 300, totalSec: 1200 },
   deep: { fanout: 10, maxChildren: 24, maxRounds: 3, perChildSec: 480, totalSec: 3000 },
 };
+
+/** How many taxonomy angles a depth covers, used by inline mode. */
+const budgetAngleCount = (depth: Depth): number => BUDGETS[depth].fanout;
 
 /**
  * The angle taxonomy. Deterministic by design: it guarantees breadth without
@@ -503,24 +506,25 @@ type Resolved = {
 /**
  * Decide what agent/model the research children run under.
  *
- * Preference order: the parent's own model (so research costs the same as the
- * conversation), then a config override, then the first model the host reports.
- * Returning nothing leaves the host to choose, which in practice meant children
- * idling for the full per-child deadline and returning nothing.
+ * An explicit override wins over inheritance: the user asked for a specific
+ * model, and inheriting the parent's spends the parent's quota — which is how
+ * a 10-agent run died against an exhausted key. Otherwise inherit the parent's
+ * model so research costs what the conversation does, then fall back to the
+ * first model the host reports.
  */
 async function resolveAgentModel(c: any, cfg: Config, parent: ParentInfo): Promise<Resolved> {
   const out: Resolved = {};
   if (parent?.agent) out.agent = String(parent.agent);
-  if (parent?.model?.modelID && parent?.model?.providerID) {
-    out.model = { modelID: parent.model.modelID, providerID: parent.model.providerID };
-    return out;
-  }
   if (cfg.model) {
     const slash = cfg.model.indexOf("/");
     if (slash > 0) {
       out.model = { providerID: cfg.model.slice(0, slash), modelID: cfg.model.slice(slash + 1) };
       return out;
     }
+  }
+  if (parent?.model?.modelID && parent?.model?.providerID) {
+    out.model = { modelID: parent.model.modelID, providerID: parent.model.providerID };
+    return out;
   }
   try {
     const list = (await withTimeout(c.model?.list?.(), 10_000, "model.list")) as
@@ -543,6 +547,29 @@ type ParentInfo = {
   model?: { modelID?: string; providerID?: string };
   agent?: string;
 };
+
+/**
+ * Re-read `config.json` from the plugin dir at the start of each run.
+ *
+ * Env vars and host plugin config are both read once at setup, so changing
+ * which model research uses required restarting opencode. This file is read per
+ * run, so pinning research to a free or cheaper model takes effect immediately.
+ */
+function runtimeOverrides(cfg: Config): Partial<Config> {
+  try {
+    const path = join(cfg.dir, "config.json");
+    if (!existsSync(path)) return {};
+    const raw = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    const out: Partial<Config> = {};
+    if (typeof raw.model === "string" && raw.model) out.model = raw.model;
+    if (typeof raw.maxConcurrent === "number" && raw.maxConcurrent > 0) {
+      out.maxConcurrent = Math.min(8, Math.max(1, Math.floor(raw.maxConcurrent)));
+    }
+    return out;
+  } catch {
+    return {};
+  }
+}
 
 type ChildHandle = {
   spec: ChildSpec;
@@ -813,6 +840,25 @@ export default Plugin.define({
 
     const cancelled = new Set<string>();
 
+    const inlineBrief = (topic: string, depth: Depth): string => {
+      const n = Math.min(budgetAngleCount(depth), ANGLES.length);
+      return [
+        `Deep research brief: **${topic}**`,
+        "",
+        `Work through these ${n} angles in order, in this session. Use your tools to actually investigate`,
+        "rather than answering from recall, and prefer primary sources. For each angle, state what you",
+        "established, what evidence supports it, and what you could not resolve.",
+        "",
+        ...ANGLES.slice(0, n).map((a, i) => `${i + 1}. **${a.id}** — ${a.brief}`),
+        "",
+        "Finish with a section `## Open questions` listing everything you could not establish and what",
+        "would be needed to settle it. Cite evidence inline for every substantive claim, and where sources",
+        "disagree, present the disagreement rather than picking a side.",
+        "",
+        `Depth: ${depth}. Write to that standard.`,
+      ].join("\n");
+    };
+
     const orchestrator = async (
       topic: string,
       depth: Depth,
@@ -825,7 +871,11 @@ export default Plugin.define({
       const deadline = startedAt + budget.totalSec * 1000;
       // Resolve once per run so every child is comparable and the model list is
       // not re-fetched per agent.
-      const resolved = await resolveAgentModel(c, cfg, parentInfo ?? {});
+      // Resolve once per run so every child is comparable and the model list is
+      // not re-fetched per agent. A config.json override is applied here so the
+      // model can be changed without restarting the host.
+      const rcfg: Config = { ...cfg, ...runtimeOverrides(cfg) };
+      const resolved = await resolveAgentModel(c, rcfg, parentInfo ?? {});
       log(
         `run ${runId}: children will use ${resolved.model ? `${resolved.model.providerID}/${resolved.model.modelID}` : "host default"}`,
       );
@@ -896,7 +946,7 @@ export default Plugin.define({
           parentID,
           deadline,
           budget.perChildSec * 1000,
-          cfg.maxConcurrent,
+          rcfg.maxConcurrent,
           resolved,
         );
         results.push(...batch);
@@ -963,13 +1013,52 @@ export default Plugin.define({
             depth: z
               .enum(["quick", "standard", "deep"])
               .optional()
-              .describe("quick=4 agents/1 round, standard=7 agents/2 rounds, deep=10 agents/3 rounds"),
+              .describe("quick=4 angles, standard=7, deep=10"),
+            mode: z
+              .enum(["inline", "parallel"])
+              .optional()
+              .describe(
+                "inline (default): this session does the research itself, no child sessions. parallel: fan out to N child sessions, which is the only way to get true concurrency.",
+              ),
           }),
           execute: async (input: any, toolCtx: any) => {
             const topic = String(input.topic ?? "").trim();
             const depth = (input.depth ?? "standard") as Depth;
             if (topic.length < 3) return { content: "deep_research failed: topic is too short" };
             const parentID = toolCtx.sessionID;
+            const mode = (input.mode ?? "inline") as "inline" | "parallel";
+            // Inline mode: no child sessions at all. The brief goes to this
+            // session and the model does the work here, which is what the user
+            // asked for by default. It cannot be parallel — session.create is
+            // the only concurrency primitive the plugin API offers — so the
+            // angles are worked in sequence.
+            if (mode === "inline") {
+              const runId = randomUUID().replace(/-/g, "").slice(0, 8);
+              storeRun(getDb(), {
+                id: runId,
+                topic,
+                depth,
+                status: "done",
+                startedAt: Date.now(),
+                finishedAt: Date.now(),
+                rounds: 1,
+                children: 0,
+                claims: 0,
+                reportPath: null,
+                summary: "inline (no child sessions)",
+              });
+              await c.session.prompt({ sessionID: parentID, text: inlineBrief(topic, depth) });
+              return {
+                content: [
+                  `deep research brief delivered: ${runId}`,
+                  `topic: ${topic}`,
+                  `depth: ${depth} · mode: inline (no child sessions created)`,
+                  "",
+                  "The research brief is in this session. Answer it here — angles are worked in sequence,",
+                  "since parallel agents require separate sessions.",
+                ].join("\n"),
+              };
+            }
             try {
               const { runId, text, claims, failureDetail } = await orchestrator(topic, depth, parentID, {
                 model: toolCtx?.model,
@@ -1065,16 +1154,22 @@ export default Plugin.define({
             "Suggest appending `depth=quick|standard|deep` (standard if they do not say).",
           ].join("\n");
         }
-        const m = raw.match(/^(.*?)(?:\s+depth\s*=\s*(quick|standard|deep))?$/is);
+        const m = raw.match(
+          /^(.*?)(?:\s+depth\s*=\s*(quick|standard|deep))?(?:\s+mode\s*=\s*(inline|parallel))?$/is,
+        );
         const topic = (m?.[1] ?? raw).trim();
         const depth = m?.[2] ?? "standard";
+        const mode = m?.[3] ?? "inline";
         return [
           `The user wants deep research on this topic:`,
           "",
           topic,
           "",
-          `Call the \`deep_research\` tool with topic=${JSON.stringify(topic)} and depth=${JSON.stringify(depth)}.`,
-          "Do not answer from memory — the tool dispatches real research agents and returns their findings for you to synthesise into a report.",
+          `Call the \`deep_research\` tool with topic=${JSON.stringify(topic)}, depth=${JSON.stringify(depth)} and mode=${JSON.stringify(mode)}.`,
+          mode === "parallel"
+            ? "Use mode=parallel: the tool dispatches research agents in parallel child sessions and returns their findings for you to synthesise."
+            : "Use mode=inline: answer the research brief yourself in this session, working the angles in sequence. Do not spawn child sessions.",
+          "Do not answer from memory.",
         ].join("\n");
       },
     });

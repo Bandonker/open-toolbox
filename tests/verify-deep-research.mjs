@@ -101,7 +101,21 @@ check(
 /* ------------------------------------------------------------- happy path */
 
 const toolCtx = { sessionID: "parent-1" };
-const run = await byName.get("deep_research").execute({ topic: "test topic for deep research", depth: "quick" }, toolCtx);
+/* ------------------------------------------------------------- inline mode */
+
+// Default is inline: no child sessions, brief delivered to this session.
+const inlineBefore = created;
+const inlineRun = await byName.get("deep_research").execute({ topic: "inline topic test" }, toolCtx);
+check("inline mode delivers a brief to the current session", inlineRun.content.includes("mode: inline"));
+check("inline mode creates no child sessions", created === inlineBefore, `created ${inlineBefore} -> ${created}`);
+check("inline mode returns a run id", /deep research brief delivered: [0-9a-f]{8}/.test(inlineRun.content), inlineRun.content.split("\n")[0]);
+
+/* ------------------------------------------------------------- happy path */
+
+// mode=parallel fans out to child sessions and writes a report.
+const run = await byName
+  .get("deep_research")
+  .execute({ topic: "test topic for deep research", depth: "quick", mode: "parallel" }, toolCtx);
 const runText = run.content;
 
 check("deep_research returns a run id", /deep research complete: [0-9a-f]{8}/.test(runText), runText.split("\n")[0]);
@@ -134,6 +148,10 @@ if (commands.has("deep-research")) {
   check("command builds a tool call", built.includes("deep_research"), built.split("\n").pop());
   check("command extracts depth=deep", built.includes('"deep"'));
   check("command extracts the topic", built.includes("quantum error correction"));
+  check("command defaults to inline mode", built.includes('"inline"'));
+  check("command tells the model not to spawn for inline", /Do not spawn child sessions/.test(built));
+  const par = spec.build("some topic mode=parallel", new Set());
+  check("command extracts mode=parallel", par.includes('"parallel"'));
   const noTopic = spec.build("", new Set());
   check("command handles no topic", noTopic.includes("no topic"));
 }
