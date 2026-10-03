@@ -1,0 +1,902 @@
+import { Plugin } from "@opencode/plugin";
+import { z } from "zod";
+import { randomUUID } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { openDatabase, applyPragmas, type AnyDatabase } from "../lib/sqlite.ts";
+import { envStr, asInt } from "../lib/config.ts";
+import { registerCommand } from "../lib/command-registry.ts";
+
+/**
+ * deep-research
+ *
+ * Autonomous multi-agent research, in the spirit of ChatGPT's Deep Research.
+ *
+ * How it works:
+ *   1. PLAN      — the topic is fanned out across a fixed taxonomy of research
+ *                  ANGLES (definition, current state, alternatives, risks,
+ *                  evidence, prior art, economics, constraints, adoption,
+ *                  benchmarks). Each angle becomes one independent brief.
+ *   2. FAN OUT   — every brief runs as its own real child session, in
+ *                  parallel, briefed with a strict output contract so the
+ *                  results parse reliably.
+ *   3. COLLECT   — each child is polled until it goes idle or hits its
+ *                  deadline (interrupted, never abandoned mid-burn), and its
+ *                  findings are parsed into structured claims.
+ *   4. ITERATE   — children report the gaps they hit; those become the next
+ *                  round's briefs, deduplicated against what is already
+ *                  covered, until the round or child budget runs out.
+ *   5. SYNTHESISE— the collected claims are deduped, ranked, and conflicting
+ *                  claims flagged, then handed back to the parent session so
+ *                  the model writes the narrative report. The digest is also
+ *                  written to disk and stored in SQLite for later recall.
+ *
+ * The orchestration (fan-out, budgets, deadlines, collection, dedup) is
+ * deterministic code; the actual research and the final narrative are done by
+ * the model. Nothing here assumes a particular model or provider.
+ */
+
+const DB_NAME = "deep-research.db";
+
+type Depth = "quick" | "standard" | "deep";
+
+type Budget = {
+  /** Angles fanned out in the first round. */
+  fanout: number;
+  /** Hard ceiling on child sessions across all rounds. */
+  maxChildren: number;
+  /** Gap-driven follow-up rounds after the first. */
+  maxRounds: number;
+  /** Per-child wall clock before we interrupt it. */
+  perChildSec: number;
+  /** Whole-run wall clock. */
+  totalSec: number;
+};
+
+const BUDGETS: Record<Depth, Budget> = {
+  quick: { fanout: 4, maxChildren: 6, maxRounds: 1, perChildSec: 180, totalSec: 420 },
+  standard: { fanout: 7, maxChildren: 14, maxRounds: 2, perChildSec: 300, totalSec: 1200 },
+  deep: { fanout: 10, maxChildren: 24, maxRounds: 3, perChildSec: 480, totalSec: 3000 },
+};
+
+/**
+ * The angle taxonomy. Deterministic by design: it guarantees breadth without
+ * spending a model turn on decomposition, and every angle is a genuinely
+ * different way to attack a topic rather than a reworded question.
+ */
+const ANGLES: Array<{ id: string; brief: string }> = [
+  { id: "definition", brief: "What exactly is it, how is it defined, and what does it explicitly exclude?" },
+  { id: "current-state", brief: "How does this work today in practice, and what is the current mainstream approach?" },
+  { id: "alternatives", brief: "What are the credible alternatives, and how do they compare on the dimensions that matter?" },
+  { id: "risks", brief: "What are the main risks, failure modes, and known problems? Include what breaks under load or at scale." },
+  { id: "evidence", brief: "What evidence, data, or measurements support the claims? Separate measured facts from assertions." },
+  { id: "prior-art", brief: "What prior art, related work, or adjacent fields have solved part of this, and what can be borrowed?" },
+  { id: "economics", brief: "What does it cost — money, time, compute, or engineering effort — and how does that scale?" },
+  { id: "constraints", brief: "What are the hard constraints: legal, regulatory, technical, organisational, or ecosystem?" },
+  { id: "adoption", brief: "Who is actually using this, at what scale, and what does adoption look like in the wild?" },
+  { id: "benchmarks", brief: "What benchmarks, metrics, or evaluations exist, and what would a good score look like?" },
+];
+
+type Claim = {
+  angle: string;
+  text: string;
+  evidence: string;
+  confidence: "high" | "medium" | "low";
+};
+
+type ChildResult = {
+  angle: string;
+  brief: string;
+  claimCount: number;
+  claims: Claim[];
+  summary: string;
+  gaps: string[];
+  ok: boolean;
+  error?: string;
+  ms: number;
+};
+
+type RunRow = {
+  id: string;
+  topic: string;
+  depth: Depth;
+  status: "running" | "done" | "failed" | "cancelled";
+  startedAt: number;
+  finishedAt: number | null;
+  rounds: number;
+  children: number;
+  claims: number;
+  reportPath: string | null;
+  summary: string;
+};
+
+/* ------------------------------------------------------------------ config */
+
+type Config = {
+  enabled: boolean;
+  dir: string;
+  maxConcurrent: number;
+};
+
+function defaultDir(): string {
+  const home = homedir();
+  return process.platform === "win32"
+    ? join(process.env.USERPROFILE ?? home, ".opencode-plugins", "deep-research")
+    : join(home, ".opencode-plugins", "deep-research");
+}
+
+function loadConfig(raw?: Record<string, unknown>): Config {
+  const o = raw ?? {};
+  return {
+    enabled: process.env.OPENCODE_DEEP_RESEARCH_ENABLED !== "0",
+    dir: typeof o.dir === "string" && o.dir ? o.dir : envStr("OPENCODE_DEEP_RESEARCH_DIR") ?? defaultDir(),
+    maxConcurrent: Math.min(
+      8,
+      Math.max(1, asInt(o.maxConcurrent, asInt(envStr("OPENCODE_DEEP_RESEARCH_CONCURRENCY"), 4))),
+    ),
+  };
+}
+
+/* ------------------------------------------------------------------ schema */
+
+function initSchema(db: AnyDatabase): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS deep_research_runs (
+      id TEXT PRIMARY KEY,
+      topic TEXT NOT NULL,
+      depth TEXT NOT NULL,
+      status TEXT NOT NULL,
+      started_at INTEGER NOT NULL,
+      finished_at INTEGER,
+      rounds INTEGER NOT NULL DEFAULT 0,
+      children INTEGER NOT NULL DEFAULT 0,
+      claims INTEGER NOT NULL DEFAULT 0,
+      report_path TEXT,
+      summary TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_dr_started ON deep_research_runs(started_at DESC);
+  `);
+  // Additive migrations for databases created by older versions.
+  const cols = new Set(
+    (db.prepare("PRAGMA table_info(deep_research_runs)").all() as Array<{ name: string }>).map(
+      (r) => r.name,
+    ),
+  );
+  for (const [name, decl] of [
+    ["rounds", "INTEGER NOT NULL DEFAULT 0"],
+    ["children", "INTEGER NOT NULL DEFAULT 0"],
+    ["claims", "INTEGER NOT NULL DEFAULT 0"],
+    ["report_path", "TEXT"],
+    ["summary", "TEXT NOT NULL DEFAULT ''"],
+  ] as const) {
+    if (!cols.has(name)) {
+      try {
+        db.exec(`ALTER TABLE deep_research_runs ADD COLUMN ${name} ${decl}`);
+      } catch {
+        /* concurrent open already added it */
+      }
+    }
+  }
+}
+
+/* --------------------------------------------------------------- utilities */
+
+const log = (msg: string): void => {
+  console.error(`[deep-research] ${msg}`);
+};
+
+const withTimeout = async <T>(p: Promise<T>, ms: number, label: string): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      p,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+};
+
+function assistantTextOf(message: unknown): string {
+  const content = (message as { content?: unknown })?.content;
+  if (typeof content === "string") return content.trim();
+  if (Array.isArray(content)) {
+    return content
+      .filter((p) => p && typeof p === "object" && (p as { type?: string }).type === "text")
+      .map((p) => String((p as { text?: unknown }).text ?? ""))
+      .join("\n")
+      .trim();
+  }
+  return "";
+}
+
+function newestAssistantText(messages: unknown): string {
+  if (!Array.isArray(messages)) return "";
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i] as { type?: string };
+    if (m?.type !== "assistant") continue;
+    const text = assistantTextOf(m);
+    if (text) return text;
+  }
+  return "";
+}
+
+/** Best-effort idle detection; unknown shapes simply mean "keep waiting". */
+function looksIdle(info: unknown): boolean {
+  if (!info || typeof info !== "object") return false;
+  const o = info as Record<string, unknown>;
+  const status = typeof o.status === "string" ? o.status.toLowerCase() : "";
+  if (status === "idle" || status === "completed" || status === "done") return true;
+  const time = o.time as { completed?: unknown } | undefined;
+  if (time && typeof time === "object" && typeof time.completed === "number") return true;
+  return false;
+}
+
+const STOPWORDS = new Set([
+  "the", "and", "for", "with", "that", "this", "from", "what", "how", "does", "are", "was",
+  "into", "their", "they", "them", "its", "his", "her", "our", "your", "have", "has", "had",
+  "about", "which", "when", "where", "who", "why", "can", "will", "would", "should", "could",
+]);
+
+/** Content words of a question, used to dedup overlapping follow-up briefs. */
+function keywords(s: string): Set<string> {
+  const out = new Set<string>();
+  for (const raw of s.toLowerCase().split(/[^a-z0-9+]+/)) {
+    if (raw.length < 4 || STOPWORDS.has(raw)) continue;
+    out.add(raw);
+  }
+  return out;
+}
+
+/** Jaccard overlap — above the threshold we treat two briefs as the same. */
+function overlap(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let shared = 0;
+  for (const w of a) if (b.has(w)) shared += 1;
+  return shared / (a.size + b.size - shared);
+}
+
+/* ------------------------------------------------------------------ prompts */
+
+function childBrief(topic: string, angle: { id: string; brief: string }, round: number): string {
+  return [
+    `You are one member of a deep-research team investigating: ${topic}`,
+    "",
+    `Your assigned angle — ${angle.id}:`,
+    angle.brief,
+    round > 0
+      ? "This is a follow-up round. Go deeper than the obvious answer, and resolve the specific gap you were pointed at."
+      : "",
+    "",
+    "Work independently and autonomously. Use your tools to actually investigate rather than relying on recall alone.",
+    "Prefer primary sources. If you cannot verify something, say so explicitly rather than asserting it.",
+    "",
+    "Return your findings in EXACTLY this format and nothing else after it:",
+    "",
+    "FINDINGS:",
+    '<json array>["{\\"angle\\":\\"' + angle.id + '\\",\\"text\\":\\"one specific claim\\",\\"evidence\\":\\"source, measurement, or why this is well established\\",\\"confidence\\":\\"high|medium|low\\"}"]</json array>',
+    "",
+    "SUMMARY:",
+    "Two or three sentences on what you found for this angle.",
+    "",
+    "GAPS:",
+    "- <something you could not resolve, or a question this angle opened that another angle should chase>",
+    "- <omit this line entirely if you had no gaps>",
+    "",
+    `Aim for 3-8 findings. Be specific and non-generic; every finding must be something you would defend.`,
+  ]
+    .filter((line) => line !== "")
+    .join("\n");
+}
+
+function synthesisPrompt(
+  topic: string,
+  depth: Depth,
+  digest: string,
+  stats: { children: number; claims: number; rounds: number; failures: number },
+): string {
+  return [
+    `Deep research complete for: **${topic}**`,
+    "",
+    `A team of ${stats.children} research agents worked this topic across ${stats.rounds} round(s) and produced ${stats.claims} findings` +
+      (stats.failures > 0 ? ` (${stats.failures} agent(s) failed or timed out)` : "") +
+      `.`,
+    "",
+    "Below is the deduplicated, evidence-annotated digest of their findings. Conflicts between agents are marked.",
+    "",
+    "---",
+    digest,
+    "---",
+    "",
+    "Write the final report. Requirements:",
+    "- Open with a direct 3-5 sentence answer to the question, not a preamble.",
+    "- Organise by theme, not by which agent found what.",
+    "- Cite the evidence inline for every substantive claim; where agents disagree, present the disagreement rather than silently picking a side.",
+    "- State clearly what could not be established, and what would need to be checked to settle it.",
+    "- No filler, no restating the digest's structure. This is depth=" + depth + " — write to that standard.",
+    "",
+    "Then add a short `## Open questions` section listing the gaps the agents reported.",
+  ].join("\n");
+}
+
+/* ------------------------------------------------------------------- parsing */
+
+/** Pull the structured findings out of a child reply, tolerating noise. */
+function parseChild(text: string, angle: { id: string; brief: string }, ms: number): ChildResult {
+  const result: ChildResult = {
+    angle: angle.id,
+    brief: angle.brief,
+    claimCount: 0,
+    claims: [],
+    summary: "",
+    gaps: [],
+    ok: false,
+    ms,
+  };
+  if (!text.trim()) {
+    result.error = "no assistant text";
+    return result;
+  }
+
+  const summary = text.match(/SUMMARY:\s*([\s\S]*?)(?:\n\s*GAPS:|$)/i);
+  if (summary) result.summary = summary[1]!.trim();
+
+  const gapsBlock = text.match(/GAPS:\s*([\s\S]*)$/i);
+  if (gapsBlock) {
+    result.gaps = gapsBlock[1]!
+      .split("\n")
+      .map((l) => l.replace(/^[\s\-*·]+/, "").trim())
+      .filter((l) => l.length > 8)
+      .slice(0, 6);
+  }
+
+  // Findings: prefer the fenced json array, then any bracketed array.
+  const fenced = text.match(/<json array>\s*(\[[\s\S]*?\])\s*<\/json array>/i);
+  const raw = fenced?.[1] ?? text.match(/(\[\s*\{[\s\S]*?\}\s*\])/)?.[1];
+  if (raw) {
+    try {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) {
+        for (const entry of parsed) {
+          if (!entry || typeof entry !== "object") continue;
+          const e = entry as Record<string, unknown>;
+          const text_ = String(e.text ?? e.claim ?? "").trim();
+          if (!text_) continue;
+          const conf = String(e.confidence ?? "").toLowerCase();
+          result.claims.push({
+            angle: angle.id,
+            text: text_,
+            evidence: String(e.evidence ?? "").trim(),
+            confidence: conf === "high" || conf === "medium" || conf === "low" ? conf : "medium",
+          });
+        }
+      }
+    } catch {
+      /* fall through to the prose fallback below */
+    }
+  }
+
+  // Prose fallback: a child that ignored the contract still contributed text.
+  if (result.claims.length === 0) {
+    const prose = text
+      .replace(/<json array>[\s\S]*?<\/json array>/gi, "")
+      .replace(/^(FINDINGS|SUMMARY|GAPS)\s*:?\s*$/gim, "")
+      .trim();
+    const lines = prose
+      .split("\n")
+      .map((l) => l.replace(/^[\s\-*·]+\s*/, "").trim())
+      .filter((l) => l.length > 24);
+    // Only trust prose if it has some shape to it, not a stray sentence.
+    if (lines.length >= 2) {
+      for (const l of lines.slice(0, 6)) {
+        result.claims.push({ angle: angle.id, text: l, evidence: "", confidence: "low" });
+      }
+    }
+  }
+
+  result.claimCount = result.claims.length;
+  result.ok = result.claims.length > 0 || result.summary.length > 0;
+  if (!result.ok) result.error = "reply contained no parsable findings";
+  return result;
+}
+
+/** Dedup claims, flag near-duplicate contradictions, rank by confidence. */
+function digestClaims(all: Claim[]): { digest: string; unique: number; conflicts: number } {
+  const kept: Claim[] = [];
+  for (const c of all) {
+    const kw = keywords(c.text);
+    const dup = kept.some((k) => overlap(keywords(k.text), kw) > 0.72);
+    if (!dup) kept.push(c);
+  }
+  const rank = { high: 0, medium: 1, low: 2 } as const;
+  kept.sort((a, b) => rank[a.confidence] - rank[b.confidence]);
+
+  let conflicts = 0;
+  const lines: string[] = [];
+  for (const c of kept) {
+    const kw = keywords(c.text);
+    // A same-angle, high-similarity pair that reads differently is a conflict.
+    if (
+      c.confidence !== "low" &&
+      kept.some(
+        (o) =>
+          o !== c &&
+          o.angle === c.angle &&
+          rank[o.confidence] !== rank[c.confidence] &&
+          overlap(keywords(o.text), kw) > 0.45 &&
+          o.text !== c.text,
+      )
+    ) {
+      conflicts += 1;
+      lines.push(`- **[${c.angle}] ${c.text}** (${c.confidence}) ^conflict`);
+    } else {
+      lines.push(`- **[${c.angle}] ${c.text}** (${c.confidence})${c.evidence ? ` — ${c.evidence}` : ""}`);
+    }
+  }
+  return { digest: lines.join("\n"), unique: kept.length, conflicts };
+}
+
+/* --------------------------------------------------------------- child run */
+
+type ChildSpec = { angle: { id: string; brief: string }; prompt: string };
+
+type ChildHandle = {
+  spec: ChildSpec;
+  id: string;
+  title: string;
+};
+
+async function runChild(
+  c: any,
+  spec: ChildSpec,
+  parentID: string,
+  deadlineMs: number,
+  perChildMs: number,
+): Promise<ChildResult> {
+  const started = Date.now();
+  let childID: string;
+  try {
+    const created = (await withTimeout(
+      c.session.create({
+        title: `deep-research:${spec.angle.id}`,
+        metadata: { parentSessionID: parentID, spawnedBy: "deep-research" },
+      }),
+      15_000,
+      "session.create",
+    )) as { id?: string };
+    if (!created?.id) throw new Error("session.create returned no id");
+    childID = created.id;
+  } catch (err) {
+    return {
+      angle: spec.angle.id,
+      brief: spec.angle.brief,
+      claimCount: 0,
+      claims: [],
+      summary: "",
+      gaps: [],
+      ok: false,
+      error: `create failed: ${String(err)}`,
+      ms: Date.now() - started,
+    };
+  }
+
+  try {
+    await withTimeout(
+      c.session.prompt({ sessionID: childID, text: spec.prompt }),
+      Math.max(1_000, Math.min(perChildMs, deadlineMs - Date.now())),
+      "session.prompt",
+    );
+  } catch (err) {
+    log(`child ${spec.angle.id}: prompt failed: ${String(err)}`);
+  }
+
+  // Poll until the child goes idle, finishes its reply, or the deadline hits.
+  const hardStop = Math.min(deadlineMs, started + perChildMs);
+  let text = "";
+  let lastLen = -1;
+  let stableSince = 0;
+  while (Date.now() < hardStop) {
+    try {
+      const info = await withTimeout(c.session.get({ sessionID: childID }), 10_000, "session.get");
+      const messages = await withTimeout(
+        c.session.context({ sessionID: childID }),
+        10_000,
+        "session.context",
+      );
+      text = newestAssistantText(messages);
+      // A completed reply is detectable without a status probe: the child was
+      // told to end with a GAPS: section (or produce no text at all).
+      const looksDone = /\bGAPS\s*:/i.test(text) || /^\s*$/.test(text);
+      if (looksDone || looksIdle(info)) break;
+      // Growing text that has stopped moving is a reasonable secondary exit,
+      // but only after it has been stable for a few polls.
+      if (text.length === lastLen && text.length > 0) {
+        if (stableSince === 0) stableSince = Date.now();
+        else if (Date.now() - stableSince > 15_000) break;
+      } else {
+        stableSince = 0;
+      }
+      lastLen = text.length;
+    } catch (err) {
+      log(`child ${spec.angle.id}: poll failed: ${String(err)}`);
+      break;
+    }
+    await new Promise((r) => setTimeout(r, 2_000));
+  }
+
+  if (Date.now() >= hardStop) {
+    // Never leave a child burning tokens past its budget.
+    try {
+      await withTimeout(c.session.interrupt({ sessionID: childID }), 8_000, "session.interrupt");
+      log(`child ${spec.angle.id}: deadline reached, interrupted`);
+    } catch {
+      /* best effort */
+    }
+  }
+
+  return parseChild(text, spec.angle, Date.now() - started);
+}
+
+/** Run a batch with a concurrency ceiling, aborting cleanly on cancellation. */
+async function runBatch(
+  c: any,
+  specs: ChildSpec[],
+  parentID: string,
+  deadlineMs: number,
+  perChildMs: number,
+  limit: number,
+): Promise<ChildResult[]> {
+  const out: ChildResult[] = [];
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(limit, specs.length)) }, async () => {
+    while (next < specs.length) {
+      if (Date.now() >= deadlineMs) return;
+      const spec = specs[next++]!;
+      out.push(await runChild(c, spec, parentID, deadlineMs, perChildMs));
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/* ------------------------------------------------------------------ storage */
+
+function storeRun(db: AnyDatabase, row: RunRow): void {
+  db.prepare(
+    `INSERT INTO deep_research_runs
+       (id, topic, depth, status, started_at, finished_at, rounds, children, claims, report_path, summary)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       status = excluded.status,
+       finished_at = excluded.finished_at,
+       rounds = excluded.rounds,
+       children = excluded.children,
+       claims = excluded.claims,
+       report_path = excluded.report_path,
+       summary = excluded.summary`,
+  ).run(
+    row.id,
+    row.topic,
+    row.depth,
+    row.status,
+    row.startedAt,
+    row.finishedAt,
+    row.rounds,
+    row.children,
+    row.claims,
+    row.reportPath,
+    row.summary,
+  );
+}
+
+function writeReport(
+  cfg: Config,
+  runId: string,
+  topic: string,
+  depth: Depth,
+  results: ChildResult[],
+  digest: string,
+  stats: { children: number; claims: number; rounds: number; failures: number; ms: number },
+): string {
+  mkdirSync(cfg.dir, { recursive: true });
+  const path = join(cfg.dir, `${runId}.md`);
+  const lines: string[] = [
+    `# Deep research: ${topic}`,
+    "",
+    `- run: \`${runId}\``,
+    `- depth: ${depth}`,
+    `- agents: ${stats.children} across ${stats.rounds} round(s)`,
+    `- findings: ${stats.claims} (${stats.failures} agent failure(s))`,
+    `- elapsed: ${Math.round(stats.ms / 1000)}s`,
+    "",
+    "## Findings",
+    "",
+    digest || "_No findings were returned._",
+    "",
+    "## Per-agent summaries",
+    "",
+  ];
+  for (const r of results) {
+    lines.push(`### ${r.angle}`);
+    lines.push("");
+    lines.push(`*Brief:* ${r.brief}`);
+    lines.push("");
+    if (r.ok) {
+      if (r.summary) lines.push(r.summary);
+      for (const g of r.gaps) lines.push(`- gap: ${g}`);
+    } else {
+      lines.push(`_Failed: ${r.error ?? "unknown"}_`);
+    }
+    lines.push("");
+  }
+  writeFileSync(path, lines.join("\n"), "utf8");
+  return path;
+}
+
+/* -------------------------------------------------------------------- plugin */
+
+export default Plugin.define({
+  id: "deep-research",
+  async setup(c: any) {
+    const cfg = loadConfig(
+      (await (c as { config?: () => Promise<Record<string, unknown>> }).config?.()) ?? undefined,
+    );
+    if (!cfg.enabled) {
+      log("disabled via OPENCODE_DEEP_RESEARCH_ENABLED=0");
+      return;
+    }
+
+    mkdirSync(cfg.dir, { recursive: true });
+    let db: AnyDatabase | null = null;
+    const getDb = (): AnyDatabase => {
+      if (db) return db;
+      db = openDatabase(join(cfg.dir, DB_NAME));
+      applyPragmas(db);
+      initSchema(db);
+      return db;
+    };
+
+    const cancelled = new Set<string>();
+
+    const orchestrator = async (
+      topic: string,
+      depth: Depth,
+      parentID: string,
+    ): Promise<{ runId: string; text: string }> => {
+      const budget = BUDGETS[depth];
+      const runId = randomUUID().replace(/-/g, "").slice(0, 8);
+      const startedAt = Date.now();
+      const deadline = startedAt + budget.totalSec * 1000;
+      storeRun(getDb(), {
+        id: runId,
+        topic,
+        depth,
+        status: "running",
+        startedAt,
+        finishedAt: null,
+        rounds: 0,
+        children: 0,
+        claims: 0,
+        reportPath: null,
+        summary: "",
+      });
+      log(`run ${runId} start: ${JSON.stringify(topic)} depth=${depth}`);
+
+      const results: ChildResult[] = [];
+      const covered: Set<string>[] = [];
+      let childrenSpawned = 0;
+
+      for (let round = 1; round <= budget.maxRounds; round++) {
+        if (cancelled.has(parentID)) break;
+        const remaining = budget.maxChildren - childrenSpawned;
+        if (remaining <= 0 || Date.now() >= deadline) break;
+
+        // Round 1: fixed taxonomy, truncated to the fan-out budget.
+        // Later rounds: gaps the agents reported, deduped against coverage.
+        let specs: ChildSpec[];
+        if (round === 1) {
+          specs = ANGLES.slice(0, Math.min(budget.fanout, remaining)).map((a) => ({
+            angle: a,
+            prompt: childBrief(topic, a, 1),
+          }));
+        } else {
+          const seen = [...covered];
+          const gapAngles: ChildSpec[] = [];
+          const gapText: string[] = [];
+          for (const r of results) {
+            for (const g of r.gaps) {
+              const kw = keywords(g);
+              if (seen.some((s) => overlap(s, kw) > 0.5)) continue;
+              const spec = {
+                angle: { id: `${r.angle}#${gapText.length + 1}`, brief: g },
+                prompt: childBrief(topic, { id: "gap", brief: g }, round),
+              };
+              gapAngles.push(spec);
+              gapText.push(g);
+              covered.push(kw);
+              if (gapAngles.length >= Math.min(4, remaining)) break;
+            }
+            if (gapAngles.length >= Math.min(4, remaining)) break;
+          }
+          specs = gapAngles;
+        }
+
+        if (specs.length === 0) {
+          log(`run ${runId}: round ${round} produced no new briefs, stopping`);
+          break;
+        }
+
+        log(`run ${runId}: round ${round} fanning out ${specs.length} agent(s)`);
+        childrenSpawned += specs.length;
+        const batch = await runBatch(
+          c,
+          specs,
+          parentID,
+          deadline,
+          budget.perChildSec * 1000,
+          cfg.maxConcurrent,
+        );
+        results.push(...batch);
+        for (const b of batch) covered.push(keywords(`${b.angle} ${b.brief}`));
+
+        const failures = batch.filter((b) => !b.ok).length;
+        log(
+          `run ${runId}: round ${round} done — ${batch.length - failures}/${batch.length} ok, ` +
+            `${batch.reduce((s, b) => s + b.claimCount, 0)} findings`,
+        );
+        // A round where nothing worked will not improve with more rounds.
+        if (failures === batch.length) break;
+      }
+
+      const allClaims = results.flatMap((r) => r.claims);
+      const { digest, unique, conflicts } = digestClaims(allClaims);
+      const failures = results.filter((r) => !r.ok).length;
+      const stats = {
+        children: results.length,
+        claims: unique,
+        rounds: results.length > 0 ? 1 : 0,
+        failures,
+        ms: Date.now() - startedAt,
+      };
+
+      const reportPath = writeReport(cfg, runId, topic, depth, results, digest, stats);
+      const headline = `${unique} findings, ${conflicts} conflict(s), ${failures} failure(s)`;
+      storeRun(getDb(), {
+        id: runId,
+        topic,
+        depth,
+        status: cancelled.has(parentID) ? "cancelled" : "done",
+        startedAt,
+        finishedAt: Date.now(),
+        rounds: Math.max(1, budget.maxRounds === 1 ? 1 : 2),
+        children: results.length,
+        claims: unique,
+        reportPath,
+        summary: headline,
+      });
+      log(`run ${runId} complete: ${headline} in ${Math.round(stats.ms / 1000)}s -> ${reportPath}`);
+
+      const text = synthesisPrompt(topic, depth, digest, {
+        children: results.length,
+        claims: unique,
+        rounds: stats.rounds,
+        failures,
+      });
+      return { runId, text };
+    };
+
+    c.tool?.transform?.(
+      async (editor: { add: (t: unknown) => void }) => {
+        editor.add({
+          name: "deep_research",
+          description:
+            "Run autonomous multi-agent research on a topic. Fans out to parallel research agents across a taxonomy of angles, iterates on the gaps they report, then hands the synthesised findings back for a written report. Returns a run id and the digest; the final narrative is written into this session.",
+          input: z.object({
+            topic: z.string().min(3).describe("What to research"),
+            depth: z
+              .enum(["quick", "standard", "deep"])
+              .optional()
+              .describe("quick=4 agents/1 round, standard=7 agents/2 rounds, deep=10 agents/3 rounds"),
+          }),
+          execute: async (input: any, toolCtx: any) => {
+            const topic = String(input.topic ?? "").trim();
+            const depth = (input.depth ?? "standard") as Depth;
+            if (topic.length < 3) return { content: "deep_research failed: topic is too short" };
+            const parentID = toolCtx.sessionID;
+            try {
+              const { runId, text } = await orchestrator(topic, depth, parentID);
+              await c.session.prompt({ sessionID: parentID, text });
+              return {
+                content: [
+                  `deep research complete: ${runId}`,
+                  `topic: ${topic}`,
+                  `depth: ${depth}`,
+                  "",
+                  "The findings have been handed to this session for the final write-up.",
+                ].join("\n"),
+              };
+            } catch (err) {
+              log(`failed: ${String(err)}`);
+              return { content: `deep_research failed: ${String(err)}` };
+            }
+          },
+        });
+
+        editor.add({
+          name: "deep_research_runs",
+          description: "List recent deep-research runs, newest first, with their status and report paths.",
+          input: z.object({ limit: z.number().int().positive().max(50).optional() }),
+          execute: async (input: any) => {
+            try {
+              const limit = Math.min(50, Math.max(1, Number(input.limit ?? 10)));
+              const rows = getDb()
+                .prepare(
+                  `SELECT id, topic, depth, status, started_at, finished_at, children, claims, report_path, summary
+                   FROM deep_research_runs ORDER BY started_at DESC LIMIT ?`,
+                )
+                .all(limit) as Array<Record<string, unknown>>;
+              if (rows.length === 0) return { content: "No deep-research runs recorded yet." };
+              const lines = rows.map((r) => {
+                const secs =
+                  typeof r.finished_at === "number"
+                    ? `${Math.round((r.finished_at - Number(r.started_at)) / 1000)}s`
+                    : "—";
+                return [
+                  `## ${r.id} · ${r.status}`,
+                  `topic: ${r.topic}`,
+                  `depth: ${r.depth} · agents: ${r.children} · claims: ${r.claims} · ${secs}`,
+                  r.report_path ? `report: ${r.report_path}` : "",
+                  r.summary ? `summary: ${r.summary}` : "",
+                ]
+                  .filter(Boolean)
+                  .join("\n");
+              });
+              return { content: lines.join("\n\n") };
+            } catch (err) {
+              return { content: `deep_research_runs failed: ${String(err)}` };
+            }
+          },
+        });
+      },
+    );
+
+    c.tool?.hook?.("chat.message", async (event: any, output: any) => {
+      const parentID = event?.properties?.sessionID;
+      const text = String(output?.text ?? "");
+      if (parentID && /^\s*\/?cancel-research\b/i.test(text)) cancelled.add(parentID);
+    });
+
+    registerCommand("deep-research", {
+      description:
+        "Autonomous multi-agent research on a topic. Usage: /deep-research <topic> [depth=quick|standard|deep]",
+      requires: [],
+      build: (args) => {
+        const raw = args.trim();
+        if (!raw) {
+          return [
+            "The user invoked `/deep-research` with no topic.",
+            "",
+            "Ask them what to research, then call the `deep_research` tool with that topic.",
+            "Suggest appending `depth=quick|standard|deep` (standard if they do not say).",
+          ].join("\n");
+        }
+        const m = raw.match(/^(.*?)(?:\s+depth\s*=\s*(quick|standard|deep))?$/is);
+        const topic = (m?.[1] ?? raw).trim();
+        const depth = m?.[2] ?? "standard";
+        return [
+          `The user wants deep research on this topic:`,
+          "",
+          topic,
+          "",
+          `Call the \`deep_research\` tool with topic=${JSON.stringify(topic)} and depth=${JSON.stringify(depth)}.`,
+          "Do not answer from memory — the tool dispatches real research agents and returns their findings for you to synthesise into a report.",
+        ].join("\n");
+      },
+    });
+
+    log("ready (tools: deep_research, deep_research_runs; command: /deep-research)");
+  },
+});

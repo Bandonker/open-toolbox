@@ -29,7 +29,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { execSync } from "node:child_process";
+import { execFile } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
@@ -269,6 +269,30 @@ const PACKAGES = [
       ["OPENCODE_LOOP_GUARD_CANCEL_LIMIT", "8", "Consecutive identical calls/replies before cancelling the turn"],
       ["OPENCODE_LOOP_GUARD_NOTIFY", "true", "Post a note into the session when the guard acts"],
       ["OPENCODE_LOOP_GUARD_LOG", "false", "Log guard activity to stderr"],
+    ],
+  },
+  {
+    dir: "deep-research",
+    name: `${SCOPE}/opencode-deep-research`,
+    source: "plugins/deep-research.ts",
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/config.ts", dest: "lib/config.js" },
+      { src: "lib/command-registry.ts", dest: "lib/command-registry.js" },
+    ],
+    rewrites: {
+      "../lib/sqlite.ts": "./lib/sqlite.js",
+      "../lib/config.ts": "./lib/config.js",
+      "../lib/command-registry.ts": "./lib/command-registry.js",
+    },
+    description:
+      "Autonomous multi-agent research. Fans a topic out across a taxonomy of research angles as parallel child sessions, iterates on the gaps those agents report, then hands the deduplicated, conflict-flagged findings back for a written report.",
+    keywords: ["research", "deep-research", "agents", "analysis", "report", "parallel"],
+    tools: ["deep_research", "deep_research_runs"],
+    config: [
+      ["OPENCODE_DEEP_RESEARCH_ENABLED", "true", "Turn deep research off without uninstalling"],
+      ["OPENCODE_DEEP_RESEARCH_DIR", "~/.opencode-plugins/deep-research", "Where the SQLite history and markdown reports are written"],
+      ["OPENCODE_DEEP_RESEARCH_CONCURRENCY", "4", "Maximum research agents running at once"],
     ],
   },
   {
@@ -555,7 +579,28 @@ const PACKAGES = [
   },
 ];
 
+/**
+ * Transpiled output keyed by source path, shared across packages.
+ *
+ * `lib/sqlite.ts` alone is bundled into ~8 packages, `lib/config.ts` into ~7
+ * and `lib/redact.ts` into ~6, so a naive re-read + re-transpile per consumer
+ * paid for the same file seven or eight times per build. ts.transpileModule
+ * is a pure function of (source text, compilerOptions, fileName), and
+ * fileName is just relPath here, so the result is memoizable on relPath alone.
+ *
+ * Only the *pre-rewrite* output is cached. rewriteImports() runs per package
+ * on the way out, because the same helper legitimately maps to different dest
+ * specifiers in different packages. Caching post-rewrite text would need a
+ * (src, rewrites) composite key and would be wrong for the current callers.
+ *
+ * Safe for one process run: the build only ever writes under .packages-tmp/,
+ * never back into the source tree, so a cached entry cannot go stale mid-build.
+ */
+const transpileCache = new Map();
+
 function transpile(relPath) {
+  const cached = transpileCache.get(relPath);
+  if (cached !== undefined) return cached;
   const abs = resolve(root, relPath);
   if (!existsSync(abs)) throw new Error(`source not found: ${relPath}`);
   const source = readFileSync(abs, "utf8");
@@ -570,6 +615,7 @@ function transpile(relPath) {
     },
     fileName: relPath,
   }).outputText;
+  transpileCache.set(relPath, output);
   return output;
 }
 
@@ -608,7 +654,10 @@ export function assertNoTsImports(code, label) {
 function rewriteImports(code, rewrites) {
   let out = code;
   for (const [from, to] of Object.entries(rewrites)) {
-    out = out.split(`"${from}"`).join(`"${to}"`).split(`'${from}'`).join(`'${to}'`);
+    // replaceAll (literal string pattern) is exactly the old
+    // split(from).join(to) semantics -- both scan the original once, so
+    // neither cascades when `to` itself contains `from`.
+    out = out.replaceAll(`"${from}"`, `"${to}"`).replaceAll(`'${from}'`, `'${to}'`);
   }
   return out;
 }
@@ -715,19 +764,58 @@ function buildPackage(pkg, outRoot) {
   return { outDir, manifest, entry, helperDests };
 }
 
+/** How many `npm pack` processes may overlap during `--pack-check`. */
+const PACK_CHECK_CONCURRENCY = 4;
+
+/**
+ * Smoke-pack one built package.
+ *
+ * Async (`execFile`) rather than `execSync` because execSync blocks the event
+ * loop, which would make the pool below meaningless. The command is passed as
+ * a single fixed string under `shell: true` — byte-identical to the old
+ * execSync call, and unlike an args array it does not trip Node's DEP0190
+ * ("args to a child process with shell option true"). The command is a
+ * hardcoded constant, so there is nothing to inject.
+ */
 function packCheck(outDir) {
-  try {
-    const raw = execSync("npm pack --dry-run --json", {
+  return new Promise((done, fail) => {
+    execFile("npm pack --dry-run --json", {
       cwd: outDir,
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "pipe"],
+      shell: true,
+    }, (err, stdout, stderr) => {
+      if (err) {
+        const detail = String(stderr ?? "").trim().split("\n")[0] || err.message;
+        fail(new Error(`npm pack failed: ${detail}`));
+        return;
+      }
+      try {
+        const info = JSON.parse(stdout)[0];
+        done({ files: info.entryCount, size: info.size, unpacked: info.unpackedSize });
+      } catch (parseErr) {
+        fail(new Error(`npm pack failed: ${parseErr.message}`));
+      }
     });
-    const info = JSON.parse(raw)[0];
-    return { files: info.entryCount, size: info.size, unpacked: info.unpackedSize };
-  } catch (err) {
-    const detail = err.stderr?.toString().trim().split("\n")[0] ?? err.message;
-    throw new Error(`npm pack failed: ${detail}`);
-  }
+  });
+}
+
+/**
+ * Run `worker` over `items` with at most `limit` in flight, preserving index
+ * order in the returned array. A worker that throws does not abort the pool;
+ * callers handle per-item failures themselves.
+ */
+async function mapPool(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  const runners = Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= items.length) return;
+      results[i] = await worker(items[i], i);
+    }
+  });
+  await Promise.all(runners);
+  return results;
 }
 
 // LIB-3 support: the build runs only when this file is invoked directly, so
@@ -742,24 +830,45 @@ async function main() {
 
   let failures = 0;
   console.log(`Building ${PACKAGES.length} packages from ${root} -> packages/\n`);
-  for (const pkg of PACKAGES) {
+
+  const rows = PACKAGES.map((pkg) => {
     const built = buildPackage(pkg, tmpRoot);
     let line = `  ${built.manifest.name}@${VERSION}  index.js`;
     if (built.helperDests.length) line += ` + ${built.helperDests.join(", ")}`;
     if (built.manifest.dependencies) line += `  deps: ${Object.keys(built.manifest.dependencies).join(",")}`;
-    console.log(line);
-    if (check) {
+    return { line, outDir: built.outDir };
+  });
+
+  // Each `npm pack` is a full node process (~1s), so the serial loop was the
+  // bulk of a --pack-check run. The calls are independent: each runs in its own
+  // already-built directory, --dry-run writes no tarball, and every result only
+  // feeds its own summary line plus the shared failure counter. So they can
+  // safely overlap. Results are collected and reprinted in PACKAGES order, so
+  // the emitted output is byte-identical to the serial version.
+  let packRows = null;
+  if (check) {
+    packRows = await mapPool(rows, PACK_CHECK_CONCURRENCY, async (row) => {
       try {
-        const info = packCheck(built.outDir);
-        console.log(
-          `      pack: ${info.files} files, ${(info.size / 1024).toFixed(1)} KiB tarball, ${(info.unpacked / 1024).toFixed(1)} KiB unpacked`,
-        );
+        const info = await packCheck(row.outDir);
+        return {
+          failed: false,
+          text:
+            `      pack: ${info.files} files, ${(info.size / 1024).toFixed(1)} KiB tarball, ` +
+            `${(info.unpacked / 1024).toFixed(1)} KiB unpacked`,
+        };
       } catch (err) {
         failures += 1;
-        console.error(`      pack FAILED: ${err.message.split("\n")[0]}`);
+        return { failed: true, text: `      pack FAILED: ${err.message.split("\n")[0]}` };
       }
-    }
+    });
   }
+
+  rows.forEach((row, i) => {
+    console.log(row.line);
+    if (!packRows) return;
+    if (packRows[i].failed) console.error(packRows[i].text);
+    else console.log(packRows[i].text);
+  });
 
   if (check && failures > 0) {
     console.error(`\n${failures} package(s) failed to pack`);
