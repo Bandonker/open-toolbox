@@ -1,6 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, unwatchFile, watchFile } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, unlinkSync, unwatchFile, watchFile } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -81,6 +81,7 @@ type Config = {
   purgeErrorTurns: number;
   protectedTools: Set<string>;
   protectedPatterns: RegExp[];
+  protectedInputPatterns: RegExp[];
   protectedFilePatterns: RegExp[];
   superseded: boolean;
   // tier 3 — compression
@@ -168,6 +169,24 @@ type Config = {
   log: boolean;
   debug: boolean;
   configPath: string | undefined;
+  // E25: custom summarization prompt template
+  summaryPromptTemplate?: string;
+  // E26: per-tool compression strategies
+  toolStrategies?: Record<string, { minChars?: number; maxSourceChars?: number; promptHint?: string }>;
+  // E29: custom notification hook
+  notifyHook?: (sessionID: string, summaryLine: string, detail: string) => void;
+  // E32: custom eviction policy
+  evictionPolicy?: "lru" | "lfu" | "priority";
+  // E33: fallback model for summarization
+  fallbackModelId?: string;
+  // E35: custom token counter
+  tokenCounter?: (text: string) => number;
+  // E38: token budget scheduling
+  budgetSchedule?: Array<{ turn: number; budgetRatio: number }>;
+  // E39: locale for messages
+  locale?: string;
+  // E40: custom compression strategies
+  customStrategies?: Array<{ id: string; apply: (results: CollectedResult[], candidates: CollectedResult[], cfg: Config) => Map<string, Decision> }>;
 };
 
 type Decision = {
@@ -186,10 +205,47 @@ type CollectedResult = {
   text: string;
   error: boolean;
   tokens: number;
-  part: PartLike;
+  /**
+   * CP-19: the live message part, released by `releaseCompiledUnits()` when the
+   * request finishes compiling. It is set to undefined so the whole cloned
+   * message graph a compiled request built (content arrays, `result.value`
+   * copies of the same text, host metadata) can be collected instead of being
+   * pinned for as long as `st.compressible` remembered the unit.
+   */
+  part?: PartLike;
   input: unknown;
+  /** CP-19: file path snapshot, kept so file notes and stats survive the release. */
+  file?: string;
+  /** CP-19: part id / toolCallId, so `compress targets: ["call_…"]` still resolves. */
+  ref?: string;
+  /** CP-19: `text.length` at compile time, for reporting after a release. */
+  size?: number;
   /** "tool" for tool-result parts, "text" for assistant/user prose parts. */
   kind: "tool" | "text";
+  /**
+   * CP-10: set when the compile pass this unit belongs to already stubbed it,
+   * so a second `applyDecisions` in the same request cannot re-stub and
+   * double-count it. The units are rebuilt by `collectResults` on every
+   * request, so the flag never leaks into the next one — unlike mutating
+   * `text`, which `st.compressible` hands to the `compress` tool.
+   */
+  stubbed?: boolean;
+};
+
+/**
+ * CP-12: a retained tool output. `hits` is recorded when the model reads the
+ * entry back through `context_pruner_recall`, so the `lfu` eviction policy has a
+ * real signal; `priority` is only ever set by imported session state (no
+ * in-process signal assigns one), but both are compared as an (score, at) tuple
+ * so a tie is always broken by recency instead of by Map order.
+ */
+type RecallEntry = {
+  tool: string;
+  text: string;
+  chars: number;
+  at: number;
+  hits?: number;
+  priority?: number;
 };
 
 type SummaryRecord = {
@@ -238,7 +294,7 @@ type SessionState = {
   recoveryTarget: number | null;
   overflowRetries: number;
   modelRef: string;
-  recall: Map<string, { tool: string; text: string; chars: number; at: number }>;
+  recall: Map<string, RecallEntry>;
   loadedRecall: boolean;
   recallDirty: boolean;
   lastNudgeRequest: number;
@@ -252,12 +308,28 @@ type SessionState = {
   nudges: number;
   /** Message index from which prose is protected by turn protection (-1 = none). */
   textProtectedFrom: number;
-  /** Message index of the live turn's user message (-1 = none). Never summarised. */
+  /**
+   * CP-1: message index of the live turn's user message (-1 = no user message).
+   * Never summarised, stubbed or collapsed.
+   */
   turnProtectedFrom: number;
   /** Span collapse measured on the last compiled request. */
   collapseSpans: number;
   collapseMessages: number;
   collapseSavedTokens: number;
+  /**
+   * E34: stack of applied compressions for undo support. CP-8: bounded — the
+   * stack used to keep the FULL text of every unit every `compress` call folded,
+   * unbounded across the session, i.e. a session that compresses repeatedly held
+   * a complete copy of its own pruned output.
+   */
+  compressionStack: Array<{ covers: string[]; originalTexts: Map<string, string>; truncated?: boolean }>;
+  /** E31: cumulative input tokens used by compression model calls. */
+  compressionCallTokens: number;
+  /** E31: cumulative cost of compression model calls (USD). */
+  compressionCallCost: number;
+  /** E27: count of low-quality compressions (summary ratio > 0.8). */
+  lowQualityCompressions: number;
   /**
    * Receipt fragments banked by async/out-of-turn completions (auto-summarise,
    * compress tool, checkpoint). Flushed as part of the next turn's single
@@ -315,6 +387,151 @@ type CommandEditorLike = {
 
 // ----------------------------------------------------------------------------
 // helpers
+
+// ----------------------------------------------------------------------------
+// E39: message catalog for multi-language support
+const MESSAGES: Record<string, Record<string, string>> = {
+  en: {
+    summaryApplied: "Summary applied",
+    compressionQualityLow: "Compression quality low",
+    sessionStateExported: "Session state exported",
+    sessionStateImported: "Session state imported",
+    sessionStateImportFailed: "Failed to import session state",
+    compressionStats: "Compression stats",
+    recallStats: "Recall stats",
+    budgetStats: "Budget stats",
+    turn: "Turn",
+    budgetRatio: "Budget ratio",
+    tokens: "Tokens",
+    saved: "Saved",
+    total: "Total",
+    session: "Session",
+    epoch: "Epoch",
+    decisions: "Decisions",
+    summaries: "Summaries",
+    savedTokens: "Saved tokens",
+    inputTokens: "Input tokens",
+    ratio: "Ratio",
+    activePruneDecisions: "Active prune decisions",
+    activeSummaries: "active summaries",
+    cacheEconomics: "Cache economics",
+    cacheSavings: "cache savings",
+    calibrationRatio: "Calibration ratio",
+    charactersSaved: "Characters saved",
+    checkpoints: "Checkpoints",
+    collapsed: "collapsed",
+    comparisonTitle: "Context pruner comparison",
+    compressedFiles: "Compressed files",
+    compressDisabled: "Compression is disabled",
+    compressEmpty: "Nothing compressible in this context",
+    compressFocus: "Focus",
+    compressModelUnavailable: "Compression model unavailable",
+    compressNoContext: "No context to compress",
+    compressRequiresSession: "compress needs a sessionID: it can only compress the session that called it.",
+    compressLiveTurnIncluded: "Includes output from the turn in progress (you asked for this range by name)",
+    compressKeptNewest: "Range truncated to the newest 40 targets",
+    compressNoTargets: "No compressible targets in range",
+    compressProtected: "Protected",
+    compressResult: "Compressed",
+    compressSaved: "saved",
+    compressionCost: "Compression cost",
+    configFile: "Config file",
+    contextMapCallCompress: "Call compress to fold these into a summary.",
+    contextMapMore: "…and",
+    contextMapTitle: "Context map",
+    estimatedCostSaved: "estimated cost saved",
+    estimatedTokensSaved: "Estimated tokens saved",
+    hooks: "Hooks",
+    lowQualityCompressions: "Low quality compressions",
+    mode: "Mode",
+    modelRef: "Model",
+    netSavings: "Net savings",
+    noCompressibleContext: "No compressible context",
+    noRequestCompiled: "No request compiled yet",
+    noSessionsSpecified: "No sessions specified",
+    nudgeConsider: "Consider compressing soon.",
+    nudgeContextAt: "Context at",
+    nudgeCritical: "Context is critical — compress now.",
+    nudgeUseCompress: "Use the compress tool to free context.",
+    nudgesSent: "Nudges sent",
+    of: "of",
+    ofPruningTotal: "Stubbed (of pruning total)",
+    pruning: "Pruning",
+    promptTokens: "Prompt tokens",
+    protectedMarker: "protected",
+    pruned: "pruned",
+    reportTitle: "Context pruner report",
+    requestsCompiled: "Requests compiled",
+    retryState: "Retry state",
+    rerunTool: "Rerun the tool to see full output",
+    savingsByTopic: "savings by topic",
+    sessionNotFound: "session not found",
+    sessionTotal: "session total",
+    spanCollapse: "Span collapse",
+    statsTitle: "Context pruner stats",
+    stubbed: "stubbed",
+    stubbedBelowFloor: "Stubbed below floor",
+    summarised: "summarised",
+    summariesGenerated: "Summaries generated",
+    summaryUnavailable: "Summary unavailable",
+    toolResultsPruned: "Tool results pruned",
+    topic: "topic",
+    trackedSessions: "Tracked sessions",
+    undoEmpty: "Nothing to undo",
+    undoRequiresSession: "undo requires a sessionID",
+    undoSuccess: "Compression undone",
+    window: "window",
+  },
+  zh: {
+    summaryApplied: "摘要已应用",
+    compressionQualityLow: "压缩质量低",
+    sessionStateExported: "会话状态已导出",
+    sessionStateImported: "会话状态已导入",
+    sessionStateImportFailed: "导入会话状态失败",
+    compressionStats: "压缩统计",
+    recallStats: "召回统计",
+    budgetStats: "预算统计",
+    turn: "轮次",
+    budgetRatio: "预算比率",
+    tokens: "令牌",
+    saved: "已保存",
+    total: "总计",
+    session: "会话",
+    epoch: "纪元",
+    decisions: "决策",
+    summaries: "摘要",
+    savedTokens: "已保存令牌",
+    inputTokens: "输入令牌",
+    ratio: "比率",
+  },
+  ja: {
+    summaryApplied: "要約が適用されました",
+    compressionQualityLow: "圧縮品質が低い",
+    sessionStateExported: "セッション状態がエクスポートされました",
+    sessionStateImported: "セッション状態がインポートされました",
+    sessionStateImportFailed: "セッション状態のインポートに失敗しました",
+    compressionStats: "圧縮統計",
+    recallStats: "リコール統計",
+    budgetStats: "予算統計",
+    turn: "ターン",
+    budgetRatio: "予算比率",
+    tokens: "トークン",
+    saved: "保存済み",
+    total: "合計",
+    session: "セッション",
+    epoch: "エポック",
+    decisions: "決定",
+    summaries: "要約",
+    savedTokens: "保存済みトークン",
+    inputTokens: "入力トークン",
+    ratio: "比率",
+  },
+};
+
+function t(key: string, locale: string): string {
+  const catalog = MESSAGES[locale] ?? MESSAGES.en;
+  return catalog[key] ?? MESSAGES.en[key] ?? key;
+}
 
 function num(value: unknown, fallback = 0): number {
   const n = typeof value === "number" ? value : Number(value);
@@ -460,6 +677,35 @@ function globalConfigDirs(): string[] {
   return [...new Set(dirs)];
 }
 
+/**
+ * CP-16: the debug logger used to write under a hardcoded `~/.config` path and
+ * never cleaned anything, so a machine with `debug: true` once accumulated one
+ * dated file per day forever. Pruning runs once per directory per process (the
+ * logger calls it after every append) and removes dated log files the
+ * filesystem says are older than a week.
+ */
+const DEBUG_LOG_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const prunedDebugDirs = new Set<string>();
+
+function pruneDebugLogs(dir: string): void {
+  if (prunedDebugDirs.has(dir)) return;
+  prunedDebugDirs.add(dir);
+  try {
+    const now = Date.now();
+    for (const name of readdirSync(dir)) {
+      if (!name.endsWith(".log")) continue;
+      const full = join(dir, name);
+      try {
+        if (now - statSync(full).mtimeMs > DEBUG_LOG_MAX_AGE_MS) unlinkSync(full);
+      } catch {
+        /* a file we cannot stat or unlink is not worth an exception */
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
 /** Collect config from (in order): global file, project file, legacy dcp file. */
 function configCandidatePaths(directory: string | undefined): string[] {
   const candidates: string[] = [];
@@ -583,6 +829,9 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
   const protectedPatterns = compilePatterns(
     asList(pick("protectedPatterns", "OPENCODE_CONTEXT_PRUNER_PROTECTED_PATTERNS")),
   );
+  const protectedInputPatterns = compilePatterns(
+    asList(pick("protectedInputPatterns", "OPENCODE_CONTEXT_PRUNER_PROTECTED_INPUT_PATTERNS")),
+  );
   const protectedFilePatterns = compileGlobs(
     asList(firstDefined(getPath(file, "protectedFilePatterns"), pick("protectedFilePatterns", "OPENCODE_CONTEXT_PRUNER_PROTECTED_FILES"))),
   );
@@ -609,16 +858,46 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
   const notifyMinTokens = asInt(pick("notifyMinTokens", "OPENCODE_CONTEXT_PRUNER_NOTIFY_MIN_TOKENS"), 500, 0, 10_000_000);
   const notifyOnTopic = asBool(pick("notifyOnTopic", "OPENCODE_CONTEXT_PRUNER_NOTIFY_ON_TOPIC"), true);
 
-  const manualRaw = getPath(file, "manualMode");
-  const manualMode: ManualMode = {
-    enabled: asBool(firstDefined(pick("manualMode", ""), isPlainObject(manualRaw) ? manualRaw.enabled : manualRaw), false),
-    automaticStrategies: asBool(isPlainObject(manualRaw) ? firstDefined(manualRaw.automaticStrategies, true) : true, true),
+  /**
+   * CP-21: nested option values. `pick()` resolves options → env → file for
+   * SCALARS, but the nested groups (`manualMode`, `turnProtection`, `strategies`)
+   * were only ever read out of the config FILE, so the documented plugin options
+   * set through `ctx.options` — the normal way a plugin is configured in
+   * opencode.json — silently did nothing, and a JSON string (all an env var can
+   * ever be) was dropped as well. Accept an object, a legacy boolean, or a JSON
+   * string from any source.
+   */
+  const asObj = (value: unknown): AnyRecord | undefined => {
+    if (isPlainObject(value)) return value;
+    if (typeof value === "string" && value.trim().startsWith("{")) {
+      try {
+        const parsed = JSON.parse(value) as unknown;
+        return isPlainObject(parsed) ? parsed : undefined;
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
   };
 
-  const turnRaw = getPath(file, "turnProtection");
+  const manualValue = pick("manualMode", "OPENCODE_CONTEXT_PRUNER_MANUAL_MODE");
+  const manualRaw = asObj(manualValue);
+  // `manualMode.automaticStrategies` may also be given flat (it started life as
+  // its own option in the E29 docs).
+  const automaticRaw = firstDefined(
+    manualRaw?.automaticStrategies,
+    pick("automaticStrategies", "OPENCODE_CONTEXT_PRUNER_AUTOMATIC_STRATEGIES"),
+  );
+  const manualMode: ManualMode = {
+    enabled: manualRaw ? asBool(manualRaw.enabled, false) : asBool(manualValue, false),
+    automaticStrategies: asBool(automaticRaw, true),
+  };
+
+  const turnValue = pick("turnProtection", "OPENCODE_CONTEXT_PRUNER_TURN_PROTECTION");
+  const turnRaw = asObj(turnValue);
   const turnProtection: TurnProtection = {
-    enabled: asBool(isPlainObject(turnRaw) ? firstDefined(turnRaw.enabled, false) : false, false),
-    turns: asInt(isPlainObject(turnRaw) ? turnRaw.turns : undefined, 4, 0, 1000),
+    enabled: asBool(turnRaw ? turnRaw.enabled : turnValue, false),
+    turns: asInt(turnRaw ? turnRaw.turns : undefined, 4, 0, 1000),
   };
 
   const compressRaw = getPath(file, "compress");
@@ -626,10 +905,9 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
   const compressValue = (dcpKey: string, envKey: string, flatKey: string): unknown =>
     firstDefined(getPath(compress, dcpKey), pick(flatKey, envKey));
 
-  const strategiesRaw = getPath(file, "strategies");
-  const strategies = isPlainObject(strategiesRaw) ? strategiesRaw : {};
-  const dedupeFile = firstDefined(getPath(strategies, "deduplication"), getPath(file, "deduplication"));
-  const purgeFile = firstDefined(getPath(strategies, "purgeErrors"), getPath(file, "purgeErrors"));
+  const strategiesRaw = asObj(pick("strategies", "OPENCODE_CONTEXT_PRUNER_STRATEGIES")) ?? {};
+  const dedupeFile = firstDefined(getPath(strategiesRaw, "deduplication"), getPath(file, "deduplication"));
+  const purgeFile = firstDefined(getPath(strategiesRaw, "purgeErrors"), getPath(file, "purgeErrors"));
 
   const nudgeForceRaw = String(firstDefined(compressValue("nudgeForce", "", "nudgeForce"), "soft")).toLowerCase();
 
@@ -654,6 +932,7 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
     purgeErrorTurns: asInt(isPlainObject(purgeFile) ? purgeFile.turns : undefined, 4, 0, 1000),
     protectedTools,
     protectedPatterns,
+    protectedInputPatterns,
     protectedFilePatterns,
     superseded: asBool(pick("superseded", "OPENCODE_CONTEXT_PRUNER_SUPERSEDED"), true),
     compressEnabled: asBool(compressValue("enabled", "OPENCODE_CONTEXT_PRUNER_COMPRESS", "compressEnabled"), true),
@@ -713,6 +992,27 @@ function resolveConfig(directory: string | undefined, options: AnyRecord | undef
     log: asBool(pick("log", "OPENCODE_CONTEXT_PRUNER_LOG"), false),
     debug: asBool(pick("debug", "OPENCODE_CONTEXT_PRUNER_DEBUG"), false),
     configPath: path,
+    // E25: custom summarization prompt template
+    summaryPromptTemplate: typeof pick("summaryPromptTemplate", "OPENCODE_CONTEXT_PRUNER_SUMMARY_PROMPT_TEMPLATE") === "string" ? String(pick("summaryPromptTemplate", "OPENCODE_CONTEXT_PRUNER_SUMMARY_PROMPT_TEMPLATE")) : undefined,
+    // E26: per-tool compression strategies
+    toolStrategies: (getPath(file, "toolStrategies") as Record<string, { minChars?: number; maxSourceChars?: number; promptHint?: string }>) ?? undefined,
+    // E29: custom notification hook (only from options, not env/file)
+    notifyHook: typeof o.notifyHook === "function" ? (o.notifyHook as (sessionID: string, summaryLine: string, detail: string) => void) : undefined,
+    // E32: custom eviction policy
+    evictionPolicy: (() => {
+      const raw = String(firstDefined(pick("evictionPolicy", "OPENCODE_CONTEXT_PRUNER_EVICTION_POLICY"), "lru")).toLowerCase();
+      return raw === "lfu" || raw === "priority" ? raw : "lru";
+    })(),
+    // E33: fallback model for summarization
+    fallbackModelId: typeof pick("fallbackModelId", "OPENCODE_CONTEXT_PRUNER_FALLBACK_MODEL") === "string" ? String(pick("fallbackModelId", "OPENCODE_CONTEXT_PRUNER_FALLBACK_MODEL")) : undefined,
+    // E35: custom token counter (only from options)
+    tokenCounter: typeof o.tokenCounter === "function" ? (o.tokenCounter as (text: string) => number) : undefined,
+    // E38: token budget scheduling
+    budgetSchedule: Array.isArray(getPath(file, "budgetSchedule")) ? (getPath(file, "budgetSchedule") as Array<{ turn: number; budgetRatio: number }>) : undefined,
+    // E39: locale
+    locale: typeof pick("locale", "OPENCODE_CONTEXT_PRUNER_LOCALE") === "string" ? String(pick("locale", "OPENCODE_CONTEXT_PRUNER_LOCALE")) : "en",
+    // E40: custom compression strategies (only from options)
+    customStrategies: Array.isArray(o.customStrategies) ? o.customStrategies : undefined,
   };
 }
 
@@ -786,6 +1086,11 @@ function hash32(text: string): number {
 }
 
 function estimateTokens(text: string, cfg: Config, ratio: number): number {
+  // E35: use custom token counter if provided
+  if (cfg.tokenCounter) {
+    const n = cfg.tokenCounter(text);
+    if (Number.isFinite(n) && n > 0) return Math.ceil(n * (Number.isFinite(ratio) && ratio > 0 ? ratio : 1));
+  }
   return estimateCharsTokens(text.length, cfg, ratio);
 }
 
@@ -820,8 +1125,12 @@ function toolCallInputs(messages: MessageLike[]): Map<string, unknown> {
   return out;
 }
 
-function collectResults(messages: MessageLike[], cfg: Config, ratio: number): CollectedResult[] {
+/** Results of one collectResults pass, with the raw token total cached. */
+type CollectedResults = CollectedResult[] & { totalTokens: number };
+
+function collectResults(messages: MessageLike[], cfg: Config, ratio: number): CollectedResults {
   const out: CollectedResult[] = [];
+  let totalTokens = 0;
   const callInputs = toolCallInputs(messages);
   for (let mi = 0; mi < messages.length; mi++) {
     const message = messages[mi] ?? {};
@@ -831,6 +1140,7 @@ function collectResults(messages: MessageLike[], cfg: Config, ratio: number): Co
       if (isToolResult(part)) {
         const text = resultText(part.result);
         const callId = part.id ?? part.toolCallId;
+        const tokens = estimateTokens(text, cfg, ratio);
         out.push({
           mi,
           pi,
@@ -838,11 +1148,12 @@ function collectResults(messages: MessageLike[], cfg: Config, ratio: number): Co
           name: toolNameOf(part),
           text,
           error: isErrorResult(part.result),
-          tokens: estimateTokens(text, cfg, ratio),
+          tokens,
           part,
           input: part.input !== undefined ? part.input : callId ? callInputs.get(callId) : undefined,
           kind: "tool",
         });
+        totalTokens += tokens;
         continue;
       }
       // Prose is opt-in (compressText). We replace the text part in place; the
@@ -854,6 +1165,7 @@ function collectResults(messages: MessageLike[], cfg: Config, ratio: number): Co
       if (role === "user" && cfg.protectUserMessages) continue;
       const text = part.text;
       if (!text.trim()) continue;
+      const tokens = estimateTokens(text, cfg, ratio);
       out.push({
         mi,
         pi,
@@ -861,24 +1173,88 @@ function collectResults(messages: MessageLike[], cfg: Config, ratio: number): Co
         name: role === "user" ? "user-message" : "assistant-message",
         text,
         error: false,
-        tokens: estimateTokens(text, cfg, ratio),
+        tokens,
         part,
         input: undefined,
         kind: "text",
       });
+      totalTokens += tokens;
     }
   }
-  return out;
+  return Object.assign(out, { totalTokens }) as CollectedResults;
 }
 
-function protectedFromIndex(messages: MessageLike[], turns: number): number {
-  if (turns <= 0) return -1;
+/**
+ * CP-19: release the message-graph references a compiled request collected.
+ * `st.compressible` survives until the NEXT request replaces it, and every unit
+ * held its part (a clone of the whole message, content arrays included, with
+ * `result.value` holding a second copy of the very text the unit already
+ * carries) plus the tool input. Small scalars the later tools still need — file
+ * path, part id, text size — are snapshotted first. Everything the compile
+ * itself needs (planning, summaries, stubs, span collapse) runs BEFORE this.
+ */
+function releaseCompiledUnits(results: CollectedResult[]): void {
+  for (const r of results) {
+    if (r.part === undefined) continue;
+    if (!r.file) r.file = filePathOf(r);
+    const id = r.part.id ?? r.part.toolCallId;
+    if (typeof id === "string" && !r.ref) r.ref = id;
+    if (r.size === undefined) r.size = r.text.length;
+    r.part = undefined;
+    r.input = undefined;
+  }
+}
+
+function userMessageIndexes(messages: MessageLike[]): number[] {
   const userIdxs: number[] = [];
   for (let i = 0; i < messages.length; i++) {
     if (messages[i]?.role === "user") userIdxs.push(i);
   }
+  return userIdxs;
+}
+
+/**
+ * Index of the oldest message inside the window covered by the last `turns`
+ * user messages, or -1 when the session is not even `turns` turns long yet.
+ *
+ * This is the VOLUNTARY recency ring (`keepRecentTurns` / `turnProtection` /
+ * `purgeErrorTurns`): "keep the last N turns untouched". A window wider than the
+ * transcript is not a protection, it is the whole transcript — returning the
+ * first user message here made `candidateResults` drop every single unit in a
+ * short session, so a fresh/subagent/fork transcript could never be pruned,
+ * summarised or repurged at all.
+ *
+ * The mandatory live-turn guard (invariant C2) does NOT come from here: it is
+ * `liveTurnIndex`, computed independently of any window, so the tool output the
+ * model has just received is protected no matter how the rings are configured.
+ */
+function protectedFromIndex(messages: MessageLike[], turns: number): number {
+  if (turns <= 0) return -1;
+  const userIdxs = userMessageIndexes(messages);
   if (userIdxs.length <= turns) return -1;
   return userIdxs[userIdxs.length - turns];
+}
+
+/**
+ * CP-1: message index of the NEWEST user message (-1 = none) — the start of the
+ * live turn. Computed independently of the turn-protection window so the live
+ * turn stays protected even in a session with a single user message.
+ *
+ * A message whose content is nothing but tool results is NOT a user turn — it is
+ * the tool channel carried on a user message, and counting it as the start of a
+ * new turn made the guard swallow every unit of such a request (invariant C2
+ * became "never prune", which is no protection at all). A genuine turn always
+ * carries user-authored text/file parts, so the newest message with one of those
+ * is where the live turn starts.
+ */
+function liveTurnIndex(messages: MessageLike[]): number {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role !== "user") continue;
+    const content = Array.isArray(messages[i]?.content) ? messages[i]!.content! : [];
+    if (content.length === 0) return i;
+    if (content.some((part) => !isToolResult(part as PartLike))) return i;
+  }
+  return -1;
 }
 
 /** C3: count of tool-call parts in the outgoing request. */
@@ -925,10 +1301,23 @@ function hasReasoningContent(messages: MessageLike[]): boolean {
 
 /** C16: prose compresses far better than tool output — lower floor for it. */
 function minCharsFor(r: CollectedResult, cfg: Config): number {
+  // E26: per-tool compression strategies
+  const strategy = cfg.toolStrategies?.[r.name];
+  if (strategy?.minChars !== undefined) return strategy.minChars;
   return r.kind === "text" ? Math.max(200, Math.floor(cfg.minChars / 4)) : cfg.minChars;
 }
 
+/** E26: effective max source chars for a tool, falling back to the global cap. */
+function maxSourceCharsFor(toolName: string | undefined, cfg: Config): number {
+  const strategy = toolName ? cfg.toolStrategies?.[toolName] : undefined;
+  if (strategy?.maxSourceChars !== undefined && strategy.maxSourceChars > 0) return strategy.maxSourceChars;
+  return cfg.compressMaxSourceChars;
+}
+
 function filePathOf(result: CollectedResult): string | undefined {
+  // CP-19: `input` is released with the message part; the snapshot taken at
+  // release time keeps file notes working for a compiled-but-idle session.
+  if (typeof result.file === "string" && result.file) return result.file;
   if (!isPlainObject(result.input)) return undefined;
   const value = firstDefined(result.input.filePath, result.input.path, result.input.file);
   return typeof value === "string" ? value.replace(/\\/g, "/") : undefined;
@@ -1053,12 +1442,47 @@ function blockedByFilePattern(result: CollectedResult, cfg: Config): boolean {
 }
 
 function isProtected(result: CollectedResult, cfg: Config): boolean {
-  return (
+  if (
     cfg.ignoreTools.has(result.name) ||
     cfg.protectedTools.has(result.name) ||
     cfg.protectedPatterns.some((re) => statelessTest(re, result.name)) ||
     blockedByFilePattern(result, cfg)
-  );
+  ) {
+    return true;
+  }
+  if (cfg.protectedInputPatterns.length > 0 && result.input !== undefined) {
+    try {
+      const serialized = JSON.stringify(result.input);
+      if (serialized && cfg.protectedInputPatterns.some((re) => statelessTest(re, serialized))) {
+        return true;
+      }
+    } catch {
+      // Non-serializable input — skip pattern matching.
+    }
+  }
+  return false;
+}
+
+/** Shared empty set for the relaxed recency ring — never mutated. */
+const EMPTY_KEYSET: Set<string> = new Set();
+
+/**
+ * Shared scan for the candidate filter: the recency ring keys, the turn
+ * protection index, and the error-purge index. Computed once per request and
+ * reused by every candidateResults call — they only differ in minLength and
+ * the relax flags, never in this scan.
+ */
+function candidateScan(
+  results: CollectedResult[],
+  messages: MessageLike[],
+  cfg: Config,
+): { recentKeys: Set<string>; from: number; errorFrom: number } {
+  const toolResults = results.filter((r) => r.kind === "tool");
+  const recentKeys = new Set(toolResults.slice(Math.max(0, toolResults.length - cfg.keepRecent)).map((r) => r.key));
+  const turns = Math.max(cfg.keepRecentTurns, cfg.turnProtection.enabled ? cfg.turnProtection.turns : 0);
+  const from = turns <= 0 ? -1 : protectedFromIndex(messages, turns);
+  const errorFrom = cfg.purgeErrors && !cfg.keepErrors ? protectedFromIndex(messages, cfg.purgeErrorTurns) : -1;
+  return { recentKeys, from, errorFrom };
 }
 
 function candidateResults(
@@ -1072,13 +1496,17 @@ function candidateResults(
     turns: false,
   },
   liveFrom = -1,
+  scan?: { recentKeys: Set<string>; from: number; errorFrom: number },
 ): CollectedResult[] {
-  const recent = relax.recent
-    ? new Set<string>()
-    : new Set(results.slice(Math.max(0, results.length - cfg.keepRecent)).map((r) => r.key));
-  const turns = relax.turns ? 0 : Math.max(cfg.keepRecentTurns, cfg.turnProtection.enabled ? cfg.turnProtection.turns : 0);
-  const from = turns <= 0 ? -1 : protectedFromIndex(messages, turns);
-  const errorFrom = cfg.purgeErrors && !cfg.keepErrors ? protectedFromIndex(messages, cfg.purgeErrorTurns) : -1;
+  // CP-2: the recency ring is a ring of TOOL outputs. Slicing the mixed
+  // tool+prose list let prose eat the ring (with compressText on by default
+  // that ring-fenced only half the intended tool outputs). The slice index has
+  // to come from the FILTERED list too — measured against the mixed length, a
+  // single prose part silently shrank the ring below `keepRecent`.
+  const shared = scan ?? candidateScan(results, messages, cfg);
+  const recent = relax.recent ? EMPTY_KEYSET : shared.recentKeys;
+  const from = relax.turns ? -1 : shared.from;
+  const errorFrom = shared.errorFrom;
   return results.filter(
     (r) =>
       r.kind === "tool" &&
@@ -1123,21 +1551,42 @@ function recallId(key: string, text: string): string {
   return hash32(`${key}\u0000${text}`).toString(16).padStart(8, "0");
 }
 
-/** Drop the least recently stored entries until the cache is within `keep`. */
-function evictRecall(st: SessionState, keep: number): void {
+/**
+ * Drop entries until the cache is within `keep`.
+ *
+ * CP-12: every policy picks its victim on an (score, at) TUPLE. The old code
+ * overwrote `score` with a timestamp in the tie-break branch and then compared
+ * that against the running best score, so lfupriority victims were chosen
+ * essentially at random once more than one entry shared a score.
+ */
+function evictRecall(st: SessionState, keep: number, policy?: "lru" | "lfu" | "priority"): void {
   while (st.recall.size > keep) {
-    let oldestKey: string | undefined;
-    let oldestAt = Infinity;
+    let evictKey: string | undefined;
+    let evictScore = Infinity;
+    let evictAt = Infinity;
     for (const [key, entry] of st.recall) {
-      if (entry.at < oldestAt) {
-        oldestAt = entry.at;
-        oldestKey = key;
+      // LFU: lowest access count; priority: lowest priority (imported state
+      // only); LRU (default): oldest access. All tie-break on the oldest `at`.
+      const score = policy === "lfu" ? (entry.hits ?? 0) : policy === "priority" ? (entry.priority ?? 0) : entry.at;
+      if (score < evictScore || (score === evictScore && entry.at < evictAt)) {
+        evictScore = score;
+        evictAt = entry.at;
+        evictKey = key;
       }
     }
-    if (oldestKey === undefined) break;
-    st.recall.delete(oldestKey);
+    if (evictKey === undefined) break;
+    st.recall.delete(evictKey);
   }
 }
+
+/**
+ * CP-7: factor applied to `recallMaxChars` (the READ cap) to derive the WRITE
+ * cap. `valueToText`'s array branch joins content parts with no cap at all, so
+ * an uncapped store turned a few large reads into hundreds of MB persisted
+ * through `recall:<sid>` on every pruning request. Storage holds a generous
+ * multiple of what a single read can ever return.
+ */
+const RECALL_STORE_FACTOR = 2;
 
 /**
  * Keep the full text of a pruned result so the model can recall it instead of
@@ -1148,8 +1597,12 @@ function rememberOutput(st: SessionState, r: CollectedResult, cfg: Config): stri
   if (!cfg.recall || cfg.recallKeep <= 0) return undefined;
   const id = recallId(r.key, r.text);
   if (!st.recall.has(id)) {
-    st.recall.set(id, { tool: r.name, text: r.text, chars: r.text.length, at: Date.now() });
-    evictRecall(st, cfg.recallKeep);
+    // CP-7: cap what is stored; `chars` keeps the ORIGINAL size so the read
+    // path can still tell the model how much was given up.
+    const storeCap = Math.max(cfg.recallMaxChars, 1000) * RECALL_STORE_FACTOR;
+    const text = r.text.length > storeCap ? `${r.text.slice(0, storeCap)}\n[context-pruner] stored output truncated at ${storeCap} chars` : r.text;
+    st.recall.set(id, { tool: r.name, text, chars: r.text.length, at: Date.now(), hits: 0 });
+    evictRecall(st, cfg.recallKeep, cfg.evictionPolicy);
     st.recallDirty = true;
   }
   return id;
@@ -1171,7 +1624,7 @@ function makeStub(
   const memoKey = `${r.key}|${reason}|${r.text.length}|${hash32(r.text.slice(0, 512))}|${cfg.keepHeadChars}|${ratio}|${id ?? ""}`;
   const memoHit = stubMemo.get(memoKey);
   if (memoHit) return memoHit;
-  const resultType = isPlainObject(r.part.result) ? r.part.result.type : undefined;
+  const resultType = isPlainObject(r.part?.result) ? r.part!.result!.type : undefined;
   const isText = resultType === undefined || resultType === "text";
   const head = isText ? r.text.slice(0, cfg.keepHeadChars).trimEnd() : "";
   const path = filePathOf(r);
@@ -1226,15 +1679,18 @@ function typedResult(_r: CollectedResult, value: string): ResultLike {
 
 /** Write the compiled value back into the part for this request only. */
 function writeUnit(r: CollectedResult, value: string): void {
+  // CP-19: a released unit (its request is long gone) has no part to rewrite.
+  const part = r.part;
+  if (!part) return;
   if (r.kind === "text") {
     // Prose keeps `type: "text"` and every sibling part stays in place.
-    r.part.text = value;
+    part.text = value;
     return;
   }
   // CP-7: preserve extra host fields — replacing the whole object drops
   // metadata the host attached to `result`.
-  const prev = isPlainObject(r.part.result) ? (r.part.result as AnyRecord) : {};
-  r.part.result = { ...prev, ...typedResult(r, value) };
+  const prev = isPlainObject(part.result) ? (part.result as AnyRecord) : {};
+  part.result = { ...prev, ...typedResult(r, value) };
 }
 
 /**
@@ -1301,6 +1757,25 @@ function setModelCache(ctx: LooseCtx, models: ModelInfo[]): void {
 }
 
 /**
+ * CP: model id → input price, memoised on the cached model list so `compress`
+ * does not await/parse `ctx.model.list()` on every summarised request. Rebuilt
+ * whenever the cached list reference changes.
+ */
+const modelPricingCaches = new WeakMap<object, { source: ModelInfo[]; prices: Map<string, number> }>();
+
+function modelInputPrices(ctx: LooseCtx): Map<string, number> {
+  const source = modelCaches.get(ctx as object) ?? [];
+  const cached = modelPricingCaches.get(ctx as object);
+  if (cached && cached.source === source) return cached.prices;
+  const prices = new Map<string, number>();
+  for (const m of source) {
+    if (typeof m?.id === "string") prices.set(m.id, num(m?.cost?.[0]?.input));
+  }
+  modelPricingCaches.set(ctx as object, { source, prices });
+  return prices;
+}
+
+/**
  * `ctx.model.list()` is async in the live runtime, but the context hook is
  * synchronous. Resolve it once per context object and read the cached result.
  */
@@ -1342,14 +1817,26 @@ function resolveModel(ctx: LooseCtx, ref: AnyRecord | undefined): ModelInfo | un
   return undefined;
 }
 
-function budgetFor(model: ModelInfo | undefined, cfg: Config): { window: number; budget: number; target: number } | null {
+function budgetFor(model: ModelInfo | undefined, cfg: Config, turn?: number): { window: number; budget: number; target: number } | null {
   const window = num(model?.limit?.context);
   if (!window || window <= 0) return null;
+  // E38: token budget scheduling — look up budget ratio by turn
+  let budgetRatio = cfg.budgetRatio;
+  if (cfg.budgetSchedule && cfg.budgetSchedule.length > 0 && turn !== undefined) {
+    // Find the most recent schedule entry for this turn
+    let best: { turn: number; budgetRatio: number } | undefined;
+    for (const entry of cfg.budgetSchedule) {
+      if (entry.turn <= turn && (!best || entry.turn >= best.turn)) {
+        best = entry;
+      }
+    }
+    if (best) budgetRatio = best.budgetRatio;
+  }
   // CP-5: real hard cap — reserve is the model's output limit clamped to
   // maxOutputReserve, falling back to maxOutputReserve when unknown.
   const outputLimit = num(model?.limit?.output);
   const reserve = outputLimit > 0 ? Math.min(outputLimit, cfg.maxOutputReserve) : cfg.maxOutputReserve;
-  const budget = Math.max(0, Math.floor(window * cfg.budgetRatio) - reserve);
+  const budget = Math.max(0, Math.floor(window * budgetRatio) - reserve);
   const target = Math.max(0, Math.floor(budget * cfg.targetRatio));
   return { window, budget, target };
 }
@@ -1382,33 +1869,52 @@ const sessionModelKey = new Map<string, string>();
  * CP-1: best-effort storage write — a throwing or rejecting store must never
  * surface (sync throw is swallowed, async rejection gets a no-op catch so
  * Node never reports an unhandled rejection).
+ *
+ * CP-15: `onFail` lets the caller REPORT the failure (the plugin's own state is
+ * being lost); the swallow/no-throw contract is unchanged.
  */
-function guardedSet(store: unknown, key: string, value: unknown): void {
+function guardedSet(store: unknown, key: string, value: unknown, onFail?: (err: unknown) => void): void {
+  const fail = (err: unknown): void => {
+    if (!onFail) return;
+    try {
+      onFail(err);
+    } catch {
+      /* a failing reporter must not break the write path either */
+    }
+  };
   try {
     Promise.resolve(
       (store as { set?: (k: string, v: unknown) => unknown } | undefined)?.set?.(key, value),
-    ).catch(() => {
-      /* ignore */
+    ).catch((err) => {
+      fail(err);
     });
-  } catch {
-    /* ignore */
+  } catch (err) {
+    fail(err);
   }
 }
 
 /**
  * CP-16: best-effort storage delete. Session deletion is a host event; a failing
  * store must not turn cleanup into a crash, and must not leave an unhandled
- * rejection behind. Mirrors guardedSet.
+ * rejection behind. Mirrors guardedSet (including CP-15's reporter).
  */
-function guardedRemove(store: unknown, key: string): void {
+function guardedRemove(store: unknown, key: string, onFail?: (err: unknown) => void): void {
+  const fail = (err: unknown): void => {
+    if (!onFail) return;
+    try {
+      onFail(err);
+    } catch {
+      /* ignore */
+    }
+  };
   try {
     Promise.resolve(
       (store as { remove?: (k: string) => unknown } | undefined)?.remove?.(key),
-    ).catch(() => {
-      /* ignore */
+    ).catch((err) => {
+      fail(err);
     });
-  } catch {
-    /* ignore */
+  } catch (err) {
+    fail(err);
   }
 }
 /**
@@ -1446,6 +1952,10 @@ const totals = {
   collapsedSpans: 0,
   collapsedMessages: 0,
   collapsedTokens: 0,
+  compressionCallTokens: 0,
+  compressionCallCost: 0,
+  // E27: compression quality metrics
+  lowQualityCompressions: 0,
 };
 
 function stateFor(sessionID: string): SessionState {
@@ -1526,6 +2036,10 @@ function stateFor(sessionID: string): SessionState {
       collapseSpans: 0,
       collapseMessages: 0,
       collapseSavedTokens: 0,
+      compressionStack: [],
+      compressionCallTokens: 0,
+      compressionCallCost: 0,
+      lowQualityCompressions: 0,
       pendingNotes: [],
     };
     sessions.set(sessionID, st);
@@ -1590,8 +2104,16 @@ function loadEpochInto(sessionID: string, st: SessionState): void {
         if (!snap || sessions.get(sessionID) !== st) return;
         const clean = sanitizeEpochSnapshot(snap);
         if (!clean) return;
-        st.epoch = clean.epoch;
-        for (const d of clean.decisions) st.decisions.set(d.key, d);
+        // CP-14: MONOTONIC. A load can land after this session already advanced
+        // (or re-created) its epoch — an evicted-and-recreated session writes 0
+        // to the store, an in-memory session has moved to N. Taking the max
+        // means a late or stale snapshot can never rewind the epoch, which is
+        // what keeps the cache-stability contract (a lower epoch re-prunes a
+        // prefix that was already rewritten).
+        st.epoch = Math.max(st.epoch, clean.epoch);
+        // CP-14: union, never replace — decisions learned since the snapshot
+        // stay in force.
+        for (const d of clean.decisions) if (!st.decisions.has(d.key)) st.decisions.set(d.key, d);
       } catch {
         /* ignore */
       }
@@ -1638,7 +2160,82 @@ export const __test__ = {
   hasModelKey: (sid: string): boolean => sessionModelKey.has(sid),
   latestTopic,
   topicLedger,
+  // CP-1 verification seams: the voluntary turn ring vs. the mandatory live
+  // turn guard.
+  protectedFromIndex,
+  liveTurnIndex,
+  // E30/E37: export/import/comparison seams for tests and tooling.
+  exportSessionState,
+  importSessionState,
+  renderComparison,
+  // E25/E26/E35/E38/E39/E40: new config-driven seams.
+  summaryPrompt,
+  estimateTokens,
+  minCharsFor,
+  evictRecall,
+  renderStats,
 };
+
+/**
+ * CP-8: how far the undo stack reaches back, and how much of each folded unit it
+ * keeps. Six compressions is well more than a turn issues, and 4 KB per unit is
+ * enough for undo to restore something useful while bounding the stack at a few
+ * hundred KB instead of a full second copy of the session's output.
+ */
+const COMPRESSION_STACK_MAX = 6;
+const COMPRESSION_PREVIEW_CHARS = 4000;
+
+/** Push one applied compression onto the session's bounded undo stack. */
+function pushCompressionEntry(st: SessionState, covers: string[], originalTexts: Map<string, string>): void {
+  let truncated = false;
+  const previews = new Map<string, string>();
+  for (const [key, text] of originalTexts) {
+    if (text.length > COMPRESSION_PREVIEW_CHARS) {
+      truncated = true;
+      previews.set(key, `${text.slice(0, COMPRESSION_PREVIEW_CHARS)}\n\n[context-pruner] undo preview truncated at ${COMPRESSION_PREVIEW_CHARS} of ${text.length} chars`);
+    } else {
+      previews.set(key, text);
+    }
+  }
+  st.compressionStack.push({ covers, originalTexts: previews, truncated });
+  // Oldest entry goes first: undo only ever pops the newest, so dropping the
+  // deepest history is the least useful thing to lose.
+  while (st.compressionStack.length > COMPRESSION_STACK_MAX) st.compressionStack.shift();
+}
+
+/**
+ * E34: Undo the last compression applied to a session.
+ * Pops the compression stack and restores original texts.
+ * @returns true if a compression was undone, false if the stack was empty.
+ */
+function undoLastCompression(sessionID: string): { undone: boolean; truncated: boolean } {
+  const st = sessions.get(sessionID);
+  if (!st) return { undone: false, truncated: false };
+  const entry = st.compressionStack.pop();
+  if (!entry) return { undone: false, truncated: false };
+
+  // Restore original texts (CP-8: previews, capped at write time).
+  for (const [key, text] of entry.originalTexts) {
+    const unit = st.compressible.find((r) => r.key === key);
+    if (unit) {
+      unit.text = text;
+    }
+  }
+
+  // Remove the summary record
+  const record = st.summaries.get(entry.covers[0]);
+  if (record) {
+    st.summaries.delete(entry.covers[0]);
+  }
+
+  // Restore decisions
+  for (const key of entry.covers) {
+    // Decisions are not restored — they were deleted during compression
+    // and would need to be re-derived from the original text
+  }
+
+  return { undone: true, truncated: entry.truncated === true };
+}
 
 /** Calibration is keyed per model string when the context hook has seen one. */
 
@@ -1660,11 +2257,17 @@ function coveredKeys(st: SessionState): Set<string> {
   return set;
 }
 
-function summarySavings(results: CollectedResult[], st: SessionState, cfg: Config, ratio: number): { saved: number; applied: number; tokens: number } {
+function summarySavings(
+  results: CollectedResult[],
+  st: SessionState,
+  cfg: Config,
+  ratio: number,
+  sharedByKey?: Map<string, CollectedResult>,
+): { saved: number; applied: number; tokens: number } {
   let saved = 0;
   let applied = 0;
   let tokens = 0;
-  const byKey = new Map(results.map((r) => [r.key, r]));
+  const byKey = sharedByKey ?? new Map(results.map((r) => [r.key, r]));
   for (const record of st.summaries.values()) {
     const present = record.covers.filter((key) => byKey.has(key));
     if (present.length === 0) continue;
@@ -1685,7 +2288,8 @@ function planDecisions(
   candidates: CollectedResult[],
   cfg: Config,
   ratio: number,
-  budget: { target: number; overhead: number; pool?: CollectedResult[] } | null,
+  budget: { target: number; overhead: number; pool?: CollectedResult[]; summarySaved?: number } | null,
+  debug?: (message: string) => void,
 ): Map<string, Decision> {
   const decisions = new Map<string, Decision>();
   const add = (r: CollectedResult, reason: string): Decision => {
@@ -1698,6 +2302,25 @@ function planDecisions(
   };
 
   const autoPrune = !cfg.manualMode.enabled || cfg.manualMode.automaticStrategies;
+
+  // E40 / CP-5: custom compression strategies. The strategy result used to be
+  // captured in a local named `decisions`, shadowing the outer map, and the
+  // merge guard tested the map it was iterating — always false — so custom
+  // strategies ran and their output was discarded. Merge into the OUTER map.
+  if (cfg.customStrategies && cfg.customStrategies.length > 0) {
+    for (const strategy of cfg.customStrategies) {
+      try {
+        const provided = strategy.apply(results, candidates, cfg);
+        for (const [key, d] of provided) {
+          if (decisions.has(key) || !d || typeof d.key !== "string") continue;
+          decisions.set(key, { ...d, key });
+        }
+      } catch (err) {
+        // Custom strategy failures must not break the built-in strategies.
+        debug?.(`custom strategy ${strategy.id} failed: ${String(err)}`);
+      }
+    }
+  }
 
   if (autoPrune && cfg.superseded) {
     const candidateKeys = new Set(candidates.map((c) => c.key));
@@ -1775,6 +2398,10 @@ function planDecisions(
     let projected = budget.overhead;
     for (const r of results) projected += r.tokens;
     for (const d of decisions.values()) projected -= d.savedTokens;
+    // CP-17: an applied summary already shed tokens the raw `results[].tokens`
+    // sum still counts. Ignoring them inflated the projection, so the loop kept
+    // stubbing units it did not need to (over-prune) against a steady target.
+    projected -= Math.max(0, budget.summarySaved ?? 0);
     for (const r of pool) {
       if (projected <= budget.target) break;
       const d = add(r, "over budget");
@@ -1801,12 +2428,30 @@ function applyDecisions(
   for (const r of results) {
     const d = decisions.get(r.key);
     if (!d) continue;
-    if (covered.has(r.key) || isPrunedStub(r.text)) continue;
+    // CP-10: `stubbed` marks a unit THIS request already stubbed; `r.text` is
+    // still the original output, so only a stub that arrived in the transcript
+    // itself (`isPrunedStub`) disqualifies a unit from being stubbed again.
+    if (covered.has(r.key) || r.stubbed === true || isPrunedStub(r.text)) continue;
     const recall = rememberOutput(st, r, cfg);
     const { stub, savedChars: sc, savedTokens: stk } = makeStub(r, d.reason, cfg, ratio, recall);
     // A pruned result is always rewritten as text-with-array-value so the
     // model request can send it (core maps over result.value as an array).
     writeUnit(r, stub);
+    // CP-10: the same unit must not be stubbed twice within ONE request — the
+    // auto-stub path (`maybeAutoSummarize`) and the hook's own plan both call
+    // this, and a second pass rewrote the part with a different reason, so
+    // totals.pruned / savedTokens / the receipt counted the saving twice.
+    //
+    // That is tracked with a per-unit flag rather than by rewriting `r.text`:
+    // `st.compressible` (the very array iterated here) survives until the next
+    // request, and the manual `compress` tool reads the units' text afterwards
+    // to build the digest source. Mutating the shared text made a unit stubbed
+    // by an earlier pass look already-pruned, so it silently dropped out of the
+    // compress range (and `coverHashes`/`pruneStaleSummaries` hashed stub text
+    // instead of the source it summarises, which made the fresh record look
+    // stale on the very next request). The units are rebuilt by
+    // `collectResults` on every request, so the flag is exactly per-request.
+    r.stubbed = true;
     d.savedChars = sc;
     d.savedTokens = stk;
     count++;
@@ -2056,9 +2701,10 @@ function collapseSpans(
   };
 }
 
-function pointerFor(r: CollectedResult): string {
+function pointerFor(r: CollectedResult, cfg: Config): string {
+  const locale = cfg.locale ?? "en";
   if (r.kind === "text") return `${POINTER_MARK} (was ${r.name}, ${r.text.length} chars).`;
-  return `${POINTER_MARK} (was "${r.name}", ${r.text.length} chars). Re-run the tool if you need it again.`;
+  return `${POINTER_MARK} (was "${r.name}", ${r.text.length} chars). ${t("rerunTool", locale)}`;
 }
 
 /**
@@ -2083,28 +2729,94 @@ function pruneStaleSummaries(st: SessionState, byKey: Map<string, CollectedResul
   return dropped;
 }
 
-function applySummaries(results: CollectedResult[], st: SessionState): number {
-  const byKey = new Map(results.map((r) => [r.key, r]));
+function applySummaries(
+  results: CollectedResult[],
+  st: SessionState,
+  cfg: Config,
+  sharedByKey?: Map<string, CollectedResult>,
+): number {
+  const byKey = sharedByKey ?? new Map(results.map((r) => [r.key, r]));
   let applied = 0;
   for (const record of st.summaries.values()) {
     const present = record.covers.map((key) => byKey.get(key)).filter((r): r is CollectedResult => Boolean(r));
     if (present.length === 0) continue;
     writeUnit(present[0], record.text);
     for (let i = 1; i < present.length; i++) {
-      writeUnit(present[i], pointerFor(present[i]));
+      writeUnit(present[i], pointerFor(present[i], cfg));
     }
     applied += present.length;
   }
   return applied;
 }
 
-function sentTokens(results: CollectedResult[], overhead: number, decisions: Map<string, Decision>, summarySaved: number): number {
-  let total = overhead;
-  for (const r of results) {
-    const d = decisions.get(r.key);
-    total += d ? Math.max(0, r.tokens - d.savedTokens) : r.tokens;
+/**
+ * One pass over the results applying summary records first and stubs second.
+ * Semantically identical to applySummaries + applyDecisions run in that order:
+ * a key in a summary record is covered, so applyDecisions would skip it anyway;
+ * a stub only touches keys that no record claims.
+ */
+function applySummariesAndDecisions(
+  results: CollectedResult[],
+  st: SessionState,
+  decisions: Map<string, Decision>,
+  cfg: Config,
+  ratio: number,
+  covered: Set<string>,
+  sharedByKey: Map<string, CollectedResult>,
+): { summaryApplied: number; applied: { count: number; savedChars: number; savedTokens: number } } {
+  const byKey = sharedByKey;
+  const summaryWrites = new Map<string, string>();
+  let summaryApplied = 0;
+  for (const record of st.summaries.values()) {
+    const present = record.covers.map((key) => byKey.get(key)).filter((r): r is CollectedResult => Boolean(r));
+    if (present.length === 0) continue;
+    summaryApplied += present.length;
+    summaryWrites.set(present[0].key, record.text);
+    for (let i = 1; i < present.length; i++) {
+      summaryWrites.set(present[i].key, pointerFor(present[i], cfg));
+    }
   }
-  return Math.max(0, total - summarySaved);
+  let count = 0;
+  let savedChars = 0;
+  let savedTokens = 0;
+  for (const r of results) {
+    const summaryText = summaryWrites.get(r.key);
+    if (summaryText !== undefined) {
+      writeUnit(r, summaryText);
+      continue;
+    }
+    const d = decisions.get(r.key);
+    if (!d) continue;
+    if (covered.has(r.key) || r.stubbed === true || isPrunedStub(r.text)) continue;
+    const recall = rememberOutput(st, r, cfg);
+    const stub = makeStub(r, d.reason, cfg, ratio, recall);
+    writeUnit(r, stub.stub);
+    r.stubbed = true;
+    d.savedChars = stub.savedChars;
+    d.savedTokens = stub.savedTokens;
+    count++;
+    savedChars += stub.savedChars;
+    savedTokens += stub.savedTokens;
+  }
+  return { summaryApplied, applied: { count, savedChars, savedTokens } };
+}
+
+function sentTokens(
+  byKey: Map<string, CollectedResult>,
+  rawTotal: number,
+  overhead: number,
+  decisions: Map<string, Decision>,
+  summarySaved: number,
+): number {
+  // Same arithmetic as scanning every result, but O(decisions): each decision
+  // shaves its unit's tokens (floored at zero) off the cached raw total.
+  let total = overhead + rawTotal - summarySaved;
+  for (const d of decisions.values()) {
+    const r = byKey.get(d.key);
+    if (!r) continue;
+    total += Math.max(0, r.tokens - d.savedTokens) - r.tokens;
+  }
+  return Math.max(0, total);
 }
 
 // ----------------------------------------------------------------------------
@@ -2198,8 +2910,20 @@ function digestOwners(value: unknown): string[] {
   return out;
 }
 
-function summaryPrompt(source: string, topic: string, reason: string, protectedBlocks: string[]): string {
+function summaryPrompt(source: string, topic: string, reason: string, protectedBlocks: string[], cfg?: Config, toolName?: string): string {
   const focus = topic || "the conversation so far";
+  // E25: use custom template if provided
+  if (cfg?.summaryPromptTemplate) {
+    return cfg.summaryPromptTemplate
+      .replace(/\{source\}/g, source)
+      .replace(/\{topic\}/g, focus)
+      .replace(/\{reason\}/g, reason || "context limit")
+      .replace(/\{protectedBlocks\}/g, protectedBlocks.map((b) => `<protect>${b}</protect>`).join("\n"));
+  }
+  // E26: per-tool prompt hint
+  const hint = toolName && cfg?.toolStrategies?.[toolName]?.promptHint
+    ? `\n\nAdditional guidance for ${toolName}: ${cfg.toolStrategies[toolName].promptHint}`
+    : "";
   return [
     "You compress part of a coding-agent conversation so it fits in a smaller context window.",
     "Rewrite the material as a dense, factual summary another coding agent can act on.",
@@ -2217,21 +2941,23 @@ function summaryPrompt(source: string, topic: string, reason: string, protectedB
     ...protectedBlocks.map((b) => `<protect>${b}</protect>`),
   ]
     .filter(Boolean)
-    .join("\n");
+    .join("\n") + hint;
 }
 
 /**
  * Deterministic digest used when the summariser model cannot be reached: the
  * head of every covered unit plus a pointer, so nothing is lost silently.
  */
-function fallbackSummary(units: CollectedResult[]): string {
+function fallbackSummary(units: CollectedResult[], cfg: Config): string {
+  const locale = cfg.locale ?? "en";
   const parts = units.map((r) => `- ${r.name} (~${r.tokens} tokens): ${r.text.slice(0, 200).replace(/\s+/g, " ").trim()}`);
-  return ["Unavailable to summarise (model call failed); heads of the covered output:", ...parts].join("\n");
+  return [t("summaryUnavailable", locale) + ":", ...parts].join("\n");
 }
 
-function buildSummaryText(summaryBody: string, protectedBlocks: string[], prose = false, filePaths?: string[]): string {
+function buildSummaryText(summaryBody: string, protectedBlocks: string[], prose = false, filePaths?: string[], cfg?: Config): string {
   const mark = prose ? PROSE_SUMMARY_MARK : SUMMARY_MARK;
-  const fileLine = filePaths && filePaths.length ? `Compressed files: ${filePaths.join(", ")}. ` : "";
+  const locale = cfg?.locale ?? "en";
+  const fileLine = filePaths && filePaths.length ? `${t("compressedFiles", locale)}: ${filePaths.join(", ")}. ` : "";
   const blocks = protectedBlocks.map((b) => `<protect>${b}</protect>`).join("\n");
   return `${mark} ${fileLine}${summaryBody.trim()}${blocks ? `\n\n${blocks}` : ""}`;
 }
@@ -2239,21 +2965,27 @@ function buildSummaryText(summaryBody: string, protectedBlocks: string[], prose 
 // ----------------------------------------------------------------------------
 // reporting
 
-function renderStats(): string {
+function renderStats(cfg: Config): string {
+  const grossSavings = totals.savedTokens + totals.summarySavedTokens;
+  const netSavings = grossSavings - totals.compressionCallTokens;
+  const locale = cfg.locale ?? "en";
   return [
-    "context-pruner (context compiler)",
+    t("statsTitle", locale),
     "",
-    `requests compiled: ${totals.requests}`,
-    `tool results pruned: ${totals.pruned}`,
-    `stubbed below summary floor: ${totals.stubbed} (~${totals.stubSavedTokens} tokens)`,
-    `summaries generated: ${totals.summaries} (model calls: ${totals.generations})`,
-    `characters saved: ${totals.savedChars}`,
-    `estimated tokens saved: ${totals.savedTokens + totals.summarySavedTokens}`,
-    `  · pruning: ${totals.savedTokens}`,
-    `  · summaries: ${totals.summarySavedTokens}`,
-    `  · of the pruning total, stubs: ${totals.stubSavedTokens}`,
-    `nudges sent: ${totals.nudgeCount}`,
-    `tracked sessions: ${sessions.size}`,
+    `${t("requestsCompiled", locale)}: ${totals.requests}`,
+    `${t("toolResultsPruned", locale)}: ${totals.pruned}`,
+    `${t("stubbedBelowFloor", locale)}: ${totals.stubbed} (~${totals.stubSavedTokens} tokens)`,
+    `${t("summariesGenerated", locale)}: ${totals.summaries} (model calls: ${totals.generations})`,
+    `${t("charactersSaved", locale)}: ${totals.savedChars}`,
+    `${t("estimatedTokensSaved", locale)}: ${grossSavings}`,
+    `  · ${t("pruning", locale)}: ${totals.savedTokens}`,
+    `  · ${t("summaries", locale)}: ${totals.summarySavedTokens}`,
+    `  · ${t("ofPruningTotal", locale)}: ${totals.stubSavedTokens}`,
+    `${t("compressionCost", locale)}: ${totals.compressionCallTokens} tokens ($${totals.compressionCallCost.toFixed(4)})`,
+    `${t("netSavings", locale)}: ${netSavings} tokens`,
+    `${t("lowQualityCompressions", locale)}: ${totals.lowQualityCompressions}`,
+    `${t("nudgesSent", locale)}: ${totals.nudgeCount}`,
+    `${t("trackedSessions", locale)}: ${sessions.size}`,
   ].join("\n");
 }
 
@@ -2286,89 +3018,249 @@ function topicLedger(st: SessionState, cfg: Config): Array<{ topic: string; summ
 
 function renderReport(sessionID: string | undefined, cfg: Config): string {
   const st = sessionID ? sessions.get(sessionID) : undefined;
-  const lines: string[] = ["context-pruner — context compiler", ""];
+  const locale = cfg.locale ?? "en";
+  const lines: string[] = [t("reportTitle", locale), ""];
   if (!st) {
-    lines.push("No request has been compiled for this session yet.");
-    lines.push(`tracked sessions: ${sessions.size}`);
+    lines.push(t("noRequestCompiled", locale));
+    lines.push(`${t("trackedSessions", locale)}: ${sessions.size}`);
     return lines.join("\n");
   }
   const hitRatio = st.inputTokens + st.cacheRead > 0 ? st.cacheRead / (st.inputTokens + st.cacheRead) : 0;
   const window = st.window ?? limitTokens(cfg.maxContextLimit, 0) ?? "unknown";
-  lines.push(`requests compiled: ${st.requestCount}`);
-  lines.push(`epoch: ${st.epoch} (replans: ${st.replanCount})`);
-  lines.push(`window: ${window}  budget: ${st.budget ?? "n/a"}  target: ${st.target ?? "n/a"}`);
-  lines.push(`model ref: ${st.modelRef || "(none)"}  models cached: ${modelCacheSize}`);
-  lines.push(`checkpoints: ${totals.checkpoints}  overflow recoveries: ${totals.overflowRecoveries}  recalls: ${totals.recalls}`);
-  lines.push(`retry state: recover target ${st.recoveryTarget ?? "n/a"}  attempts ${st.overflowRetries}`);
-  lines.push(`calibration ratio: ${st.ratio.toFixed(3)}  cache hit: ${(hitRatio * 100).toFixed(1)}%`);
+  lines.push(`${t("requestsCompiled", locale)}: ${st.requestCount}`);
+  lines.push(`${t("epoch", locale)}: ${st.epoch} (replans: ${st.replanCount})`);
+  lines.push(`${t("window", locale)}: ${window}  budget: ${st.budget ?? "n/a"}  target: ${st.target ?? "n/a"}`);
+  lines.push(`${t("modelRef", locale)}: ${st.modelRef || "(none)"}  models cached: ${modelCacheSize}`);
+  lines.push(`${t("checkpoints", locale)}: ${totals.checkpoints}  overflow recoveries: ${totals.overflowRecoveries}  recalls: ${totals.recalls}`);
+  lines.push(`${t("retryState", locale)}: recover target ${st.recoveryTarget ?? "n/a"}  attempts ${st.overflowRetries}`);
+  lines.push(`${t("calibrationRatio", locale)}: ${st.ratio.toFixed(3)}  cache hit: ${(hitRatio * 100).toFixed(1)}%`);
   if (st.inputCost > 0) {
     const effective = effectiveInputPrice(st);
     const basis = st.cacheRead > 0 && st.cacheReadPrice > 0 ? "input − cache read" : "input tokens";
     lines.push(
-      `estimated cost saved: $${(st.savedTokensTotal * effective).toFixed(4)} (at $${(effective * 1_000_000).toFixed(2)}/M ${basis})`,
+      `${t("estimatedCostSaved", locale)}: $${(st.savedTokensTotal * effective).toFixed(4)} (at $${(effective * 1_000_000).toFixed(2)}/M ${basis})`,
     );
     if (st.cacheRead > 0 && st.cacheReadPrice > 0 && st.inputCost > st.cacheReadPrice) {
       lines.push(
-        `cache savings: $${(st.cacheRead * (st.inputCost - st.cacheReadPrice)).toFixed(4)} (${st.cacheRead} cached tokens vs input price)`,
+        `${t("cacheSavings", locale)}: $${(st.cacheRead * (st.inputCost - st.cacheReadPrice)).toFixed(4)} (${st.cacheRead} cached tokens vs input price)`,
       );
     }
   }
-  lines.push(`prompt tokens: ${st.inputTokens}  cache read: ${st.cacheRead}  cache write: ${st.cacheWrite}`);
+  if (st.compressionCallTokens > 0 || st.compressionCallCost > 0) {
+    lines.push(
+      `${t("compressionCost", locale)}: ${st.compressionCallTokens} tokens ($${st.compressionCallCost.toFixed(4)})`,
+    );
+    const netTokens = st.savedTokensTotal - st.compressionCallTokens;
+    lines.push(`${t("netSavings", locale)}: ${netTokens} tokens`);
+  }
+  lines.push(`${t("promptTokens", locale)}: ${st.inputTokens}  cache read: ${st.cacheRead}  cache write: ${st.cacheWrite}`);
   if (st.cacheRead > 0 || st.cacheWrite > 0) {
     const short = st.lastReplan === "deferred" && st.lastReplanShort > 0 ? ` (short ${Math.ceil(st.lastReplanShort)})` : "";
     lines.push(
-      `cache economics: ${cfg.cacheAware ? "on" : "off"}  replan gate: ${st.lastGate} tok  last replan: ${st.lastReplan ?? "n/a"}${short}`,
+      `${t("cacheEconomics", locale)}: ${cfg.cacheAware ? "on" : "off"}  replan gate: ${st.lastGate} tok  last replan: ${st.lastReplan ?? "n/a"}${short}`,
     );
   }
-  lines.push(`active prune decisions: ${st.decisions.size}`);
+  lines.push(`${t("activePruneDecisions", locale)}: ${st.decisions.size}`);
   const proseSummaries = [...st.summaries.values()].filter((r) => r.prose).length;
   lines.push(
-    `active summaries: ${st.summaries.size} (covering ${coveredKeys(st).size} units, ~${st.summarySavedTokens} tokens saved${proseSummaries ? `, ${proseSummaries} prose` : ""})`,
+    `${t("activeSummaries", locale)}: ${st.summaries.size} (covering ${coveredKeys(st).size} units, ~${st.summarySavedTokens} tokens saved${proseSummaries ? `, ${proseSummaries} prose` : ""})`,
   );
   const ledger = topicLedger(st, cfg);
   if (ledger.length > 0) {
-    lines.push("savings by topic:");
+    lines.push(t("savingsByTopic", locale) + ":");
     for (const row of ledger) {
       lines.push(`  · ${row.topic} — ${row.summaries} summaries, ${row.units} units, ~${row.saved} tokens saved`);
     }
   }
-  lines.push(`nudges sent: ${st.nudges}  tool calls since last summary: ${st.iterationsSinceCompress}`);
+  lines.push(`${t("nudgesSent", locale)}: ${st.nudges}  tool calls since last summary: ${st.iterationsSinceCompress}`);
   lines.push(
-    `span collapse: ${cfg.collapseRanges ? "on" : "off"}${cfg.collapseStubs ? "+stubs" : ""}  last request: ${st.collapseSpans} span(s), ${st.collapseMessages} message(s), ~${st.collapseSavedTokens} tokens`,
+    `${t("spanCollapse", locale)}: ${cfg.collapseRanges ? "on" : "off"}${cfg.collapseStubs ? "+stubs" : ""}  last request: ${st.collapseSpans} span(s), ${st.collapseMessages} message(s), ~${st.collapseSavedTokens} tokens`,
   );
-  lines.push(`mode: ${cfg.manualMode.enabled ? "manual" : "automatic"}  turnProtection: ${cfg.turnProtection.enabled ? `${cfg.turnProtection.turns} turns` : "off"}`);
+  lines.push(`${t("mode", locale)}: ${cfg.manualMode.enabled ? "manual" : "automatic"}  turnProtection: ${cfg.turnProtection.enabled ? `${cfg.turnProtection.turns} turns` : "off"}`);
   lines.push(
-    `hooks: compaction=${cfg.compactionCheckpoint ? "on" : "off"} retry=${cfg.retryOnOverflow ? "on" : "off"} title=${cfg.titleShortCircuit ? "on" : "off"} recall=${cfg.recall ? "on" : "off"}`,
+    `${t("hooks", locale)}: compaction=${cfg.compactionCheckpoint ? "on" : "off"} retry=${cfg.retryOnOverflow ? "on" : "off"} title=${cfg.titleShortCircuit ? "on" : "off"} recall=${cfg.recall ? "on" : "off"}`,
   );
-  if (cfg.configPath) lines.push(`config file: ${cfg.configPath}`);
+  if (cfg.configPath) lines.push(`${t("configFile", locale)}: ${cfg.configPath}`);
   if (st.decisions.size > 0) {
     for (const d of st.decisions.values()) {
       lines.push(`  · ${d.key} — ${d.reason} (~${d.savedTokens} tokens)`);
     }
   }
   lines.push("");
-  lines.push(renderStats());
+  lines.push(renderStats(cfg));
   return lines.join("\n");
 }
 
 function renderContextMap(st: SessionState, cfg: Config, limit = 50): string {
   const list = st.compressible;
-  if (list.length === 0) return "No compressible context recorded yet.";
+  const locale = cfg.locale ?? "en";
+  if (list.length === 0) return t("noCompressibleContext", locale);
   const textProtected = protectedTextKeys(list, st, cfg);
-  const lines = ["compressible context (oldest first):"];
+  const lines = [t("contextMapTitle", locale) + ":"];
   // C11: the map is embedded in nudges — an unbounded listing would eat the
   // very context it is trying to save.
   const shown = list.slice(0, Math.max(1, limit));
   shown.forEach((r, index) => {
-    const protectedFlag = isProtected(r, cfg) || textProtected.has(r.key) ? " [protected]" : "";
+    const protectedFlag = isProtected(r, cfg) || textProtected.has(r.key) ? ` [${t("protectedMarker", locale)}]` : "";
     const preview = r.text.slice(0, 80).replace(/\s+/g, " ");
     lines.push(`#${index + 1} ${r.name} ~${r.tokens} tokens${protectedFlag} — ${preview}`);
   });
   if (list.length > shown.length) {
-    lines.push(`… and ${list.length - shown.length} more (call context_map for the full list).`);
+    lines.push(`${t("contextMapMore", locale)} ${list.length - shown.length} more (call context_map for the full list).`);
   }
   lines.push("");
-  lines.push("Call `compress` with from/to (#N or a message id), before, after, or last to summarise a range.");
+  lines.push(t("contextMapCallCompress", locale));
+  return lines.join("\n");
+}
+
+// ----------------------------------------------------------------------------
+// E30: session state export/import
+
+function exportSessionState(sessionID: string): string {
+  const st = sessions.get(sessionID);
+  if (!st) return JSON.stringify({ error: "session not found" });
+  const decisions = Array.from(st.decisions.values());
+  const summaries = Array.from(st.summaries.values());
+  const recall = Array.from(st.recall.entries()).map(([id, entry]) => ({ id, ...entry }));
+  return JSON.stringify({
+    version: 1,
+    sessionID,
+    epoch: st.epoch,
+    decisions,
+    summaries,
+    recall,
+    inputTokens: st.inputTokens,
+    cacheRead: st.cacheRead,
+    cacheWrite: st.cacheWrite,
+    savedTokensTotal: st.savedTokensTotal,
+    summarySavedTokens: st.summarySavedTokens,
+    compressionCallTokens: st.compressionCallTokens,
+    compressionCallCost: st.compressionCallCost,
+    lowQualityCompressions: st.lowQualityCompressions,
+    nudges: st.nudges,
+    requestCount: st.requestCount,
+    replanCount: st.replanCount,
+    iterationsSinceCompress: st.iterationsSinceCompress,
+    lastToolCallTotal: st.lastToolCallTotal,
+    textProtectedFrom: st.textProtectedFrom,
+    turnProtectedFrom: st.turnProtectedFrom,
+    collapseSpans: st.collapseSpans,
+    collapseMessages: st.collapseMessages,
+    collapseSavedTokens: st.collapseSavedTokens,
+  });
+}
+
+function importSessionState(sessionID: string, json: string): boolean {
+  try {
+    const data = JSON.parse(json);
+    if (!isPlainObject(data)) return false;
+    let st = sessions.get(sessionID);
+    if (!st) {
+      st = stateFor(sessionID);
+    }
+    if (typeof data.epoch === "number") st.epoch = data.epoch;
+    if (Array.isArray(data.decisions)) {
+      for (const d of data.decisions) {
+        if (isPlainObject(d) && typeof d.key === "string") {
+          st.decisions.set(d.key, d as Decision);
+        }
+      }
+    }
+    if (Array.isArray(data.summaries)) {
+      for (const s of data.summaries) {
+        if (isPlainObject(s) && typeof s.first === "string") {
+          st.summaries.set(s.first, s as SummaryRecord);
+        }
+      }
+    }
+    if (Array.isArray(data.recall)) {
+      for (const r of data.recall) {
+        if (isPlainObject(r) && typeof r.id === "string") {
+          st.recall.set(r.id, r as { tool: string; text: string; chars: number; at: number });
+        }
+      }
+    }
+    if (typeof data.inputTokens === "number") st.inputTokens = data.inputTokens;
+    if (typeof data.cacheRead === "number") st.cacheRead = data.cacheRead;
+    if (typeof data.cacheWrite === "number") st.cacheWrite = data.cacheWrite;
+    if (typeof data.savedTokensTotal === "number") st.savedTokensTotal = data.savedTokensTotal;
+    if (typeof data.summarySavedTokens === "number") st.summarySavedTokens = data.summarySavedTokens;
+    if (typeof data.compressionCallTokens === "number") st.compressionCallTokens = data.compressionCallTokens;
+    if (typeof data.compressionCallCost === "number") st.compressionCallCost = data.compressionCallCost;
+    if (typeof data.lowQualityCompressions === "number") st.lowQualityCompressions = data.lowQualityCompressions;
+    if (typeof data.nudges === "number") st.nudges = data.nudges;
+    if (typeof data.requestCount === "number") st.requestCount = data.requestCount;
+    if (typeof data.replanCount === "number") st.replanCount = data.replanCount;
+    if (typeof data.iterationsSinceCompress === "number") st.iterationsSinceCompress = data.iterationsSinceCompress;
+    if (typeof data.lastToolCallTotal === "number") st.lastToolCallTotal = data.lastToolCallTotal;
+    if (typeof data.textProtectedFrom === "number") st.textProtectedFrom = data.textProtectedFrom;
+    if (typeof data.turnProtectedFrom === "number") st.turnProtectedFrom = data.turnProtectedFrom;
+    if (typeof data.collapseSpans === "number") st.collapseSpans = data.collapseSpans;
+    if (typeof data.collapseMessages === "number") st.collapseMessages = data.collapseMessages;
+    if (typeof data.collapseSavedTokens === "number") st.collapseSavedTokens = data.collapseSavedTokens;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// E37: session comparison
+
+function renderComparison(sessionIDs: string[], cfg: Config): string {
+  const locale = cfg.locale ?? "en";
+  const lines: string[] = [t("comparisonTitle", locale), ""];
+  if (sessionIDs.length === 0) {
+    lines.push(t("noSessionsSpecified", locale));
+    return lines.join("\n");
+  }
+  const rows: Array<{
+    sessionID: string;
+    exists: boolean;
+    epoch: number;
+    decisions: number;
+    summaries: number;
+    savedTokens: number;
+    inputTokens: number;
+    compressionCallTokens: number;
+    lowQualityCompressions: number;
+    nudges: number;
+    requestCount: number;
+  }> = [];
+  for (const sid of sessionIDs) {
+    const st = sessions.get(sid);
+    if (!st) {
+      rows.push({ sessionID: sid, exists: false, epoch: 0, decisions: 0, summaries: 0, savedTokens: 0, inputTokens: 0, compressionCallTokens: 0, lowQualityCompressions: 0, nudges: 0, requestCount: 0 });
+    } else {
+      rows.push({
+        sessionID: sid,
+        exists: true,
+        epoch: st.epoch,
+        decisions: st.decisions.size,
+        summaries: st.summaries.size,
+        savedTokens: st.savedTokensTotal,
+        inputTokens: st.inputTokens,
+        compressionCallTokens: st.compressionCallTokens,
+        lowQualityCompressions: st.lowQualityCompressions,
+        nudges: st.nudges,
+        requestCount: st.requestCount,
+      });
+    }
+  }
+  // Header
+  lines.push(
+    `${"session".padEnd(24)} ${"epoch".padStart(6)} ${"decisions".padStart(10)} ${"summaries".padStart(10)} ${"savedTokens".padStart(12)} ${"inputTokens".padStart(12)} ${"compTokens".padStart(12)} ${"lowQual".padStart(8)} ${"nudges".padStart(7)} ${"requests".padStart(9)}`,
+  );
+  lines.push("-".repeat(120));
+  for (const r of rows) {
+    if (!r.exists) {
+      lines.push(`${r.sessionID.slice(0, 24).padEnd(24)} (${t("sessionNotFound", locale)})`);
+    } else {
+      lines.push(
+        `${r.sessionID.slice(0, 24).padEnd(24)} ${String(r.epoch).padStart(6)} ${String(r.decisions).padStart(10)} ${String(r.summaries).padStart(10)} ${String(r.savedTokens).padStart(12)} ${String(r.inputTokens).padStart(12)} ${String(r.compressionCallTokens).padStart(12)} ${String(r.lowQualityCompressions).padStart(8)} ${String(r.nudges).padStart(7)} ${String(r.requestCount).padStart(9)}`,
+      );
+    }
+  }
   return lines.join("\n");
 }
 
@@ -2406,12 +3298,83 @@ export default Plugin.define({
     const debug = (message: string): void => {
       if (!cfg.debug) return;
       try {
-        const dir = join(homedir(), ".config", "opencode", "logs", "context-pruner");
+        // CP-16: same directory the config is read from. `homedir()` missed the
+        // XDG config root and every portable/XDG install, and a `logs/` path
+        // that was never cleaned grew without bound.
+        const root = globalConfigDirs()[0];
+        if (!root) return;
+        const dir = join(root, "logs", "context-pruner");
         mkdirSync(dir, { recursive: true });
         appendFileSync(join(dir, `${new Date().toISOString().slice(0, 10)}.log`), `${new Date().toISOString()} ${message}\n`);
+        pruneDebugLogs(dir);
       } catch {
         /* ignore */
       }
+    };
+    /**
+     * CP-15: a pruning failure used to go only to `debug()`, which is off by
+     * default — a session could lose every byte of its epoch, recall and summary
+     * state and the user would never see why. The hook still never throws (that
+     * would break the session), but the failure is now reported through `log()`
+     * — i.e. printed even when `log` is off, since this is exactly the case the
+     * user needs it for — at most once per category per session so a broken
+     * store cannot spam stderr on every request. The count is kept so a later
+     * report can say how many were suppressed.
+     */
+    const failureCounts = new Map<string, number>();
+    const reportFailure = (category: string, err: unknown, sessionID?: string): void => {
+      const key = `${category}|${sessionID ?? ""}`;
+      const seen = (failureCounts.get(key) ?? 0) + 1;
+      failureCounts.set(key, seen);
+      // Every failure also lands in the debug log, whatever the reporting says.
+      debug(`[${category}] ${String(err)}`);
+      if (failureCounts.size > 256) {
+        const oldest = failureCounts.keys().next();
+        if (!oldest.done) failureCounts.delete(oldest.value);
+      }
+      const scope = sessionID ? `${category} (${sessionID})` : category;
+      if (seen === 1) {
+        try {
+          console.error(`[context-pruner] ${scope} failed: ${String(err)}`);
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      // Report again on a widening powers-of-two cadence (2, 4, 8, …).
+      if ((seen & (seen - 1)) === 0) {
+        try {
+          console.error(`[context-pruner] ${scope} failed ${seen}x, last: ${String(err)}`);
+        } catch {
+          /* ignore */
+        }
+      }
+    };
+
+    /**
+     * CP-20: claim a digest cache entry for one session as an OWNER, keeping
+     * every owner already recorded. The same content hashes to the same key in
+     * two sessions (a fork, two agents reading the same file), and the old
+     * blind `sessions: [sessionID]` write REPLACED the list: when the session
+     * written first was deleted, `purgeOrphanDigests` saw a single dead owner and
+     * reclaimed a digest a live session was still using.
+     *
+     * The claim is also skipped when this session is already an owner, which
+     * keeps a cache-hit path free of writes (write volume drives `gcStorage`).
+     */
+    const claimDigest = async (key: string, text: string, topic: string, owner: string): Promise<void> => {
+      const existing = await readStore(key, "digest");
+      const owners = digestOwners(existing);
+      if (isPlainObject(existing) && typeof existing.text === "string" && existing.text && owners.includes(owner)) return;
+      const previous = isPlainObject(existing) ? existing : undefined;
+      const merged = [...owners, ...(owner ? [owner] : [])].filter((sid, i, all) => sid && all.indexOf(sid) === i);
+      writeStore(key, {
+        text: previous && typeof previous.text === "string" && previous.text ? previous.text : text,
+        topic: topic || (previous && typeof previous.topic === "string" ? previous.topic : ""),
+        version: VERSION,
+        at: Date.now(),
+        sessions: merged,
+      });
     };
 
     // Config hot reload: opencode only re-reads a plugin when its file changes,
@@ -2442,13 +3405,28 @@ export default Plugin.define({
       }
     }
 
-    const readStore = async (key: string): Promise<unknown> => {
+    const readStore = async (key: string, context?: string, sessionID?: string): Promise<unknown> => {
       try {
         const value = c.storage?.get ? await c.storage.get(key) : undefined;
         return value;
-      } catch {
+      } catch (err) {
+        // CP-15: a failed read means the plugin silently forgets state it
+        // should have restored (epoch, recall, summaries, digests). Report.
+        const split = key.indexOf(":");
+        reportFailure(`store read ${context ?? (split > 0 ? key.slice(0, split) : "store")}`, err, sessionID);
         return undefined;
       }
+    };
+    /**
+     * CP-14: read-modify-write helper. `set` is a blind overwrite, and one key
+     * genuinely has more than one writer (an evicted-then-recreated session
+     * state, a fork, a second opencode process on the same store), so every
+     * durable write re-reads first and merges into whatever the store holds.
+     */
+    const mergeStore = (key: string, merge: (existing: unknown) => unknown, context?: string, sessionID?: string): void => {
+      void Promise.resolve(readStore(key, context, sessionID))
+        .then((existing) => writeStore(key, merge(existing)))
+        .catch((err) => reportFailure(`store merge ${context ?? "state"}`, err, sessionID));
     };
     /** CP-16/17: page through every entry under a prefix (bounded, best-effort). */
     const scanStore = async (prefix: string): Promise<Array<{ key: string; value: unknown }>> => {
@@ -2546,7 +3524,13 @@ export default Plugin.define({
     // CP-1: storage writes are best-effort — a rejecting store must never
     // surface as an unhandled rejection.
     const writeStore = (key: string, value: unknown): void => {
-      guardedSet(c.storage, key, value);
+      // CP-15: a failed write loses the plugin's own durable state (epoch,
+      // recall, summaries, digest cache, calibration) — report it, do not
+      // swallow it whole. The key's namespace scopes the suppression counter.
+      const split = key.indexOf(":");
+      const namespace = split > 0 ? key.slice(0, split) : "store";
+      const owner = split > 0 && (namespace === "epoch" || namespace === "recall" || namespace === "summaries") ? key.slice(split + 1) : undefined;
+      guardedSet(c.storage, key, value, (err) => reportFailure(`store write ${namespace}`, err, owner));
       // CP-17: keep the bounded caches bounded during a long-lived process, not
       // just at startup. Reclaim at most once per batch of writes.
       if (cfg.storageGc && (key.startsWith("summary:") || key.startsWith("calibration:"))) {
@@ -2577,24 +3561,53 @@ export default Plugin.define({
       for (const key of SESSION_KEYS(sessionID)) guardedRemove(c.storage, key);
     };
     /**
-     * CP-18: cached liveness probe. Session deletion can happen while opencode
-     * is closed (no event), so both passes probe `session.get`. A probe that
-     * fails for any reason counts as gone: this state is a cache, so reclaiming
-     * it costs at most one re-read, while leaking it is permanent.
+     * CP-18/CP-13: cached liveness probe. Session deletion can happen while
+     * opencode is closed (no event), so both passes probe `session.get`.
+     *
+     * CP-13: a probe FAILURE is not a NOT-FOUND. `session.get` throws for plenty
+     * of transient reasons (server still starting, a network blip, a rate
+     * limit), and counting that as "gone" deleted the epoch/recall/summaries
+     * keys — and every digest they owned — of a perfectly live session, which
+     * is far more destructive than holding a cache entry. The probe is therefore
+     * tri-state: `true` alive, `false` definitively not found, `null` unknown
+     * (never cached, so the next sweep re-probes). Only `false` reclaims.
      */
     const sessionDomain = c.session as { get?: (input: { sessionID: string }) => Promise<unknown> } | undefined;
+    // CP-19: a long-lived server probes thousands of sessions; this map is a
+    // cache, so it is bounded (FIFO) instead of growing for the process's life.
+    const ALIVE_CACHE_MAX = 512;
     const aliveCache = new Map<string, boolean>();
-    const isAlive = async (sid: string): Promise<boolean> => {
+    /**
+     * CP-13: classify a failed `session.get`. opencode reports a missing session
+     * by THROWING (NotFoundError / a 404), so "it threw" cannot simply mean
+     * "transient" — the sweep would never reclaim anything. But the same call
+     * also throws while the server is still starting or when a request fails.
+     * Only an error that positively says not-found is definitive.
+     */
+    const isNotFoundFailure = (err: unknown): boolean => {
+      const rec = (err ?? {}) as AnyRecord;
+      const status = num(rec.status ?? rec.statusCode, 0);
+      if (status === 404 || status === 410) return true;
+      const text = `${String(rec.name ?? "")} ${String(rec.message ?? "")} ${String((err as Error)?.message ?? "")} ${String(err ?? "")}`.toLowerCase();
+      return /(not\s*found|no such|does not exist|unknown session|invalid session)/.test(text);
+    };
+    const isAlive = async (sid: string): Promise<boolean | null> => {
       const cached = aliveCache.get(sid);
       if (cached !== undefined) return cached;
-      let alive = false;
-      if (typeof sessionDomain?.get === "function") {
-        try {
-          const info = await sessionDomain.get({ sessionID: sid });
-          alive = Boolean(info && (info as AnyRecord).id);
-        } catch {
-          alive = false;
-        }
+      if (typeof sessionDomain?.get !== "function") return null;
+      let alive: boolean | null;
+      try {
+        const info = await sessionDomain.get({ sessionID: sid });
+        // A missing session object (or one without an id) is the host's
+        // definitive "not found"; a throw is only definitive when it says so.
+        alive = Boolean(info && (info as AnyRecord).id) ? true : false;
+      } catch (err) {
+        alive = isNotFoundFailure(err) ? false : null;
+      }
+      if (alive === null) return null;
+      if (aliveCache.size >= ALIVE_CACHE_MAX) {
+        const oldest = aliveCache.keys().next();
+        if (!oldest.done) aliveCache.delete(oldest.value);
       }
       aliveCache.set(sid, alive);
       return alive;
@@ -2602,7 +3615,8 @@ export default Plugin.define({
     /**
      * CP-18: reclaim digest-cache entries whose owning sessions are all gone.
      * Entries shared by a live session survive; untagged legacy entries are
-     * left to the count-based GC (CP-17).
+     * left to the count-based GC (CP-17). CP-13: an owner whose probe failed is
+     * unknown, not gone, and keeps the digest.
      */
     const purgeOrphanDigests = async (): Promise<void> => {
       if (typeof sessionDomain?.get !== "function") return;
@@ -2610,16 +3624,18 @@ export default Plugin.define({
         const owners = digestOwners(entry.value);
         if (owners.length === 0) continue;
         let anyAlive = false;
+        let anyUnknown = false;
         for (const sid of owners) {
-          if (await isAlive(sid)) {
+          const alive = await isAlive(sid);
+          if (alive === true) {
             anyAlive = true;
             break;
           }
+          if (alive === null) anyUnknown = true;
         }
-        if (!anyAlive) {
-          debug(`reclaimed digest ${entry.key} (sessions: ${owners.join(", ")})`);
-          guardedRemove(c.storage, entry.key);
-        }
+        if (anyAlive || anyUnknown) continue;
+        debug(`reclaimed digest ${entry.key} (sessions: ${owners.join(", ")})`);
+        guardedRemove(c.storage, entry.key);
       }
     };
     /**
@@ -2638,7 +3654,9 @@ export default Plugin.define({
         }
       }
       for (const sid of seen) {
-        if (!(await isAlive(sid))) {
+        // CP-13: only a definitive not-found reclaims; an unknown probe is
+        // retried on the next sweep rather than deleting a live session's state.
+        if ((await isAlive(sid)) === false) {
           debug(`reclaimed orphaned state for deleted session ${sid}`);
           forgetSession(sid);
         }
@@ -2651,6 +3669,17 @@ export default Plugin.define({
 
     const notify = (sessionID: string, summaryLine: string, detail: string): void => {
       if (cfg.notify === "off") return;
+      // E29: custom notification hook
+      if (cfg.notifyHook) {
+        try {
+          cfg.notifyHook(sessionID, summaryLine, detail);
+        } catch {
+          /* ignore */
+        }
+        return;
+      }
+      // E39: localize the notification prefix
+      const locale = cfg.locale ?? "en";
       // Minimal stays a single line; detailed is that line plus the detail.
       const text = cfg.notify === "minimal" ? summaryLine : `${summaryLine}\n${detail}`;
       if (cfg.notifyType === "chat") {
@@ -2671,17 +3700,17 @@ export default Plugin.define({
       }
     };
 
-    const loadSummaries = async (sessionID: string, st: SessionState): Promise<void> => {
-      if (st.loadedSummaries) return;
-      st.loadedSummaries = true;
-      const raw = await readStore(`summaries:${sessionID}`);
-      if (!Array.isArray(raw)) return;
+    /** Parse a stored `summaries:<sid>` array into records (CP-14: shared by
+     * the loader and the merge-on-write path). */
+    const parseSummaryEntries = (raw: unknown): SummaryRecord[] => {
+      const out: SummaryRecord[] = [];
+      if (!Array.isArray(raw)) return out;
       for (const entry of raw) {
         if (!isPlainObject(entry)) continue;
         const covers = asList(entry.covers);
         const text = typeof entry.text === "string" ? entry.text : "";
         if (covers.length === 0 || !text) continue;
-        st.summaries.set(covers[0], {
+        out.push({
           first: covers[0],
           covers,
           hashes: Array.isArray(entry.hashes) ? entry.hashes.map((h) => num(h)) : [],
@@ -2689,7 +3718,23 @@ export default Plugin.define({
           tokens: num(entry.tokens),
           topic: typeof entry.topic === "string" ? entry.topic : "",
           at: num(entry.at),
+          // CP-6 classification must survive the round trip: the merge-on-write
+          // path below rebuilds every record through this parser, so dropping it
+          // here silently turned every reloaded prose summary into a tool
+          // summary (`context_report` stopped counting prose, and the flag the
+          // apply path branches on was gone).
+          prose: entry.prose === true,
         });
+      }
+      return out;
+    };
+
+    const loadSummaries = async (sessionID: string, st: SessionState): Promise<void> => {
+      if (st.loadedSummaries) return;
+      st.loadedSummaries = true;
+      for (const rec of parseSummaryEntries(await readStore(`summaries:${sessionID}`, "summaries", sessionID))) {
+        // CP-14: union by key, newest `at` wins.
+        if (!st.summaries.has(rec.first) || (st.summaries.get(rec.first)?.at ?? 0) <= rec.at) st.summaries.set(rec.first, rec);
       }
     };
 
@@ -2697,62 +3742,156 @@ export default Plugin.define({
     // (same best-effort pattern as summaries/recall). stateFor() flushes on
     // eviction and reloads lazily on creation via this registration.
     epochStore = {
-      save: (sid, snap) => writeStore(`epoch:${sid}`, { ...snap, at: Date.now() }),
-      load: async (sid) => sanitizeEpochSnapshot(await readStore(`epoch:${sid}`)),
+      // CP-14: the epoch is monotonic. An evicted-then-recreated session state
+      // flushes epoch 0 into a key that already holds N; a plain overwrite sent
+      // the session backwards and the next request re-pruned a prefix the
+      // provider had cached under the newer layout. Decisions are written as
+      // this state's authoritative snapshot (compress DELETES entries on
+      // purpose, so a union would resurrect stubs for units a summary already
+      // replaced) — only the epoch is merged forward.
+      save: (sid, snap) =>
+        mergeStore(
+          `epoch:${sid}`,
+          (existing) => {
+            const prev = sanitizeEpochSnapshot(existing);
+            return { epoch: Math.max(prev?.epoch ?? 0, snap.epoch), decisions: snap.decisions, at: Date.now() };
+          },
+          "epoch",
+          sid,
+        ),
+      load: async (sid) => sanitizeEpochSnapshot(await readStore(`epoch:${sid}`, "epoch", sid)),
     };
 
-    const persistSummaries = (sessionID: string, st: SessionState): void => {
-      if (cfg.summaryKeep > 0) {
-        while (st.summaries.size > cfg.summaryKeep) {
-          let oldestKey: string | undefined;
-          let oldestAt = Infinity;
-          for (const [key, rec] of st.summaries) {
-            if (rec.at < oldestAt) {
-              oldestAt = rec.at;
-              oldestKey = key;
-            }
+    /** Drop the oldest records until the session is within `summaryKeep`. */
+    const trimSummaries = (st: SessionState): void => {
+      if (cfg.summaryKeep <= 0) return;
+      while (st.summaries.size > cfg.summaryKeep) {
+        let oldestKey: string | undefined;
+        let oldestAt = Infinity;
+        for (const [key, rec] of st.summaries) {
+          if (rec.at < oldestAt) {
+            oldestAt = rec.at;
+            oldestKey = key;
           }
-          if (oldestKey === undefined) break;
-          st.summaries.delete(oldestKey);
         }
+        if (oldestKey === undefined) break;
+        st.summaries.delete(oldestKey);
       }
-      writeStore(`summaries:${sessionID}`, [...st.summaries.values()]);
     };
 
-    const loadRecall = async (sessionID: string, st: SessionState): Promise<void> => {
-      if (st.loadedRecall) return;
-      st.loadedRecall = true;
-      const raw = await readStore(`recall:${sessionID}`);
-      if (!Array.isArray(raw)) return;
+    /**
+     * CP-14: merge-on-write. The old code wrote `[...st.summaries.values()]`
+     * blind, so a second writer on the same key (evict-and-recreate, fork,
+     * another process) had its summaries deleted by the next flush — deleting a
+     * summary record loses the digest the transcript pointers refer to and the
+     * next request re-spends a `session.generate` call to rebuild it. Re-read
+     * inside the session's persist chain and union by key, newest `at` wins.
+     *
+     * The returned promise is the write itself, so an `await`ing caller (the
+     * compress tool) observes the flush it just asked for. Fire-and-forget
+     * callers still serialise behind the same per-session chain, so ordering —
+     * which is what makes the merge correct — is unchanged.
+     */
+    const summaryChains = new Map<string, Promise<void>>();
+    const persistSummaries = (sessionID: string, st: SessionState): Promise<void> => {
+      trimSummaries(st);
+      const tail = summaryChains.get(sessionID) ?? Promise.resolve();
+      const head = tail
+        .then(async () => {
+          const merged = new Map<string, SummaryRecord>();
+          for (const rec of parseSummaryEntries(await readStore(`summaries:${sessionID}`, "summaries", sessionID))) merged.set(rec.first, rec);
+          for (const rec of st.summaries.values()) {
+            const held = merged.get(rec.first);
+            if (!held || held.at <= rec.at) merged.set(rec.first, rec);
+          }
+          let list = [...merged.values()];
+          // Newest records win the cap: a reloaded record's own `at` decides its
+          // rank, so a fork's older summaries are the ones evicted.
+          if (cfg.summaryKeep > 0 && list.length > cfg.summaryKeep) {
+            list = list.sort((a, b) => a.at - b.at).slice(-cfg.summaryKeep);
+          }
+          writeStore(`summaries:${sessionID}`, list);
+        })
+        .catch((err) => {
+          reportFailure("persist summaries", err, sessionID);
+        });
+      summaryChains.set(sessionID, head);
+      if (summaryChains.size > 20) {
+        const first = summaryChains.keys().next().value as string | undefined;
+        if (first !== undefined && first !== sessionID) summaryChains.delete(first);
+      }
+      void head.then(() => {
+        if (summaryChains.get(sessionID) === head) summaryChains.delete(sessionID);
+      }).catch(() => {});
+      return head;
+    };
+
+    /** Parse a stored `recall:<sid>` array into entries (CP-14: shared by the
+     * loader and the merge-on-write path). */
+    const parseRecallEntries = (raw: unknown): Array<{ id: string; entry: RecallEntry }> => {
+      const out: Array<{ id: string; entry: RecallEntry }> = [];
+      if (!Array.isArray(raw)) return out;
       for (const entry of raw) {
         if (!isPlainObject(entry)) continue;
         const id = typeof entry.id === "string" ? entry.id : "";
         const text = typeof entry.text === "string" ? entry.text : "";
         if (!id || !text) continue;
-        st.recall.set(id, {
-          tool: typeof entry.tool === "string" ? entry.tool : "",
-          text,
-          chars: num(entry.chars, text.length),
-          at: num(entry.at),
+        out.push({
+          id,
+          entry: {
+            tool: typeof entry.tool === "string" ? entry.tool : "",
+            text,
+            chars: num(entry.chars, text.length),
+            at: num(entry.at),
+            hits: num(entry.hits),
+            ...(typeof entry.priority === "number" ? { priority: num(entry.priority) } : {}),
+          },
         });
       }
-      evictRecall(st, cfg.recallKeep);
+      return out;
     };
 
-    /** Flush newly pruned outputs, merging anything already persisted first. */
+    /** CP-14: union parsed entries into the session map, newest `at` wins. */
+    const mergeRecallEntries = (st: SessionState, parsed: Array<{ id: string; entry: RecallEntry }>): void => {
+      for (const { id, entry } of parsed) {
+        const held = st.recall.get(id);
+        if (!held || held.at <= entry.at) st.recall.set(id, entry);
+      }
+    };
+
+    const loadRecall = async (sessionID: string, st: SessionState): Promise<void> => {
+      if (st.loadedRecall) return;
+      st.loadedRecall = true;
+      mergeRecallEntries(st, parseRecallEntries(await readStore(`recall:${sessionID}`, "recall", sessionID)));
+      evictRecall(st, cfg.recallKeep, cfg.evictionPolicy);
+    };
+
+    /**
+     * Flush newly pruned outputs. CP-14: this is a genuine read-modify-write —
+     * `st.recall` only holds what this process remembered, so writing it blind
+     * deleted entries another writer (or this session before an eviction) had
+     * stored, and a lost entry is output the model can no longer recall without
+     * re-running the tool. The chain already serialized this session's own
+     * flushes (CP-2); it now re-reads the stored array inside the chain and
+     * unions by `at` instead of relying on the load-once `loadRecall` guard —
+     * which never re-read, so the "merging anything already persisted" the
+     * comment promised never happened after the first load.
+     */
     const persistRecall = (sessionID: string, st: SessionState): void => {
       if (!st.recallDirty) return;
       // CP-2: chain onto the session's pending persist so an in-flight
       // read-modify-write finishes before the next one starts.
       const tail = persistChains.get(sessionID) ?? Promise.resolve();
       const head = tail
-        .then(() => loadRecall(sessionID, st))
-        .then(() => {
+        .then(async () => {
+          mergeRecallEntries(st, parseRecallEntries(await readStore(`recall:${sessionID}`, "recall", sessionID)));
+          evictRecall(st, cfg.recallKeep, cfg.evictionPolicy);
           writeStore(`recall:${sessionID}`, [...st.recall.entries()].map(([id, entry]) => ({ id, ...entry })));
           st.recallDirty = false;
         })
-        .catch(() => {
-          /* CP-1: ignore */
+        .catch((err) => {
+          // CP-15: report — the recall entries this flush would have stored are gone.
+          reportFailure("persist recall", err, sessionID);
         });
       persistChains.set(sessionID, head);
       if (persistChains.size > 20) {
@@ -2823,7 +3962,7 @@ export default Plugin.define({
         (window > 0 && estimate >= Math.floor(window * cfg.autoSummarizeRatio));
       if (sum < cfg.autoSummarizeMinTokens) {
         if (cfg.autoSummarizeStub && st.pendingEstimate > st.target) {
-          const autoPlan = planDecisions(st.compressible, chosen, cfg, st.ratio, null);
+          const autoPlan = planDecisions(st.compressible, chosen, cfg, st.ratio, null, debug);
           // C6: persist the ad-hoc stub decisions into the current epoch —
           // recomputing them every request let them flip-flop and broke the
           // byte-identical prompt prefix the provider cache relies on.
@@ -2856,6 +3995,16 @@ export default Plugin.define({
       st.autoSummarizing = true;
       try {
         const raw = chosen.map((r) => `### ${r.name}\n${r.text}`).join("\n\n");
+        // CP-10: `chosen` aliases the live `st.compressible` units, and the
+        // hook's own applyDecisions runs (synchronously, after this function
+        // yields at its first await) and now rewrites `r.text` to the stub it
+        // sent. Snapshot the identity data the record needs while the units
+        // still hold their original text — hashing stub text instead would make
+        // the record look stale on the very next request, dropping the summary
+        // and re-spending the model call.
+        const chosenHashes = coverHashes(chosen);
+        const chosenPaths = chosen.map((r) => filePathOf(r)).filter(Boolean) as string[];
+        const chosenProse = chosen.every((r) => r.kind === "text");
         let blocks: string[] = [];
         let source = raw;
         if (cfg.protectTags) {
@@ -2863,43 +4012,58 @@ export default Plugin.define({
           source = extracted.stripped;
           blocks = extracted.blocks;
         }
-        if (source.length > cfg.compressMaxSourceChars) source = `${source.slice(0, cfg.compressMaxSourceChars)}\n\n[truncated]`;
+        const maxSrc = maxSourceCharsFor(chosen[0]?.name, cfg);
+        if (source.length > maxSrc) source = `${source.slice(0, maxSrc)}\n\n[truncated]`;
 
         const cacheKey = `summary:${hash32(`${VERSION}\u0000auto\u0000${source}`)}`;
         let body: string | undefined;
-        const cached = await readStore(cacheKey);
+        const cached = await readStore(cacheKey, "digest");
         if (isPlainObject(cached) && typeof cached.text === "string" && cached.text) body = cached.text;
+        if (body) {
+          // CP-20: a hit still has to record this session as a co-owner.
+          await claimDigest(cacheKey, body, "auto", sessionID);
+        }
         if (!body) {
           // Cache misses spend the session model-call budget; cache hits are
           // free so repeat requests covering the same units don't re-spend.
           st.autoSummarizeCalls++;
           if (cfg.autoSummarizeMaxCalls > 0 && st.autoSummarizeCalls > cfg.autoSummarizeMaxCalls) return;
-          const prompt = summaryPrompt(source, "what future work needs", "context budget", blocks);
+          const prompt = summaryPrompt(source, "what future work needs", "context budget", blocks, cfg, chosen[0]?.name);
           try {
-            const response = await session.generate({ sessionID, prompt });
-            body = generatedText(response);
+            // E33: try fallback model if configured and session model fails
+            if (cfg.fallbackModelId) {
+              try {
+                const response = await session.generate({ sessionID, prompt, model: cfg.fallbackModelId });
+                body = generatedText(response);
+              } catch {
+                body = "";
+              }
+            }
+            if (!body) {
+              const response = await session.generate({ sessionID, prompt });
+              body = generatedText(response);
+            }
           } catch {
             body = "";
           }
           // The model call may fail or return nothing (local models are flaky);
           // fall back to a deterministic digest so the relief is still real.
-          if (!body && cfg.autoSummarizeStub) body = fallbackSummary(chosen);
+          if (!body && cfg.autoSummarizeStub) body = fallbackSummary(chosen, cfg);
           if (!body) return;
           totals.generations++;
-          writeStore(cacheKey, { text: body, topic: "auto", version: VERSION, at: Date.now(), sessions: [sessionID] });
+          // CP-20: union the owner list instead of replacing it.
+          await claimDigest(cacheKey, body, "auto", sessionID);
         }
 
-        const prose = chosen.every((r) => r.kind === "text");
-        const compressedPaths = chosen.map((r) => filePathOf(r)).filter(Boolean) as string[];
-        const text = buildSummaryText(body, blocks, prose, compressedPaths);
+        const text = buildSummaryText(body, blocks, chosenProse, chosenPaths, cfg);
         const tokens = estimateTokens(text, cfg, st.ratio);
         const covers = chosen.map((r) => r.key);
         for (const [key, existing] of [...st.summaries]) {
           if (existing.covers.every((cover) => covers.includes(cover))) st.summaries.delete(key);
         }
-        st.summaries.set(covers[0], { first: covers[0], covers, hashes: coverHashes(chosen), text, tokens, topic: "auto", at: Date.now(), prose });
+        st.summaries.set(covers[0], { first: covers[0], covers, hashes: chosenHashes, text, tokens, topic: "auto", at: Date.now(), prose: chosenProse });
         for (const key of covers) st.decisions.delete(key);
-        persistSummaries(sessionID, st);
+        await persistSummaries(sessionID, st);
 
         const saved = Math.max(0, chosen.reduce((acc, r) => acc + r.tokens, 0) - tokens);
         totals.summaries++;
@@ -2965,19 +4129,31 @@ export default Plugin.define({
             st.compressible = results;
             const protectTurns = Math.max(cfg.keepRecentTurns, cfg.turnProtection.enabled ? cfg.turnProtection.turns : 0);
             st.textProtectedFrom = protectedFromIndex(messages, protectTurns);
-            // The live turn (everything at or after the newest user message) is
-            // never summarised: the model needs the tool output it just received.
-            st.turnProtectedFrom = protectedFromIndex(messages, 1);
+            // The live turn (everything at or after the NEWEST user message) is
+            // never summarised: the model needs the tool output it just
+            // received. CP-1: computed independently of the turn-protection
+            // window, so a session with a single user message still protects it.
+            st.turnProtectedFrom = liveTurnIndex(messages);
             // Integrity: a summary whose source output changed is dropped, so its
             // results can be summarised again (or pruned by another strategy).
             const byKey = new Map(results.map((r) => [r.key, r]));
             const droppedSummaries = pruneStaleSummaries(st, byKey);
             if (droppedSummaries > 0) {
-              persistSummaries(sessionID, st);
+              // The context hook is synchronous by contract: chain, do not await.
+              void persistSummaries(sessionID, st);
               debug(`dropped ${droppedSummaries} stale summary record(s) for ${sessionID}`);
             }
             const covered = coveredKeys(st);
-            const budget = budgetFor(model, cfg);
+            // CP-17: standing summary savings are computed once, before planning.
+            // Nothing between here and the reporting below changes a summary
+            // record or the raw tokens of a covered unit (applyDecisions skips
+            // covered keys), so this value also serves the receipts later.
+            const stats = summarySavings(results, st, cfg, ratio, byKey);
+            const rawTotal = results.totalTokens;
+            const scan = candidateScan(results, messages, cfg);
+            // CP-6: the E38 budget schedule is indexed by turn, so the hook has
+            // to say which turn it is — the count of user messages so far.
+            const budget = budgetFor(model, cfg, userMessageIndexes(messages).length);
             if (budget) {
               st.window = budget.window;
               st.budget = budget.budget;
@@ -3021,10 +4197,10 @@ export default Plugin.define({
               estimateTokens(lastToolsJson, cfg, ratio) +
               messages.length * 4;
 
-            const candidates = candidateResults(results, messages, cfg, covered, cfg.minChars, undefined, st.turnProtectedFrom);
+            const candidates = candidateResults(results, messages, cfg, covered, cfg.minChars, undefined, st.turnProtectedFrom, scan);
             const budgetPool =
               budget && cfg.budgetMinChars < cfg.minChars
-                ? candidateResults(results, messages, cfg, covered, cfg.budgetMinChars, undefined, st.turnProtectedFrom)
+                ? candidateResults(results, messages, cfg, covered, cfg.budgetMinChars, undefined, st.turnProtectedFrom, scan)
                 : candidates;
             const target = effectiveTarget ?? budget?.target ?? null;
             // Over target, the recency ring-fence is the first thing to give:
@@ -3032,10 +4208,10 @@ export default Plugin.define({
             // touched only when the voluntary pool cannot reach the target, and
             // a small set of hottest outputs is always kept so the live turn
             // never loses its most recent context entirely.
-            let desired = planDecisions(results, candidates, cfg, ratio, budget && target !== null ? { target, overhead, pool: budgetPool } : null);
+            let desired = planDecisions(results, candidates, cfg, ratio, budget && target !== null ? { target, overhead, pool: budgetPool, summarySaved: stats.saved } : null, debug);
             const planWith = (pool: CollectedResult[] | undefined) =>
-              planDecisions(results, candidates, cfg, ratio, budget && target !== null ? { target, overhead, pool } : null);
-            const projectedNow = (pool: CollectedResult[] | undefined) => sentTokens(results, overhead, planWith(pool), 0);
+              planDecisions(results, candidates, cfg, ratio, budget && target !== null ? { target, overhead, pool, summarySaved: stats.saved } : null, debug);
+            const projectedNow = (pool: CollectedResult[] | undefined) => sentTokens(byKey, rawTotal, overhead, planWith(pool), 0);
             if (budget && target !== null && projectedNow(budgetPool) > target) {
               // The hottest outputs survive every relaxation stage: even when the
               // recency ring-fence gives way, the live turn never loses its most
@@ -3044,8 +4220,8 @@ export default Plugin.define({
                 cfg.relaxRecentFloor > 0
                   ? new Set(
                       results
-                        .slice(Math.max(0, results.length - cfg.relaxRecentFloor))
                         .filter((r) => r.kind === "tool")
+                        .slice(Math.max(0, results.length - cfg.relaxRecentFloor))
                         .map((r) => r.key),
                     )
                   : new Set<string>();
@@ -3054,12 +4230,12 @@ export default Plugin.define({
                 candidateResults(results, messages, cfg, covered, cfg.budgetMinChars, {
                   recent: true,
                   turns: cfg.turnProtection.enabled,
-                }, st.turnProtectedFrom),
+                }, st.turnProtectedFrom, scan),
               );
               const relaxedPlan = planWith(relaxed);
               if (sumSaved(relaxedPlan) > sumSaved(desired)) desired = relaxedPlan;
               const deep = keepHottest(
-                candidateResults(results, messages, cfg, covered, cfg.budgetMinChars, { recent: true, turns: true }, st.turnProtectedFrom),
+                candidateResults(results, messages, cfg, covered, cfg.budgetMinChars, { recent: true, turns: true }, st.turnProtectedFrom, scan),
               );
               const deepPlan = planWith(deep);
               if (sumSaved(deepPlan) > sumSaved(desired)) desired = deepPlan;
@@ -3068,7 +4244,16 @@ export default Plugin.define({
             let decisions = desired;
             const desiredSavings = sumSaved(desired);
             const currentSavings = sumSaved(st.decisions);
-            const overTarget = effectiveTarget !== null && sentTokens(results, overhead, st.decisions, 0) > effectiveTarget;
+            // CP-9: the replan gate is a cache-churn question, so it is computed
+            // against the model's real `budget.target`. The proactive steady
+            // ceiling (`steadyTargetRatio`, often 6% of the window) sits far
+            // below it and used to count as "over target": the gate collapsed to
+            // zero and every request replanned the whole prefix, defeating the
+            // provider cache the gate exists to protect. The steady ceiling
+            // still drives the work itself (planDecisions/maybeAutoSummarize run
+            // against `effectiveTarget`); only the deferral decision changes.
+            const gateTarget = budget?.target ?? null;
+            const overTarget = gateTarget !== null && sentTokens(byKey, rawTotal, overhead, st.decisions, stats.saved) > gateTarget;
             const gate = overTarget || recovering ? 0 : cacheReplanGate(st, cfg);
             // Over budget or recovering, don't let the voluntary replan floor
             // defer savings we need right now.
@@ -3091,15 +4276,14 @@ export default Plugin.define({
             // Summarise from the raw (pre-stub) size: stubbing alone can meet a
             // low steady target, but a digest of the stubbed units is smaller
             // still. The record is stored now and applied on the next request.
-            const rawEstimate = sentTokens(results, overhead, new Map(), 0);
+            const rawEstimate = Math.max(0, overhead + rawTotal);
             // Single-digest receipts: auto-stub counts accumulate into this
             // turn's receipt instead of notifying separately; async
             // completions bank a note for the next turn's digest.
             const turnAuto: TurnTally = { stubbed: 0, stubSaved: 0 };
             if (!cfg.manualMode.enabled) void maybeAutoSummarize(sessionID, st, rawEstimate, turnAuto).catch(() => {});
 
-            const summaryApplied = applySummaries(results, st);
-            const applied = applyDecisions(results, decisions, cfg, ratio, covered, st);
+            const { summaryApplied, applied } = applySummariesAndDecisions(results, st, decisions, cfg, ratio, covered, byKey);
             // Whole-span collapse runs last: the digests and stubs it reads are
             // already written, so a closed run that is fully represented loses
             // its message shells, per-unit scaffolding and tool-call arguments.
@@ -3116,7 +4300,6 @@ export default Plugin.define({
               );
             }
             persistRecall(sessionID, st);
-            const stats = summarySavings(results, st, cfg, ratio);
             st.summariesCount = st.summaries.size;
             st.summarySavedTokens = stats.saved;
 
@@ -3129,7 +4312,7 @@ export default Plugin.define({
             st.lastToolCallTotal = toolCallsNow;
             st.pendingEstimate = Math.max(
               0,
-              sentTokens(results, overhead, decisions, stats.saved) - collapsed.savedTokens,
+              sentTokens(byKey, rawTotal, overhead, decisions, stats.saved) - collapsed.savedTokens,
             );
             if (st.recoveryTarget !== null && st.pendingEstimate <= st.recoveryTarget) {
               st.recoveryTarget = null;
@@ -3157,13 +4340,14 @@ export default Plugin.define({
               // summarise or checkpoint — reports too so nothing is lost.
               if (saved >= cfg.notifyMinTokens || (summaryApplied > 0 && cfg.notifyOnTopic) || (banked.length > 0 && cfg.notifyOnTopic)) {
                 st.pendingNotes.length = 0;
-                const receipt = `saved ~${saved} tokens this turn · ~${sessionTotal} session total${topic ? ` · topic: ${topic}` : ""}${banked.length > 0 ? ` · ${banked.join(" · ")}` : ""}`;
+                const locale = cfg.locale ?? "en";
+                const receipt = `${t("savedTokens", locale)} ~${saved} ${t("tokens", locale)} · ~${sessionTotal} ${t("sessionTotal", locale)}${topic ? ` · ${t("topic", locale)}: ${topic}` : ""}${banked.length > 0 ? ` · ${banked.join(" · ")}` : ""}`;
                 notify(
                   sessionID,
-                  `pruned ${applied.count} result(s)${summaryApplied ? `, ${summaryApplied} summarised` : ""}${turnAuto.stubbed > 0 ? `, ${turnAuto.stubbed} stubbed` : ""}${collapsed.spans > 0 ? `, ${collapsed.messages} message(s) collapsed` : ""} — ${receipt} (epoch ${st.epoch})`,
-                  `epoch ${st.epoch}: pruned ${applied.count}/${results.length}, summaries ${st.summaries.size}, ${receipt}` +
+                  `${t("pruned", locale)} ${applied.count} result(s)${summaryApplied ? `, ${summaryApplied} ${t("summarised", locale)}` : ""}${turnAuto.stubbed > 0 ? `, ${turnAuto.stubbed} ${t("stubbed", locale)}` : ""}${collapsed.spans > 0 ? `, ${collapsed.messages} ${t("collapsed", locale)}` : ""} — ${receipt} (${t("epoch", locale)} ${st.epoch})`,
+                  `${t("epoch", locale)} ${st.epoch}: ${t("pruned", locale)} ${applied.count}/${results.length}, ${t("summaries", locale)} ${st.summaries.size}, ${receipt}` +
                   (collapsed.spans > 0
-                    ? `\n  span collapse: ${collapsed.spans} span(s), ${collapsed.messages} message(s), ~${collapsed.savedTokens} tokens`
+                    ? `\n  ${t("spanCollapse", locale)}: ${collapsed.spans} span(s), ${collapsed.messages} message(s), ~${collapsed.savedTokens} tokens`
                     : "") +
                   (applied.count > 0
                     ? `\n  reasons: ${[...new Set([...decisions.values()].map((d) => d.reason))].join(", ")}`
@@ -3190,10 +4374,11 @@ export default Plugin.define({
                   // C11: a critical nudge carries only the top entries — the
                   // full map would itself eat the context it is trying to save.
                   const map = renderContextMap(st, cfg, critical ? 10 : 25);
-                  const force = cfg.nudgeForce === "strong" ? "You should compress now." : "Consider compressing.";
+                  const nudgeLocale = cfg.locale ?? "en";
+                  const force = cfg.nudgeForce === "strong" ? t("nudgeCritical", nudgeLocale) : t("nudgeConsider", nudgeLocale);
                   const nudge = [
-                    `[context-pruner] Context is at ~${st.pendingEstimate} of ~${window} tokens.`,
-                    `${force} Use the \`compress\` tool to summarise older tool output.`,
+                    `[context-pruner] ${t("nudgeContextAt", nudgeLocale)} ~${st.pendingEstimate} ${t("of", nudgeLocale)} ~${window} tokens.`,
+                    `${force} ${t("nudgeUseCompress", nudgeLocale)}`,
                     "",
                     map,
                   ].join("\n");
@@ -3223,8 +4408,24 @@ export default Plugin.define({
                 `epoch ${st.epoch}: pruned ${applied.count}/${results.length}, summaries ${st.summaries.size}, ~${applied.savedTokens + stats.saved} tokens (sent ~${st.pendingEstimate}, target ${st.target ?? "n/a"})`,
               );
             }
+            // CP-19: the request is fully compiled and reported. Release the
+            // message-part references so the cloned transcript this request
+            // built can be collected; `st.compressible` keeps the scalars
+            // (name, text, tokens, file, part id) that `context_map`, `compress`
+            // and the stats tools read between requests. An auto-summarise still
+            // in flight writes nothing into these parts any more — which is the
+            // correct outcome, since the request those clones belong to has
+            // already been sent; its decisions live in `st.decisions` /
+            // `st.summaries` and are applied by the NEXT request's compile.
+            releaseCompiledUnits(results);
           } catch (err) {
+            // The hook must never throw into the host session — but CP-15: a
+            // failure here means THIS REQUEST WENT OUT UNPRUNED, which is the
+            // one failure the user has to see. reportFailure() prints through
+            // the log sink once per session and then suppresses.
             debug(`context hook failed: ${String(err)}`);
+            const sid = String(((event as AnyRecord | undefined)?.sessionID as string | undefined) ?? "unknown");
+            reportFailure("context hook", err, sid);
           }
             }),
           );
@@ -3303,7 +4504,10 @@ export default Plugin.define({
           st.overflowRetries = 0;
           st.recoveryTarget = null;
         } catch (err) {
+          // CP-15: a usage event that throws loses token calibration and
+          // overflow recovery for the session — report it, suppressed per session.
           debug(`usage event failed: ${String(err)}`);
+          reportFailure("usage event", err, typeof (event as AnyRecord)?.sessionID === "string" ? String((event as AnyRecord).sessionID) : undefined);
         }
       };
       // The promise API's `event.subscribe` returns an async iterable (the
@@ -3350,7 +4554,7 @@ export default Plugin.define({
             input: z.object({}),
             execute: async () => {
               try {
-                return { content: renderStats() };
+                return { content: renderStats(cfg) };
               } catch (err) {
                 return { content: `context_pruner_stats failed: ${String(err)}` };
               }
@@ -3427,6 +4631,11 @@ export default Plugin.define({
                   const hit = st.recall.get(id);
                   if (!hit) continue;
                   totals.recalls++;
+                  // CP-12: record the access. Without a hit counter the `lfu`
+                  // eviction policy compared entries that were all zero and
+                  // evicted by insertion order, i.e. it was not LFU at all.
+                  hit.hits = (hit.hits ?? 0) + 1;
+                  st.recallDirty = true;
                   const text =
                     hit.text.length > cfg.recallMaxChars
                       ? `${hit.text.slice(0, cfg.recallMaxChars)}\n\n[context-pruner] recall truncated at ${cfg.recallMaxChars} of ${hit.chars} chars.`
@@ -3446,7 +4655,8 @@ export default Plugin.define({
               "Replace a chosen range of older tool output with a real summary produced by the session model. " +
               "Ranges: `last` (the N most recent tool outputs), `from`/`to` (inclusive, using #N from context_map or a message id), " +
               "`before`/`after`. Always give a `topic` describing what future work must retain. " +
-              "Run context_map first to see what is available. Protected tools and `<protect>` blocks are never summarised.",
+              "Run context_map first to see what is available. Protected tools, `<protect>` blocks and protected user text are never summarised; " +
+              "a range you name explicitly may include the turn in progress, and the reply says how many of the folded units came from it.",
             input: z.object({
               topic: z.string().optional().describe("What the summary must preserve (files, symbols, decisions)"),
               reason: z.string().optional().describe("Why you are compressing now"),
@@ -3455,12 +4665,39 @@ export default Plugin.define({
               before: z.union([z.string(), z.number()]).optional().describe("Compress everything before this #N or message id"),
               after: z.union([z.string(), z.number()]).optional().describe("Compress everything after this #N or message id"),
               last: z.number().int().optional().describe("Compress the N most recent tool outputs"),
+              dryRun: z.boolean().optional().describe("Preview the compression prompt without applying it"),
             }),
             execute: async (input, context) => {
               try {
                 return await runCompress(input, context);
               } catch (err) {
                 return { content: `compress failed: ${String(err)}` };
+              }
+            },
+          });
+
+          editor.add({
+            name: "context_pruner_undo",
+            description:
+              "Undo the last compression applied to this session, restoring the original tool outputs.",
+            input: z.object({
+              sessionID: z.string().optional().describe("Session to undo compression for (defaults to the caller's session)"),
+            }),
+            execute: async (input, toolCtx) => {
+              try {
+                const args = (input ?? {}) as { sessionID?: string };
+                const callerSid = String((toolCtx as { sessionID?: string })?.sessionID ?? "");
+                const sessionID = args.sessionID ?? callerSid;
+                if (!sessionID) return { content: t("undoRequiresSession", cfg.locale ?? "en") };
+                const ok = undoLastCompression(sessionID);
+                if (ok.undone) {
+                  // CP-8: the stack keeps capped previews, so say when a
+                  // restored output came back shortened.
+                  return { content: ok.truncated ? `${t("undoSuccess", cfg.locale ?? "en")} (some outputs were restored from a truncated preview)` : t("undoSuccess", cfg.locale ?? "en") };
+                }
+                return { content: t("undoEmpty", cfg.locale ?? "en") };
+              } catch (err) {
+                return { content: `context_pruner_undo failed: ${String(err)}` };
               }
             },
           });
@@ -3528,7 +4765,8 @@ export default Plugin.define({
           const text = ref.trim();
           const numbered = text.match(/^#?(\d+)$/);
           if (numbered) return Number(numbered[1]) - 1;
-          const idx = list.findIndex((r) => r.key === text || r.part.id === text || r.part.toolCallId === text);
+          // CP-19: `ref` is the part-id snapshot kept when the part was released.
+          const idx = list.findIndex((r) => r.key === text || r.ref === text || r.part?.id === text || r.part?.toolCallId === text);
           if (idx >= 0) return idx;
         }
         return -1;
@@ -3561,15 +4799,24 @@ export default Plugin.define({
     }
 
     async function runCompress(input: unknown, callContext: unknown): Promise<{ content: string }> {
-      if (!cfg.compressEnabled) return { content: "compress is disabled by configuration." };
+      const locale = cfg.locale ?? "en";
+      if (!cfg.compressEnabled) return { content: t("compressDisabled", locale) };
       const args = (input ?? {}) as AnyRecord;
       const caller = (callContext ?? {}) as AnyRecord;
-      const sessionID = String(caller.sessionID ?? [...sessions.keys()].pop() ?? "unknown");
+      // CP-3: compress rewrites the transcript of the session it summarises, so
+      // it runs on the CALLER's session only. The old
+      // `[...sessions.keys()].pop()` fallback silently compressed whichever
+      // session had compiled last — the failure mode CP-12 already fixed for
+      // context_report and context_map, and exactly what happens when a subagent
+      // calls compress while the parent compiled most recently.
+      const callerSid = String(caller.sessionID ?? "");
+      if (!callerSid) return { content: t("compressRequiresSession", locale) };
+      const sessionID = callerSid;
       const st = sessions.get(sessionID);
-      if (!st) return { content: "Nothing has been compiled for this session yet; call context_map first." };
+      if (!st) return { content: t("compressNoContext", locale) };
 
       const list = st.compressible;
-      if (list.length === 0) return { content: "No compressible context is available yet." };
+      if (list.length === 0) return { content: t("compressEmpty", locale) };
 
       const textProtected = protectedTextKeys(list, st, cfg);
       let targets = await findTargets(args, list);
@@ -3580,13 +4827,29 @@ export default Plugin.define({
           r.text.length >= Math.min(cfg.minChars, 200) &&
           !isPrunedStub(r.text),
       );
+      // CP-18 (restored): the manual tool does NOT filter the live turn. It is
+      // the model naming a specific range on purpose — filtering here made
+      // `from`/`to`/`last` unusable in exactly the shape where it matters (a
+      // short or single-turn session, where the live turn IS the whole
+      // transcript, so every unit was dropped and compress reported "no
+      // targets"). Invariant C2 is an invariant about the AUTOMATIC passes,
+      // which run without being asked and honour `turnProtectedFrom` at the C2
+      // guards (candidateResults / maybeAutoSummarize / collapseSpans).
+      // The count is reported as a note so the model can see it folded live
+      // output on purpose rather than by accident.
+      let liveIncluded = 0;
+      if (st.turnProtectedFrom >= 0) liveIncluded = targets.filter((r) => r.mi >= st.turnProtectedFrom).length;
       if (targets.length === 0) {
-        return {
-          content:
-            "No compressible results matched. Use context_map to list available #N ranges; protected tools, tiny results, and recent prose cannot be compressed.",
-        };
+        return { content: t("compressNoTargets", locale) };
       }
-      if (targets.length > 40) targets = targets.slice(0, 40);
+      // CP-18: the old `slice(0, 40)` kept the OLDEST targets and dropped the
+      // near-term ones without a word, which is backwards — the recent range is
+      // what the model still works in. Keep the newest and say what happened.
+      let keptNewest = false;
+      if (targets.length > 40) {
+        targets = targets.slice(-40);
+        keptNewest = true;
+      }
 
       const topic = sanitizeLabel(args.topic);
       const reason = sanitizeLabel(args.reason) || "context limit";
@@ -3599,16 +4862,48 @@ export default Plugin.define({
         source = extracted.stripped;
         protectedBlocks = extracted.blocks;
       }
-      if (source.length > cfg.compressMaxSourceChars) {
-        source = `${source.slice(0, cfg.compressMaxSourceChars)}\n\n[truncated]`;
+      const maxSrc = maxSourceCharsFor(targets[0]?.name, cfg);
+      if (source.length > maxSrc) {
+        source = `${source.slice(0, maxSrc)}\n\n[truncated]`;
+      }
+
+      // E28: dry-run mode — build the prompt and return it without calling the model.
+      const dryRun = asBool(args.dryRun, false);
+      if (dryRun) {
+        // CP-4: the per-tool template and the target's tool name were dropped on
+        // this path, so a dry run previewed a different prompt than the one the
+        // real call sends.
+        const prompt = summaryPrompt(source, topic, reason, protectedBlocks, cfg, targets[0]?.name);
+        const estimatedTokens = targets.reduce((sum, r) => sum + r.tokens, 0);
+        const estimatedSavings = Math.max(0, estimatedTokens - estimateTokens(prompt, cfg, st.ratio));
+        return {
+          content: [
+            "[dry-run] Compression preview — no changes applied.",
+            "",
+            liveIncluded > 0 ? `${t("compressLiveTurnIncluded", locale)} (${liveIncluded} unit(s)).` : "",
+            keptNewest ? `${t("compressKeptNewest", locale)}.` : "",
+            `Targets (${targets.length}):`,
+            ...targets.map((r) => `  · #${r.key} ${r.name} (${r.tokens} tokens)`),
+            "",
+            `Estimated savings: ~${estimatedSavings} tokens`,
+            "",
+            "Prompt that would be sent to the model:",
+            "---",
+            prompt,
+            "---",
+          ].join("\n"),
+        };
       }
 
       const cacheKey = summaryCacheKey(topic, source);
       let body: string | undefined;
-      const cached = await readStore(cacheKey);
+      const cached = await readStore(cacheKey, "digest");
       if (isPlainObject(cached) && typeof cached.text === "string" && cached.text) {
         body = cached.text;
         debug(`summary cache hit for ${targets.length} result(s)`);
+        // CP-20: a cache hit still has to record this session as a co-owner, or
+        // the digest is owned by whoever wrote it first and dies with them.
+        await claimDigest(cacheKey, body, topic, sessionID);
       }
 
       const session = c.session;
@@ -3616,25 +4911,38 @@ export default Plugin.define({
         if (typeof session?.generate !== "function") {
           return { content: "The session model is unavailable, so compress cannot generate a summary right now." };
         }
-        const prompt = summaryPrompt(source, topic, reason, protectedBlocks);
+        const prompt = summaryPrompt(source, topic, reason, protectedBlocks, cfg, targets[0]?.name);
         try {
           const response = await session.generate({ sessionID, prompt });
           body = generatedText(response);
+          // E31: track compression cost
+          const inputTokens = num((response as AnyRecord)?.inputTokens ?? ((response as AnyRecord)?.usage as AnyRecord | undefined)?.input_tokens, 0);
+          if (inputTokens > 0) {
+            st.compressionCallTokens += inputTokens;
+            totals.compressionCallTokens += inputTokens;
+            // Estimate cost: use model pricing if available, otherwise rough estimate
+            if ((modelCaches.get(c as object) ?? []).length === 0) refreshModels(c);
+            const pricing = modelInputPrices(c).get(st.modelRef) ?? 0;
+            const cost = pricing > 0 ? (inputTokens / 1_000_000) * pricing : 0;
+            st.compressionCallCost += cost;
+            totals.compressionCallCost += cost;
+          }
         } catch {
           body = "";
         }
-        if (!body && cfg.autoSummarizeStub) body = fallbackSummary(targets);
+        if (!body && cfg.autoSummarizeStub) body = fallbackSummary(targets, cfg);
         if (!body) {
           debug(`compress generate returned empty`);
-          return { content: "The model returned an empty summary; nothing was compressed." };
+          return { content: t("compressModelUnavailable", locale) };
         }
         totals.generations++;
-        writeStore(cacheKey, { text: body, topic, version: VERSION, at: Date.now(), sessions: [sessionID] });
+        // CP-20: union the owner list instead of replacing it.
+        await claimDigest(cacheKey, body, topic, sessionID);
       }
 
       const prose = targets.every((r) => r.kind === "text");
       const compressedPaths = targets.map((r) => filePathOf(r)).filter(Boolean) as string[];
-      const text = buildSummaryText(body, protectedBlocks, prose, compressedPaths);
+      const text = buildSummaryText(body, protectedBlocks, prose, compressedPaths, cfg);
       const covers = targets.map((r) => r.key);
       const record: SummaryRecord = {
         first: covers[0],
@@ -3646,17 +4954,36 @@ export default Plugin.define({
         at: Date.now(),
         prose,
       };
+      // E34: push to compression stack before applying (CP-8: bounded, previews capped).
+      const originalTexts = new Map<string, string>();
+      for (const r of targets) {
+        originalTexts.set(r.key, r.text);
+      }
+      pushCompressionEntry(st, covers, originalTexts);
+
       // Nested compression: drop any previous record fully contained here.
       for (const [key, existing] of [...st.summaries]) {
         if (existing.covers.every((cover) => covers.includes(cover))) st.summaries.delete(key);
       }
       st.summaries.set(covers[0], record);
       for (const key of covers) st.decisions.delete(key);
-      persistSummaries(sessionID, st);
+      // Awaited: the record has to be readable the moment `compress` returns,
+      // both for a caller that immediately inspects storage and for the next
+      // request, which loads summaries from there.
+      await persistSummaries(sessionID, st);
 
       const savedTokens = Math.max(0, targets.reduce((sum, r) => sum + r.tokens, 0) - record.tokens);
       totals.summaries++;
       totals.summarySavedTokens += savedTokens;
+      // E27: compression quality metrics — track low-quality compressions
+      const originalTokens = targets.reduce((sum, r) => sum + r.tokens, 0);
+      if (originalTokens > 0) {
+        const qualityRatio = record.tokens / originalTokens;
+        if (qualityRatio > 0.8) {
+          totals.lowQualityCompressions++;
+          st.lowQualityCompressions++;
+        }
+      }
       st.iterationsSinceCompress = 0;
 
       // Banked for the next turn's single digest: the digest names the
@@ -3665,10 +4992,13 @@ export default Plugin.define({
 
       return {
         content: [
-          `Summarised ${targets.length} tool result(s) (~${savedTokens} tokens saved).`,
-          `The summary is applied on the next request; the covered output is replaced by it.`,
-          topic ? `Focus preserved: ${topic}` : "",
-          protectedBlocks.length > 0 ? `Kept ${protectedBlocks.length} protected block(s) verbatim.` : "",
+          `${t("compressResult", locale)} ${targets.length} tool result(s) (~${savedTokens} tokens saved).`,
+          t("compressSaved", locale),
+          topic ? `${t("compressFocus", locale)}: ${topic}` : "",
+          protectedBlocks.length > 0 ? `${t("compressProtected", locale)} ${protectedBlocks.length} protected block(s) verbatim.` : "",
+          // CP-18: say when the range reached into the turn in progress.
+          liveIncluded > 0 ? `${t("compressLiveTurnIncluded", locale)} (${liveIncluded} unit(s)).` : "",
+          keptNewest ? `${t("compressKeptNewest", locale)} (${targets.length} kept of a longer range).` : "",
         ]
           .filter(Boolean)
           .join("\n"),
