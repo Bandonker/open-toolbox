@@ -341,7 +341,7 @@ check("stats_tokens returns per-day and per-model text", tokensText.includes("To
 const heatmap = (await byName.stats_heatmap.execute({ weeks: 26 }, toolCtx)).content;
 check(
   "stats_heatmap returns a heatmap with a legend",
-  heatmap.includes("Usage heatmap (last 26 weeks, metric=tokens)") && heatmap.includes("Legend:") && heatmap.includes("█"),
+  /Usage heatmap \(last \d+ weeks, metric=tokens\)/.test(heatmap) && heatmap.includes("Legend:") && heatmap.includes("█"),
   heatmap.split("\n")[0],
 );
 

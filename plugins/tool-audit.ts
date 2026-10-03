@@ -1,14 +1,16 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
-import { statSync } from "fs";
-import { homedir } from "os";
-import { join } from "path";
+import { statSync, mkdtempSync, createWriteStream, rmSync, mkdirSync, renameSync, copyFileSync } from "fs";
+import { homedir, tmpdir } from "os";
+import { join, basename } from "path";
 import {
   openDatabase,
   applyPragmas,
   quoteFtsQuery,
   type AnyDatabase,
 } from "../lib/sqlite.ts";
+import { fmtDuration, fmtTime, fmtSize } from "../lib/format.ts";
+import { asBool, asInt } from "../lib/config.ts";
 
 /**
  * tool-audit
@@ -39,8 +41,13 @@ type Pending = {
   sessionID: string;
   agent: string;
   messageID: string;
-  /** Event id — stored as call_id so redelivered events can't double-record (T2). */
-  callId: string;
+  /**
+   * Event id — stored as call_id so redelivered events can't double-record (T2).
+   * TA-3/TA-4: null for id-less events — the partial unique index ignores
+   * NULLs, so every id-less call is kept (a "(no-id)" sentinel used to make
+   * INSERT OR IGNORE silently drop all but the first).
+   */
+  callId: string | null;
   input: unknown;
   startedMs: number;
 };
@@ -58,12 +65,11 @@ function resolveConfig(options: Record<string, unknown> | undefined): Config {
   };
   const num = (value: unknown, envValue: string | undefined, fallback: number): number => {
     const raw = typeof value === "number" || typeof value === "string" ? value : envValue;
-    const n = typeof raw === "number" ? raw : Number(raw);
-    return Number.isFinite(n) ? n : fallback;
+    return asInt(raw, fallback);
   };
   const bool = (value: unknown, envValue: string | undefined, fallback: boolean): boolean => {
     if (typeof value === "boolean") return value;
-    if (typeof envValue === "string") return /^(1|true|yes|on)$/i.test(envValue.trim());
+    if (typeof envValue === "string") return asBool(envValue, fallback);
     return fallback;
   };
 
@@ -287,16 +293,13 @@ function parseSince(value: unknown): number | undefined {
   return Number.isFinite(t) ? t : undefined;
 }
 
-function fmtDuration(ms: unknown): string {
-  if (typeof ms !== "number" || !Number.isFinite(ms)) return "?";
-  if (ms < 1000) return `${Math.round(ms)}ms`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`;
-  return `${(ms / 60_000).toFixed(1)}m`;
-}
-
-function fmtTime(iso: unknown): string {
-  if (typeof iso !== "string") return "?";
-  return iso.replace("T", " ").replace(/\.\d+Z$/, "Z");
+/** Escape a value for CSV output per RFC 4180. */
+function csvEscape(value: unknown): string {
+  const s = String(value ?? "");
+  if (/[",\n\r]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
 }
 
 type Filters = { sessionId?: string; tool?: string; status?: string; since?: number };
@@ -363,13 +366,6 @@ function dbSizeOf(cfg: Config): number | null {
   }
 }
 
-function fmtSize(bytes: number | null): string {
-  if (bytes === null) return "?";
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
 export default Plugin.define({
   id: "tool-audit",
   async setup(ctx) {
@@ -408,7 +404,18 @@ export default Plugin.define({
     }, 3_600_000);
     pruneTimer.unref?.();
 
-    const record = (entry: Pending, status: string, error: string | undefined, outputChars: number | undefined, endedMs: number): void => {
+    const record = (
+      entry: Pending,
+      status: string,
+      error: string | undefined,
+      outputChars: number | undefined,
+      endedMs: number,
+      // TA-6: null when the pending entry was swept (call longer than the
+      // sweep TTL) or execute.before was lost — duration_ms is stored NULL so
+      // AVG/percentiles exclude the call instead of a fabricated 0 dragging
+      // them down.
+      durationMs: number | null = endedMs - entry.startedMs,
+    ): void => {
       try {
         getDb(cfg)
           .prepare(
@@ -421,7 +428,9 @@ export default Plugin.define({
             entry.agent || null,
             entry.messageID || null,
             // T2/T7: record the event id so a redelivered execute.after is
-            // ignored by the partial unique index; empty ids stay NULL.
+            // ignored by the partial unique index; TA-3/TA-4: id-less events
+            // stay NULL — the partial index ignores NULLs, so every one of
+            // them is recorded.
             entry.callId || null,
             entry.tool,
             serializeInput(entry.input, cfg),
@@ -431,7 +440,7 @@ export default Plugin.define({
             new Date(entry.startedMs).toISOString(),
             new Date(endedMs).toISOString(),
             entry.startedMs,
-            endedMs - entry.startedMs,
+            durationMs,
           );
       } catch (err) {
         console.error(`[tool-audit] failed to record ${entry.tool}: ${String(err)}`);
@@ -470,14 +479,17 @@ export default Plugin.define({
 
     const registrations: Array<{ dispose: () => Promise<void> }> = [];
 
-    // TA-3: sweep stale pending entries (at most once per 10 min) so a missed
-    // execute.after can never grow the map without bound.
+    // TA-3/TA-6: sweep stale pending entries (at most once per 10 min) so a
+    // missed execute.after can never grow the map without bound. The TTL is
+    // generous (1h): a call that finishes within it still reports a real
+    // duration; anything swept is recorded by the after-hook fallback with
+    // duration_ms NULL rather than dropped or zeroed (TA-6).
     let lastPendingSweep = 0;
     const sweepPending = (now: number): void => {
       if (now - lastPendingSweep < 10 * 60_000) return;
       lastPendingSweep = now;
       for (const [key, entry] of pending) {
-        if (now - entry.startedMs > 10 * 60_000) pending.delete(key);
+        if (now - entry.startedMs > 60 * 60_000) pending.delete(key);
       }
     };
 
@@ -491,7 +503,7 @@ export default Plugin.define({
           if (event.id === undefined || event.id === null) return;
           // T7: normalize the event id — "undefined" must never become a
           // call_id (it would collide across every id-less event).
-          const callId = String(event.id ?? "");
+          const callId = String(event.id);
           pending.set(callId, {
             tool: event.tool,
             sessionID: String(event.sessionID ?? ""),
@@ -508,18 +520,38 @@ export default Plugin.define({
       registrations.push(
         await ctx.tool.hook("execute.after", (event) => {
           if (cfg.ignoreTools.has(event.tool)) return;
-          const key = String(event.id ?? "");
-          const entry: Pending = pending.get(key) ?? {
-            tool: event.tool,
-            sessionID: String(event.sessionID ?? ""),
-            agent: String(event.agent ?? ""),
-            messageID: String(event.messageID ?? ""),
-            callId: key,
-            input: event.input,
-            startedMs: Date.now(),
-          };
-          pending.delete(key);
+          // TA-3/TA-4: an id-less event keeps call_id = NULL instead of the
+          // old "(no-id)" sentinel — the sentinel collided with itself under
+          // the partial unique index, so INSERT OR IGNORE dropped every
+          // id-less call after the first. NULL ids are simply left out of the
+          // index, and idempotency (T2) still applies to every real id.
+          const callId = event.id === undefined || event.id === null ? null : String(event.id);
           const endedMs = Date.now();
+          const entry: Pending | undefined = callId === null ? undefined : pending.get(callId);
+          if (callId !== null) pending.delete(callId);
+          if (entry === undefined) {
+            // TA-6: no pending entry — the call outlived the sweep TTL or its
+            // execute.before was lost. Still record the call (fallback row),
+            // but with duration_ms NULL rather than a fabricated 0.
+            const synthesized: Pending = {
+              tool: event.tool,
+              sessionID: String(event.sessionID ?? ""),
+              agent: String(event.agent ?? ""),
+              messageID: String(event.messageID ?? ""),
+              callId,
+              input: event.input,
+              startedMs: endedMs,
+            };
+            if (event.status === "error") {
+              const message = String(
+                (event.error as { message?: string })?.message ?? event.error ?? "unknown error",
+              );
+              record(synthesized, "error", message, undefined, endedMs, null);
+            } else {
+              record(synthesized, "completed", undefined, outputChars(event.result), endedMs, null);
+            }
+            return;
+          }
           if (event.status === "error") {
             const message = String(
               (event.error as { message?: string })?.message ?? event.error ?? "unknown error",
@@ -656,6 +688,39 @@ export default Plugin.define({
               max_ms: number | null;
             }>;
 
+            // E49: duration percentiles per tool (P50/P95/P99).
+            // TA-2: the percentile query must carry the same where clause and
+            // params as every other query in this report — previously it read
+            // the whole table, so a session/time-filtered report showed
+            // percentiles computed from unfiltered data.
+            const filterBits: string[] = [];
+            if (args.sessionId) filterBits.push(`session=${args.sessionId}`);
+            if (args.since) filterBits.push(`since=${args.since}`);
+            const filterLabel = filterBits.length ? ` (filtered: ${filterBits.join(" ")})` : "";
+            const durationRows = database
+              .query(`SELECT tool, duration_ms FROM calls c WHERE duration_ms IS NOT NULL${where.sql}`)
+              .all(...where.params) as Array<{ tool: string; duration_ms: number }>;
+            const durationsByTool = new Map<string, number[]>();
+            for (const r of durationRows) {
+              const arr = durationsByTool.get(r.tool) ?? [];
+              arr.push(r.duration_ms);
+              durationsByTool.set(r.tool, arr);
+            }
+            const percentile = (sorted: number[], p: number): number => {
+              if (sorted.length === 0) return 0;
+              const idx = Math.ceil((p / 100) * sorted.length) - 1;
+              return sorted[Math.max(0, Math.min(idx, sorted.length - 1))];
+            };
+            const percentilesByTool = new Map<string, { p50: number; p95: number; p99: number }>();
+            for (const [tool, durs] of durationsByTool) {
+              durs.sort((a, b) => a - b);
+              percentilesByTool.set(tool, {
+                p50: percentile(durs, 50),
+                p95: percentile(durs, 95),
+                p99: percentile(durs, 99),
+              });
+            }
+
             const slowest = database
               .query(
                 `SELECT tool, status, duration_ms, session_id, started_at, error
@@ -679,11 +744,11 @@ export default Plugin.define({
               // T9: show where the data lives and how big the store is.
               `store: ${join(cfg.dir, DB_NAME)} | rows: ${totals.calls} | size: ${fmtSize(dbSizeOf(cfg))} | oldest: ${totals.first_ms ? fmtTime(new Date(totals.first_ms).toISOString()) : "n/a"}`,
               "",
-              "per tool (calls | errors | avg | max):",
-              ...perTool.map(
-                (r) =>
-                  `- ${r.tool}: ${r.calls} | ${r.errors ?? 0} | ${fmtDuration(r.avg_ms)} | ${fmtDuration(r.max_ms)}`,
-              ),
+              `per tool${filterLabel} (calls | errors | avg | max | p50 | p95 | p99):`,
+              ...perTool.map((r) => {
+                const p = percentilesByTool.get(r.tool);
+                return `- ${r.tool}: ${r.calls} | ${r.errors ?? 0} | ${fmtDuration(r.avg_ms)} | ${fmtDuration(r.max_ms)} | p50=${fmtDuration(p?.p50)} p95=${fmtDuration(p?.p95)} p99=${fmtDuration(p?.p99)}`;
+              }),
               "",
               "slowest:",
               ...slowest.map(
@@ -751,7 +816,7 @@ export default Plugin.define({
           tool: z.string().optional().describe("Only calls of this tool"),
           status: z.enum(["completed", "error"]).optional().describe("Only calls with this status"),
           since: z.string().optional().describe('Time window: "30m", "24h", "7d" or an ISO date'),
-          format: z.enum(["jsonl", "markdown"]).optional().describe("Output format (default jsonl)"),
+          format: z.enum(["jsonl", "markdown", "csv"]).optional().describe("Output format (default jsonl)"),
           limit: z.number().optional().describe("Max rows (default 50, max 1000)"),
         }),
         execute: async (input) => {
@@ -760,9 +825,14 @@ export default Plugin.define({
             tool?: string;
             status?: string;
             since?: string;
-            format?: "jsonl" | "markdown";
+            format?: "jsonl" | "markdown" | "csv";
             limit?: number;
           };
+          // TA-5: every path — success, zero rows, mid-write failure — must
+          // close the stream and remove the temp dir. Previously any throw
+          // leaked an open write stream and a temp directory per failure.
+          let writeStream: ReturnType<typeof createWriteStream> | null = null;
+          let tmpDir: string | null = null;
           try {
             const database = getDb(cfg);
             const where = whereClause({
@@ -772,51 +842,229 @@ export default Plugin.define({
               since: parseSince(args.since),
             });
             const limit = Math.min(Math.max(Math.trunc(args.limit ?? 50), 1), 1000);
-            const rows = database
+            const format = args.format ?? "jsonl";
+
+            // E50: stream rows via .iterate() and write incrementally to a temp
+            // file instead of loading all rows into memory with .all().
+            tmpDir = mkdtempSync(join(tmpdir(), "trace-export-"));
+            const tmpFile = join(tmpDir, `trace-export-${Date.now()}.${format}`);
+            writeStream = createWriteStream(tmpFile, "utf8");
+
+            let count = 0;
+            if (format === "markdown") {
+              writeStream.write("| time | tool | status | duration_ms | session | error | input |\n| --- | --- | --- | --- | --- | --- | --- |\n");
+            } else if (format === "csv") {
+              writeStream.write("id,started_at,tool,status,duration_ms,session_id,error,input,output_chars\n");
+            }
+
+            const iter = database
               .query(`SELECT * FROM calls c WHERE 1=1${where.sql} ORDER BY c.started_ms ASC LIMIT ?`)
-              .all(...where.params, limit) as CallRow[];
+              .iterate(...where.params, limit) as IterableIterator<CallRow>;
 
-            if (rows.length === 0) return { content: "No tool calls matched." };
-
-            if ((args.format ?? "jsonl") === "markdown") {
-              const head =
-                "| time | tool | status | duration_ms | session | error | input |\n| --- | --- | --- | --- | --- | --- | --- |";
-              const body = rows.map((r) =>
-                [
+            for (const r of iter) {
+              count++;
+              if (format === "markdown") {
+                writeStream.write(`| ${[
                   fmtTime(r.started_at),
                   r.tool,
                   r.status ?? "",
                   r.duration_ms ?? "",
                   (r.session_id ?? "").slice(0, 12),
-                  // T6: newlines in stored values must not break the table.
                   (r.error ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ").slice(0, 120),
                   (r.input ?? "").replace(/\|/g, "\\|").replace(/\r?\n/g, " ").slice(0, 200),
-                ].join(" | "),
-              );
-              return { content: [head, ...body.map((b) => `| ${b} |`)].join("\n") };
-            }
-
-            const jsonl = rows
-              .map((r) =>
-                JSON.stringify({
+                ].join(" | ")} |\n`);
+              } else if (format === "csv") {
+                writeStream.write(`${[
+                  r.id,
+                  fmtTime(r.started_at),
+                  r.tool,
+                  r.status ?? "",
+                  r.duration_ms ?? "",
+                  (r.session_id ?? "").slice(0, 12),
+                  (r.error ?? "").slice(0, 2000),
+                  (r.input ?? "").slice(0, 2000),
+                  r.output_chars ?? "",
+                ].map(csvEscape).join(",")}\n`);
+              } else {
+                writeStream.write(JSON.stringify({
                   time: r.started_at,
                   tool: r.tool,
                   status: r.status,
                   duration_ms: r.duration_ms,
                   session: r.session_id,
                   agent: r.agent,
-                  // TA-5: the error column is unbounded — truncate so a bulk
-                  // export cannot return megabytes of text.
                   error:
                     r.error && r.error.length > 2000 ? `${r.error.slice(0, 2000)}…[truncated]` : r.error,
                   input: r.input,
                   output_chars: r.output_chars,
-                }),
-              )
-              .join("\n");
-            return { content: jsonl };
+                }) + "\n");
+              }
+            }
+
+            writeStream.end();
+            await new Promise<void>((resolve, reject) => {
+              writeStream!.on("finish", resolve);
+              writeStream!.on("error", reject);
+            });
+
+            if (count === 0) {
+              return { content: "No tool calls matched." };
+            }
+
+            // TA-5: move the finished file out of the temp dir into the
+            // plugin's data dir so the returned path stays valid, letting the
+            // finally block remove the temp dir on every path.
+            const exportDir = join(cfg.dir, "exports");
+            mkdirSync(exportDir, { recursive: true });
+            const finalPath = join(exportDir, basename(tmpFile));
+            try {
+              renameSync(tmpFile, finalPath);
+            } catch {
+              // Cross-device temp dirs (tmpfs → home): copy instead of rename.
+              copyFileSync(tmpFile, finalPath);
+            }
+            return { content: `Exported ${count} row(s) to ${finalPath}` };
           } catch (err) {
             return { content: `trace_export failed: ${String(err)}` };
+          } finally {
+            try {
+              writeStream?.destroy();
+            } catch {
+              /* already closed */
+            }
+            if (tmpDir) {
+              try {
+                rmSync(tmpDir, { force: true, recursive: true });
+              } catch {
+                /* best effort */
+              }
+            }
+          }
+        },
+      });
+
+      // E48 — trace_timeline
+      editor.add({
+        name: "trace_timeline",
+        description: "Full call history for a single tool, newest first.",
+        input: z.object({
+          tool: z.string().min(1).describe("Tool name"),
+          // TA-1: the stored statuses are "completed"/"error" — the old
+          // ["ok","error"] enum filtered every completed call out of results.
+          status: z.enum(["completed", "error"]).optional().describe("Filter by status"),
+          since: z.string().optional().describe('Start time (ISO or "1h" style)'),
+          limit: z.number().int().positive().max(500).optional().describe("Max rows (default 50)"),
+        }),
+        execute: async (input) => {
+          const args = input as { tool: string; status?: string; since?: string; limit?: number };
+          try {
+            const db = getDb(cfg);
+            const sinceMs = parseSince(args.since);
+            const limit = args.limit ?? 50;
+            // TA-1: the calls table has started_at/started_ms, not `time` —
+            // the old query threw `no such column: time` on every call.
+            let sql =
+              "SELECT id, started_at, session_id, agent, tool, status, duration_ms FROM calls WHERE tool = ?";
+            const params: unknown[] = [args.tool];
+            if (args.status) {
+              sql += " AND status = ?";
+              params.push(args.status);
+            }
+            if (sinceMs !== undefined) {
+              sql += " AND started_ms >= ?";
+              params.push(sinceMs);
+            }
+            sql += " ORDER BY started_ms DESC LIMIT ?";
+            params.push(limit);
+            const rows = db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+            if (rows.length === 0) return { content: `No calls found for tool '${args.tool}'.` };
+            const lines = [`Call history for '${args.tool}' (${rows.length} calls)`];
+            for (const r of rows) {
+              lines.push(
+                `  ${fmtTime(r.started_at)} ${r.status} ${fmtDuration(r.duration_ms)} session=${r.session_id} agent=${r.agent}`,
+              );
+            }
+            return { content: lines.join("\n") };
+          } catch (err) {
+            return { content: `trace_timeline failed: ${String(err)}` };
+          }
+        },
+      });
+
+      // E52 — trace_config
+      editor.add({
+        name: "trace_config",
+        description: "View or update tool-audit configuration at runtime.",
+        input: z.object({
+          ignoreTools: z.array(z.string()).optional().describe("Replace the ignore list"),
+          addIgnoreTools: z.array(z.string()).optional().describe("Add tools to the ignore list"),
+          removeIgnoreTools: z.array(z.string()).optional().describe("Remove tools from the ignore list"),
+          redact: z.boolean().optional().describe("Enable/disable redaction"),
+          maxInputChars: z.number().optional().describe("Max input characters to store (min 100)"),
+        }),
+        execute: async (input) => {
+          const args = input as {
+            ignoreTools?: string[];
+            addIgnoreTools?: string[];
+            removeIgnoreTools?: string[];
+            redact?: boolean;
+            maxInputChars?: number;
+          };
+          try {
+            if (args.ignoreTools) {
+              cfg.ignoreTools = new Set(args.ignoreTools);
+            }
+            if (args.addIgnoreTools) {
+              for (const t of args.addIgnoreTools) cfg.ignoreTools.add(t);
+            }
+            if (args.removeIgnoreTools) {
+              for (const t of args.removeIgnoreTools) cfg.ignoreTools.delete(t);
+            }
+            if (args.redact !== undefined) cfg.redact = args.redact;
+            if (args.maxInputChars !== undefined) cfg.maxInputChars = Math.max(100, args.maxInputChars);
+
+            return {
+              content: [
+                `tool-audit config:`,
+                `  ignoreTools: ${[...cfg.ignoreTools].join(", ")}`,
+                `  redact: ${cfg.redact}`,
+                `  maxInputChars: ${cfg.maxInputChars}`,
+                `  retentionDays: ${cfg.retentionDays}`,
+                `  dir: ${cfg.dir}`,
+              ].join("\n"),
+            };
+          } catch (err) {
+            return { content: `trace_config failed: ${String(err)}` };
+          }
+        },
+      });
+
+      // E51 — trace_redact_verify
+      editor.add({
+        name: "trace_redact_verify",
+        description: "Verify redaction is working by running it on a sample string.",
+        input: z.object({
+          sample: z.string().optional().describe("Sample text to redact (default: built-in test string)"),
+        }),
+        execute: async (input) => {
+          const args = input as { sample?: string };
+          try {
+            const before =
+              args.sample ??
+              "sk-abc123def456 api_key=xyz789 token=secret123 password=hunter2 email=test@example.com";
+            const after = redact(before);
+            return {
+              content: [
+                `Redaction verification`,
+                ``,
+                `  before: ${before}`,
+                `  after:  ${after}`,
+                ``,
+                after === before ? `  WARNING: redaction had no effect` : `  OK: redaction applied`,
+              ].join("\n"),
+            };
+          } catch (err) {
+            return { content: `trace_redact_verify failed: ${String(err)}` };
           }
         },
       });

@@ -15,7 +15,7 @@ completion tracking through the server's event stream. The first seven are
 about sessions this plugin spawned; the last two are about *other* sessions
 working in the same project.
 
-- Plugin source: `plugins/opencode-sessions.ts`
+- Plugin source: `opencode-sessions/opencode-sessions.ts`
 - Dev + verification: `opencode-sessions/` (this folder)
 
 ## Install
@@ -431,9 +431,9 @@ context registers all seven tools (`spawn_session`, `session_result`,
 
 Loader check (plugin installed into a running server's plugins dir):
 
-1. `node opencode-sessions/sync.mjs` installs the repo copy to
-   `plugins/opencode-sessions.ts` inside this repository; copy that file into
-   your global or project plugins dir, then (re)start opencode.
+1. Copy `opencode-sessions/opencode-sessions.ts` into your global or project
+   plugins dir (and keep `helpers.ts` beside it, outside the plugins dir so the
+   loader never treats it as a plugin), then (re)start opencode.
 2. All seven tools appear in the live tool registry with no
    `failed to load plugin` WARN in the server log.
 3. `list_sessions` executes live against the server.

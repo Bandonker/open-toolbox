@@ -85,6 +85,46 @@ function payloads(body) {
     .map((line) => line.slice(5).trim());
 }
 
+/** The {index, reason} of every chunk that still carries a finish reason. */
+function finishEntries(body) {
+  const out = [];
+  for (const payload of payloads(body)) {
+    if (payload === "[DONE]") continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      continue;
+    }
+    const choices = Array.isArray(parsed?.choices) ? parsed.choices : [];
+    for (const choice of choices) {
+      if (choice && typeof choice === "object" && choice.finish_reason) {
+        out.push({ index: choice.index, reason: choice.finish_reason });
+      }
+    }
+  }
+  return out;
+}
+
+/** Per-event shape classification, so ordering can be asserted. */
+function eventKinds(body) {
+  return payloads(body).map((payload) => {
+    if (payload === "[DONE]") return "done";
+    let parsed;
+    try {
+      parsed = JSON.parse(payload);
+    } catch {
+      return "other";
+    }
+    const choices = Array.isArray(parsed?.choices) ? parsed.choices : [];
+    const finish = choices.some((c) => c && typeof c === "object" && c.finish_reason);
+    const delta = choices.some(
+      (c) => c && typeof c === "object" && c.delta && Object.keys(c.delta).length > 0,
+    );
+    return finish ? "finish" : delta ? "delta" : "other";
+  });
+}
+
 // Case 1: reasoning content arrives after the finish_reason chunk. The stream
 // must be reordered so nothing follows the finish reason.
 {
@@ -134,6 +174,104 @@ function payloads(body) {
   check("compliant stream keeps exactly one finish reason", finishes.length === 1, body);
   check("compliant stream keeps its content", body.includes("one") && body.includes("two"));
   check("compliant stream still ends with [DONE]", events[events.length - 1] === "[DONE]", body);
+}
+
+// Case 2b (FG-1): n > 1 choices. The transform used to remember ONE finish
+// reason and flush it as `index: 0`, so every other choice lost its own finish
+// reason (and the wrong choice got one). Each stripped index must be flushed.
+{
+  const { body } = await drive([
+    dataChunk({ id: "m", choices: [{ index: 0, delta: { content: "a0" } }, { index: 1, delta: { content: "b0" } }] }),
+    dataChunk({ id: "m", choices: [{ index: 0, delta: { content: "a1" }, finish_reason: "stop" }] }),
+    dataChunk({ id: "m", choices: [{ index: 1, delta: { content: "b1" }, finish_reason: "tool_calls" }] }),
+    dataChunk({ id: "m", choices: [{ index: 0, delta: { reasoning_content: "late thought" } }] }),
+    "data: [DONE]\n\n",
+  ]);
+  check("FG-1 multi-choice keeps every choice's content", ["a0", "a1", "b0", "b1"].every((t) => body.includes(t)), body);
+  const entries = finishEntries(body);
+  check(
+    "FG-1 one finish entry is emitted per stripped choice index",
+    JSON.stringify(entries) === JSON.stringify([{ index: 0, reason: "stop" }, { index: 1, reason: "tool_calls" }]),
+    JSON.stringify(entries),
+  );
+  const kinds = eventKinds(body);
+  const lastFinish = kinds.lastIndexOf("finish");
+  const lastDelta = kinds.lastIndexOf("delta");
+  check("FG-1 multi-choice finishes come after all content", lastFinish > lastDelta, JSON.stringify(kinds));
+  check(
+    "FG-1 the finish entries are the last events before [DONE]",
+    kinds.slice(lastFinish).every((k, i) => (i === kinds.slice(lastFinish).length - 1 ? k === "done" : k === "finish")),
+    JSON.stringify(kinds),
+  );
+}
+
+// Case 2c (FG-1): only the choice at index 1 ever carried a finish reason. It
+// must be flushed as index 1 — the old hardcoded index terminated the wrong
+// choice and left the real one unterminated.
+{
+  const { body } = await drive([
+    dataChunk({ id: "n", choices: [{ index: 0, delta: { content: "a0" } }, { index: 1, delta: { content: "b0" } }] }),
+    dataChunk({ id: "n", choices: [{ index: 1, delta: {}, finish_reason: "tool_calls" }] }),
+    "data: [DONE]\n\n",
+  ]);
+  const entries = finishEntries(body);
+  check("FG-1 a lone index-1 finish keeps its index", JSON.stringify(entries) === JSON.stringify([{ index: 1, reason: "tool_calls" }]), JSON.stringify(entries));
+  check("FG-1 no phantom finish is invented for index 0", body.includes('"a0"') && body.includes('"b0"'), body);
+}
+
+// Case 2d (FG-2): the gateway streams tool call argument fragments
+// that carry neither `id` nor `function.name`, and the start delta
+// (the chunk that carries them) arrives late. The fragments must be
+// buffered and flushed as one consolidated delta with the identity,
+// before the finish reason.
+{
+  const { body } = await drive([
+    dataChunk({ id: "t", choices: [{ index: 0, delta: { role: "assistant", content: null, tool_calls: [{ index: 0, function: { arguments: '{"command": ' } }] } }] }),
+    dataChunk({ id: "t", choices: [{ index: 0, delta: { content: null, tool_calls: [{ index: 0, function: { arguments: '"ls"' } }] } }] }),
+    dataChunk({ id: "t", choices: [{ index: 0, delta: { content: null, tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "shell", arguments: " }" } }] } }] }),
+    dataChunk({ id: "t", choices: [{ index: 0, delta: { content: null, tool_calls: [{ index: 0, function: { arguments: "" } }] } }] }),
+    dataChunk({ id: "t", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+    "data: [DONE]\n\n",
+  ]);
+  const events = payloads(body).filter((p) => p !== "[DONE]").map((p) => {
+    try { return JSON.parse(p); } catch { return null; }
+  }).filter(Boolean);
+  const toolChunks = events.filter((e) => e.choices?.[0]?.delta?.tool_calls);
+  check("FG-2 the first tool_calls chunk carries id and name",
+    toolChunks.length > 0 && toolChunks[0].choices[0].delta.tool_calls[0].id === "call_1" &&
+    toolChunks[0].choices[0].delta.tool_calls[0].function.name === "shell",
+    JSON.stringify(toolChunks));
+  check("FG-2 buffered arguments are consolidated into the flushed delta",
+    toolChunks[0].choices[0].delta.tool_calls[0].function.arguments === '{"command": "ls" }',
+    JSON.stringify(toolChunks));
+  const finishIdx = events.findIndex((e) => e.choices?.[0]?.finish_reason);
+  const lastToolIdx = events.length - 1 - [...events].reverse().findIndex((e) => e.choices?.[0]?.delta?.tool_calls);
+  check("FG-2 tool call is flushed before the finish reason", finishIdx > lastToolIdx, JSON.stringify(events));
+}
+
+// Case 2e (FG-2): the start delta never arrives at all — every
+// fragment lacks `id` and `function.name`. The buffered call is
+// flushed before the finish reason with a synthesised id so the
+// driver at least sees a well-formed call.
+{
+  const { body } = await drive([
+    dataChunk({ id: "u", choices: [{ index: 0, delta: { role: "assistant", content: null, tool_calls: [{ index: 0, function: { arguments: '{"a":' } }] } }] }),
+    dataChunk({ id: "u", choices: [{ index: 0, delta: { content: null, tool_calls: [{ index: 0, function: { arguments: "1}" } }] } }] }),
+    dataChunk({ id: "u", choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] }),
+    "data: [DONE]\n\n",
+  ]);
+  const events = payloads(body).filter((p) => p !== "[DONE]").map((p) => {
+    try { return JSON.parse(p); } catch { return null; }
+  }).filter(Boolean);
+  const toolChunks = events.filter((e) => e.choices?.[0]?.delta?.tool_calls);
+  check("FG-2 a call with no start delta is still flushed before finish",
+    toolChunks.length === 1 &&
+    toolChunks[0].choices[0].delta.tool_calls[0].function.arguments === '{"a":1}' &&
+    typeof toolChunks[0].choices[0].delta.tool_calls[0].id === "string",
+    JSON.stringify(toolChunks));
+  const finishIdx = events.findIndex((e) => e.choices?.[0]?.finish_reason);
+  const toolIdx = events.findIndex((e) => e.choices?.[0]?.delta?.tool_calls);
+  check("FG-2 flushed call precedes the finish reason", toolIdx >= 0 && finishIdx > toolIdx, JSON.stringify(events));
 }
 
 // Case 3: a non-SSE response is passed through untouched (same object).

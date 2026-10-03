@@ -8,6 +8,8 @@ backups/
 
 docs/
 packages/
+.packages-tmp/
+.packages-backup/
 
 ISSUES.md
 .superpowers/

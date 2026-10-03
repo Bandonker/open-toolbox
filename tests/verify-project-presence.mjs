@@ -923,18 +923,37 @@ const msgText = (m) =>
   );
 
   // A broadcast must reach the live peer and report the vanished one rather
-  // than silently dropping it or reviving it.
+  // than silently dropping it or reviving it. ID_A was messaged a moment ago
+  // by PP-48, so the first broadcast lands inside the 2s double-delivery
+  // window: OS-8 requires that suppression to be *reported*, not counted as
+  // delivered. Once the window has passed the same broadcast reaches both.
   h.alive.delete(ID_E);
   h.push(sessionEvent(ID_C, PROJECT, "session.execution.started"));
   await new Promise((r) => setTimeout(r, 60));
   h.synthetic.length = 0;
+  const throttled = await h.tools.session_broadcast.execute({ text: "heads up", noReply: true }, { sessionID: SELF });
+  check(
+    "PP-50a a double-delivery suppression is reported, never counted as sent",
+    /Broadcast to 1\/2/.test(throttled.content) &&
+      new RegExp(`Not sent to .*${ID_A.slice(0, 8)}`).test(throttled.content) &&
+      // The vanished peer is reported and forgotten by this broadcast, which
+      // is why PP-50b below no longer sees it at all.
+      new RegExp(`Confirmed gone and dropped: .*${ID_E.slice(0, 8)}`).test(throttled.content) &&
+      h.synthetic.length === 1 &&
+      h.synthetic[0].sessionID === ID_C &&
+      !h.synthetic.some((s) => s.sessionID === ID_A),
+    throttled.content.replace(/\n/g, " | ").slice(0, 200),
+  );
+
+  await new Promise((r) => setTimeout(r, 2100));
+  h.synthetic.length = 0;
   const mixed = await h.tools.session_broadcast.execute({ text: "heads up", noReply: true }, { sessionID: SELF });
   check(
-    "PP-50 a broadcast reaches the live peers and reports the vanished one",
+    "PP-50b a broadcast reaches every live peer once the window has passed",
     /Broadcast to 2\/2/.test(mixed.content) &&
-      new RegExp(`Confirmed gone and dropped: .*${ID_E.slice(0, 8)}`).test(mixed.content) &&
+      !/Confirmed gone/.test(mixed.content) && // ID_E was dropped by PP-50a
       h.synthetic.some((s) => s.sessionID === ID_C) &&
-      !h.synthetic.some((s) => s.sessionID === ID_E),
+      h.synthetic.some((s) => s.sessionID === ID_A),
     mixed.content.replace(/\n/g, " | ").slice(0, 200),
   );
 }

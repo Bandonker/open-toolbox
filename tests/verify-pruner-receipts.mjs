@@ -198,7 +198,7 @@ assert.equal(quiet.length, 0, `expected no receipt below the floor, got ${quiet.
   const beforeCompress = notes.length;
   const compressRes = await toolDefs.compress.execute({ topic: "auth refactor", last: 2 }, { sessionID: "ses_digest" });
   assert.ok(
-    /Summarised \d+ tool result/.test(compressRes.content),
+    /Compressed \d+ tool result/.test(compressRes.content),
     `compress summarises, got: ${compressRes.content}`,
   );
   assert.equal(notes.length, beforeCompress, "compress tool emits no receipt of its own");

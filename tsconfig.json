@@ -12,8 +12,7 @@
   },
   "include": [
     "plugins/**/*.ts",
-    "lib/**/*.ts",
-    "opencode-sessions/helpers.ts",
-    "opencode-sessions/opencode-sessions.ts"
+    "opencode-sessions/**/*.ts",
+    "lib/**/*.ts"
   ]
 }

@@ -1,5 +1,6 @@
 import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
+import { asBool, asInt } from "../lib/config.ts";
 
 /**
  * goal
@@ -42,6 +43,7 @@ interface ContextEvent {
 interface ToolEvent {
   sessionID?: string;
   tool?: string;
+  args?: unknown;
 }
 
 interface EventEnvelope {
@@ -59,6 +61,7 @@ interface GoalCtx {
     get?: (key: string) => Promise<unknown>;
     set?: (key: string, value: unknown) => Promise<void>;
     remove?: (key: string) => Promise<void>;
+    keys?: () => Promise<string[]>;
   };
   event?: {
     subscribe?: (opts: { signal: AbortSignal }) => AsyncIterable<EventEnvelope>;
@@ -117,6 +120,8 @@ interface GoalState {
   sessionID: string;
   objective: string;
   criteria: string[];
+  /** E115: parallel to criteria — tracks which are done. */
+  criteriaDone?: boolean[];
   status: GoalStatus;
   createdAt: number;
   updatedAt: number;
@@ -136,6 +141,11 @@ interface GoalState {
   pausedAt?: number;
   /** Set once when a user-initiated (non-goal) turn suppressed the auto-kick (G9). */
   userTookOver?: boolean;
+  /** E120: recent tool call signatures for duplicate detection. */
+  recentToolCalls?: string[];
+  /** E124/GO-6: per-goal notification override, read by note() — a goal that
+   * carries notify:false (e.g. restored through `/goal import`) stays quiet. */
+  notify?: boolean;
   progress: ProgressNote[];
   lastSummary?: string;
   evidence?: string;
@@ -153,6 +163,8 @@ interface GoalConfig {
   maxInjectChars: number;
   notify: boolean;
   log: boolean;
+  /** E128: per-turn timeout in minutes. */
+  maxTurnMinutes: number;
 }
 
 /* --------------------------------------------------------------- constants */
@@ -174,11 +186,26 @@ const HELP = [
   "  /goal resume             resume an auto-continuing goal",
   "  /goal done               mark the goal complete yourself",
   "  /goal clear              forget the goal",
+  "  /goal history            list all past goals",
+  "  /goal budget <n> [min]   update iteration/time budget",
+  "  /goal criteria [text]    add or list success criteria",
+  "  /goal objective [text]   show or update the objective",
+  "  /goal log                show recent log messages",
+  "  /goal stats              show aggregate goal statistics",
+  "  /goal export             export goal as JSON",
+  "  /goal import <json>      restore a goal from JSON",
+  "  /goal pause_all          pause all active goals",
+  "  /goal resume_all         resume all paused goals",
   "",
   "Tip: follow the objective with '- ' lines to list success criteria, e.g.",
   "  /goal Ship the login fix",
   "  - the failing test passes",
   "  - no new type errors",
+  "",
+  "Examples:",
+  "  /goal Ship the login fix - tests pass - no type errors",
+  "  /goal Refactor the auth module",
+  "  /goal Fix all TypeScript errors in the codebase",
 ].join("\n");
 const NO_GOAL = "[goal-plugin] No goal is set for this session. Use `/goal <objective>` to set one.";
 
@@ -196,20 +223,13 @@ const STATUS_LABEL: Record<GoalStatus, string> = {
 /* ----------------------------------------------------------------- config */
 
 function toBool(value: unknown, fallback: boolean): boolean {
-  if (typeof value === "boolean") return value;
   if (typeof value === "number") return value !== 0;
-  if (typeof value === "string") {
-    const v = value.trim().toLowerCase();
-    if (["1", "true", "yes", "on"].includes(v)) return true;
-    if (["0", "false", "no", "off"].includes(v)) return false;
-  }
-  return fallback;
+  return asBool(value, fallback);
 }
 
 function toInt(value: unknown, fallback: number, min: number, max: number): number {
-  const n = typeof value === "number" ? value : Number.parseInt(String(value ?? ""), 10);
-  if (!Number.isFinite(n)) return fallback;
-  return Math.min(max, Math.max(min, Math.trunc(n)));
+  const n = asInt(value, fallback);
+  return Math.min(max, Math.max(min, n));
 }
 
 function resolveConfig(options: Record<string, unknown> | undefined): GoalConfig {
@@ -225,6 +245,8 @@ function resolveConfig(options: Record<string, unknown> | undefined): GoalConfig
     maxInjectChars: toInt(pick("maxInjectChars", "OPENCODE_GOAL_MAX_INJECT_CHARS"), 1600, 200, 20000),
     notify: toBool(pick("notify", "OPENCODE_GOAL_NOTIFY"), true),
     log: toBool(pick("log", "OPENCODE_GOAL_LOG"), false),
+    // E128: per-turn timeout.
+    maxTurnMinutes: toInt(pick("maxTurnMinutes", "OPENCODE_GOAL_MAX_TURN_MINUTES"), 30, 1, 100000),
   };
 }
 
@@ -282,7 +304,8 @@ function parseGoalText(text: string): { objective: string; criteria: string[] } 
     if (bullet && bullet[1]) criteria.push(bullet[1].trim());
     else objective.push(line);
   }
-  const head = objective.join(" ").trim();
+  // E123: preserve line breaks in multi-line objectives.
+  const head = objective.join("\n").trim();
   if (!head && criteria.length > 0) return { objective: criteria.join("; "), criteria: [] };
   return { objective: head, criteria };
 }
@@ -319,11 +342,16 @@ function buildPrompt(
       : `${MARK} Continue toward the goal (attempt ${st.iterations}/${st.maxIterations}, ${remaining} left, ${elapsedMin} min elapsed, about ${budgetMin} min of wall-clock budget remaining).`,
   ];
   if (opts.note) lines.push(opts.note);
-  lines.push("", `OBJECTIVE\n${st.objective}`);
+  lines.push("", `OBJECTIVE\n${truncate(st.objective, 2000)}`);
   if (st.criteria.length > 0) {
+    // E114: show criteria completion count.
+    const doneCount = st.criteriaDone?.filter(Boolean).length ?? 0;
     lines.push(
       "",
-      `SUCCESS CRITERIA\n${st.criteria.map((c, i) => `${i + 1}. ${c}`).join("\n")}`,
+      `SUCCESS CRITERIA (${doneCount}/${st.criteria.length} complete)\n${st.criteria.map((c, i) => {
+      const done = st.criteriaDone?.[i] ? "✓" : " ";
+      return `${i + 1}. [${done}] ${truncate(c, 500)}`;
+    }).join("\n")}`,
     );
   }
   if (st.progress.length > 0) {
@@ -355,6 +383,8 @@ function buildReminder(st: GoalState, cfg: GoalConfig): string {
   ];
   if (st.criteria.length > 0) lines.push(`Success criteria: ${st.criteria.join(" | ")}`);
   lines.push(`Budget: attempt ${st.iterations}/${st.maxIterations} (${remaining} left).`);
+  // E126: failure count in reminder.
+  lines.push(`Failures: ${st.failures}/${cfg.maxFailures}`);
   if (st.progress.length > 0) {
     lines.push(`Latest milestone: ${st.progress[st.progress.length - 1].text}`);
   }
@@ -373,25 +403,31 @@ function statusText(st: GoalState, cfg: GoalConfig): string {
     : cfg.maxMinutes > 0
       ? Math.max(0, cfg.maxMinutes - elapsedMin)
       : null;
-  const lines = [`${MARK} Goal (${STATUS_LABEL[st.status]})`, `Objective: ${st.objective}`];
+  const lines = [`${MARK} Goal (${STATUS_LABEL[st.status]})`, `Objective: ${truncate(st.objective, 2000)}`];
   if (st.criteria.length > 0) {
-    lines.push(`Success criteria:\n${st.criteria.map((c, i) => `  ${i + 1}. ${c}`).join("\n")}`);
+    lines.push(`Success criteria:\n${st.criteria.map((c, i) => `  ${i + 1}. ${truncate(c, 500)}`).join("\n")}`);
   }
   lines.push(
     `Attempts: ${st.iterations}/${st.maxIterations} (${remaining} left) · ${elapsedMin} min elapsed · ${budgetMin === null ? "no wall-clock deadline" : `~${budgetMin} min budget left`}`,
   );
+  // E116: stall count.
+  lines.push(`Stall count: ${st.stallCount}/${cfg.stallLimit}`);
+  // E117: failure count.
+  lines.push(`Failures: ${st.failures}/${cfg.maxFailures}`);
+  // E118: last signature.
+  if (st.lastSignature) lines.push(`Last reply signature: ${truncate(st.lastSignature, 100)}`);
   if (st.progress.length > 0) {
     lines.push(
       `Recent progress:\n${st.progress
         .slice(-3)
-        .map((p) => `  - ${p.text}`)
+        .map((p) => `  - ${truncate(p.text, 500)}`)
         .join("\n")}`,
     );
   }
-  if (st.lastSummary) lines.push(`Last summary: ${st.lastSummary}`);
+  if (st.lastSummary) lines.push(`Last summary: ${truncate(st.lastSummary, 1000)}`);
   if (st.evidence) lines.push(`Evidence: ${truncate(st.evidence, 500)}`);
-  if (st.blockedReason) lines.push(`Blocked: ${st.blockedReason}`);
-  if (st.stoppedReason) lines.push(`Stopped: ${st.stoppedReason}`);
+  if (st.blockedReason) lines.push(`Blocked: ${truncate(st.blockedReason, 500)}`);
+  if (st.stoppedReason) lines.push(`Stopped: ${truncate(st.stoppedReason, 500)}`);
   return lines.join("\n");
 }
 
@@ -419,9 +455,31 @@ export default Plugin.define({
     const loading = new Map<string, Promise<GoalState | undefined>>();
     const inFlight = new Set<string>();
     const toolActivity = new Set<string>();
+    // E120: recent tool call signatures per session for duplicate detection.
+    const toolCallSigs = new Map<string, string[]>();
+    // GO-6: wall-clock start of the turn currently in flight, so evaluate()
+    // can tell a turn that ran past maxTurnMinutes from a quick one. Stamped
+    // when the plugin queues a turn (kick) and by the first tool call of a
+    // turn (the tool hook); consumed — not left behind — at the top of
+    // evaluate, exactly like `toolActivity` (GO-1), so an early return cannot
+    // leak a stale stamp into the next turn.
+    const turnStartedAt = new Map<string, number>();
+
+    /** GO-4: drop every per-session scratch map entry for a session whose goal
+     * is finished (stop/clear/teardown — and any terminal transition, which
+     * save() routes through here for non-active states). */
+    const dropSessionScratch = (sessionID: string): void => {
+      toolCallSigs.delete(sessionID);
+      toolActivity.delete(sessionID);
+      turnStartedAt.delete(sessionID);
+    };
     /** GO-3/CR-5: session-keyed state is capped with oldest-first (FIFO)
      * eviction so a long-lived process cannot grow it without bound.
-     * Related entries are evicted together to avoid half-state. */
+     * Related entries are evicted together to avoid half-state.
+     * GO-4: `toolCallSigs` belongs to that family too — it was the one session
+     * map left out of the cap, so a process that only ever ran the tool hook
+     * (sessions that never stored a goal) grew it without bound, and stop /
+     * teardown never dropped it. */
     const MAX_SESSION_STATES = 500;
     const evictSessionStateIfFull = (): void => {
       while (live.size >= MAX_SESSION_STATES) {
@@ -432,6 +490,8 @@ export default Plugin.define({
         loading.delete(sid);
         inFlight.delete(sid);
         toolActivity.delete(sid);
+        toolCallSigs.delete(sid);
+        turnStartedAt.delete(sid);
       }
       while (loading.size > MAX_SESSION_STATES) {
         const oldest = loading.keys().next();
@@ -443,6 +503,16 @@ export default Plugin.define({
         if (oldest.done) break;
         toolActivity.delete(oldest.value);
       }
+      while (toolCallSigs.size > MAX_SESSION_STATES) {
+        const oldest = toolCallSigs.keys().next();
+        if (oldest.done) break;
+        toolCallSigs.delete(oldest.value as string);
+      }
+      while (turnStartedAt.size > MAX_SESSION_STATES) {
+        const oldest = turnStartedAt.keys().next();
+        if (oldest.done) break;
+        turnStartedAt.delete(oldest.value as string);
+      }
     };
     const disposers: Array<() => void | Promise<void>> = [];
     const track = (registration: Disposable | undefined): void => {
@@ -451,12 +521,23 @@ export default Plugin.define({
       }
     };
 
+    // E119: in-memory ring buffer of recent log messages.
+    const logBuffer: string[] = [];
+    const MAX_LOG_BUFFER = 100;
     const log = (message: string): void => {
+      logBuffer.push(`[${new Date().toISOString()}] ${message}`);
+      if (logBuffer.length > MAX_LOG_BUFFER) logBuffer.shift();
       if (cfg.log) console.error(`[goal] ${message}`);
     };
 
     const note = async (sessionID: string, text: string): Promise<void> => {
       if (!cfg.notify) return;
+      // GO-6: E124's per-goal override is now actually read (it was declared
+      // on GoalState and never consulted). A goal that carries notify:false
+      // (e.g. restored through `/goal import`) gets no plugin chatter; goals
+      // without the field keep the global default.
+      const override = live.get(sessionID)?.notify;
+      if (override === false) return;
       try {
         await c.session?.synthetic?.({ sessionID, text });
       } catch (err) {
@@ -467,6 +548,13 @@ export default Plugin.define({
     const save = async (st: GoalState): Promise<void> => {
       evictSessionStateIfFull();
       live.set(st.sessionID, st);
+      // GO-4: stop() is only one of the terminal paths — goals that finish
+      // through goal_complete / goal_blocked / `/goal done` set the status and
+      // save directly, and used to leave their tool-call signatures and turn
+      // stamp behind, where the NEXT goal in the same session read them as a
+      // duplicate-tool stall. Any non-active save means the loop is done
+      // driving this session, so the scratch state goes with it.
+      if (st.status !== "active") dropSessionScratch(st.sessionID);
       try {
         await c.storage?.set?.(STORE_PREFIX + st.sessionID, st);
       } catch (err) {
@@ -523,6 +611,9 @@ export default Plugin.define({
 
     const clear = async (sessionID: string): Promise<void> => {
       live.delete(sessionID);
+      // GO-4: the goal is gone, so is the scratch state that only made sense
+      // while it was being driven.
+      dropSessionScratch(sessionID);
       try {
         await c.storage?.remove?.(STORE_PREFIX + sessionID);
       } catch (err) {
@@ -556,6 +647,9 @@ export default Plugin.define({
       // G2: re-validate identity/status — queued events must not resurrect a
       // goal that was cleared, replaced, or paused in the meantime.
       if (live.get(st.sessionID) !== st || st.status !== "active") return;
+      // GO-6: the plugin knows when it starts a turn, so stamp the wall-clock
+      // start of the turn it is about to run; evaluate() measures against it.
+      turnStartedAt.set(st.sessionID, Date.now());
       try {
         await c.session?.prompt?.({
           sessionID: st.sessionID,
@@ -575,9 +669,18 @@ export default Plugin.define({
     };
 
     const stop = async (st: GoalState, status: GoalStatus, reason: string): Promise<void> => {
+      if (st.status !== "active") return;
       st.status = status;
       st.stoppedReason = reason;
       st.updatedAt = Date.now();
+      st.lastHandledMessageID = "";
+      st.lastHandledAt = 0;
+      st.recentSignatures = [];
+      st.lastSignature = "";
+      // GO-4: the loop is over — drop the per-session scratch state along with
+      // it instead of keeping stale signatures/turn stamps around until the
+      // FIFO cap happens to reach them.
+      dropSessionScratch(st.sessionID);
       await save(st);
       await note(
         st.sessionID,
@@ -586,39 +689,60 @@ export default Plugin.define({
       log(`goal for ${st.sessionID} stopped: ${status} (${reason})`);
     };
 
-    /** Latest assistant turn plus the user message that prompted it. */
-    const lastTurn = async (
-      sessionID: string,
-    ): Promise<{ id: string; text: string; userText: string }> => {
+    /** Latest assistant turn plus the user message that prompted it.
+     * GO-5: the caller has to tell three very different outcomes apart, so the
+     * result is discriminated by `threw` instead of an empty id:
+     *   threw: true   — session.context() itself failed (storage/server error)
+     *   id: ""        — the read worked but there is no usable assistant turn
+     *                   (none yet, or the message carries no id)
+     *   id: <string>  — a normal turn
+     * The old shape collapsed all three into `id === ""`, and evaluate() bailed
+     * on that, so a real session.execution.failed with no assistant turn never
+     * accrued `failures` and the loop stranded "active" instead of stopping. */
+    interface LastTurn {
+      id: string;
+      text: string;
+      userText: string;
+      threw: boolean;
+    }
+
+    const lastTurn = async (sessionID: string): Promise<LastTurn> => {
+      let messages: RawMessage[];
       try {
-        const messages = (await c.session?.context?.({ sessionID })) ?? [];
-        let aiIdx = -1;
-        for (let i = messages.length - 1; i >= 0; i--) {
-          const m = messages[i];
-          if (m?.role === "assistant" || m?.type === "assistant") {
-            aiIdx = i;
-            break;
-          }
-        }
-        let userText = "";
-        for (let i = aiIdx >= 0 ? aiIdx - 1 : messages.length - 1; i >= 0; i--) {
-          if (messages[i]?.role === "user") {
-            userText = textOf(messages[i]);
-            break;
-          }
-        }
-        if (aiIdx < 0) return { id: "", text: "", userText };
-        return { id: String(messages[aiIdx].id ?? ""), text: textOf(messages[aiIdx]), userText };
+        messages = (await c.session?.context?.({ sessionID })) ?? [];
       } catch (err) {
         log(`session.context failed for ${sessionID}: ${describeError(err)}`);
+        return { id: "", text: "", userText: "", threw: true };
       }
-      return { id: "", text: "", userText: "" };
+      let aiIdx = -1;
+      for (let i = messages.length - 1; i >= 0; i--) {
+        const m = messages[i];
+        if (m?.role === "assistant" || m?.type === "assistant") {
+          aiIdx = i;
+          break;
+        }
+      }
+      let userText = "";
+      for (let i = aiIdx >= 0 ? aiIdx - 1 : messages.length - 1; i >= 0; i--) {
+        if (messages[i]?.role === "user") {
+          userText = textOf(messages[i]);
+          break;
+        }
+      }
+      if (aiIdx < 0) return { id: "", text: "", userText, threw: false };
+      // An assistant message with no id is still a real turn — only its id is
+      // unknown, which G12 handles by time-based dedupe.
+      return { id: String(messages[aiIdx].id ?? ""), text: textOf(messages[aiIdx]), userText, threw: false };
     };
 
     const evaluate = async (sessionID: string, failed: boolean): Promise<void> => {
       if (!cfg.enabled || inFlight.has(sessionID)) return;
       inFlight.add(sessionID);
       const toolsRan = toolActivity.delete(sessionID);
+      // GO-6: consumed up-front, exactly like toolsRan (GO-1) — every early
+      // return below must not leave a stamp behind for the next turn.
+      const turnStart = turnStartedAt.get(sessionID);
+      turnStartedAt.delete(sessionID);
       try {
         const st = await load(sessionID);
         if (!st || st.status !== "active") return;
@@ -635,6 +759,13 @@ export default Plugin.define({
 
         const last = await lastTurn(sessionID);
 
+        // GO-5/H2: only a *failed context read* may bail before the failure
+        // accounting below — the old `last.id === ""` test also swallowed "no
+        // assistant turn yet" and "assistant message without an id", so
+        // session.execution.failed never accrued st.failures in those cases
+        // and maxFailures could never trip (the loop stranded "active").
+        if (last.threw) return;
+
         // G1: failure accounting runs BEFORE the dedup early-return so a
         // duplicate idle/failed pair can never swallow failures (which used
         // to let maxFailures never accrue and the loop stall silently).
@@ -648,9 +779,10 @@ export default Plugin.define({
           }
         }
 
-        // G12: an empty assistant id (session.context errors) is an unknown
-        // turn — dedupe it briefly by time instead of double-counting the
-        // paired idle/succeeded events.
+        // G12: an empty assistant id is an unknown turn — dedupe it briefly by
+        // time instead of double-counting the paired idle/succeeded events.
+        // GO-5: this block is reachable again (the id check above no longer
+        // returns on an empty id), which is what it was written for.
         const knownID = last.id !== "";
         if (knownID) {
           if (last.id === st.lastHandledMessageID) return;
@@ -687,6 +819,25 @@ export default Plugin.define({
         }
         st.userTookOver = false;
 
+        // GO-6: maxTurnMinutes is now enforced (it was resolved, reported by
+        // goal_config, and checked nowhere). A single turn that runs past the
+        // per-turn budget ends the loop instead of continuing on, so one hung
+        // or looping turn cannot burn the whole wall-clock budget.
+        // Deliberately evaluated AFTER the G9 takeover check above: the budget
+        // bounds the turns *this plugin drives*, and a user who spends five
+        // minutes on their own turn must not have their goal stopped for it.
+        if (cfg.maxTurnMinutes > 0 && turnStart !== undefined) {
+          const turnMs = now - turnStart;
+          if (turnMs > cfg.maxTurnMinutes * 60_000) {
+            await stop(
+              st,
+              "timeout",
+              `turn exceeded maxTurnMinutes (${Math.round(turnMs / 1000)}s > ${cfg.maxTurnMinutes} min).`,
+            );
+            return;
+          }
+        }
+
         // G10: stall = no tools this turn AND the reply repeats something
         // recent (catches A/B/A/B alternation, not just exact A/A repeats).
         // toolsRan was consumed at the top of evaluate so user-takeover and
@@ -705,6 +856,12 @@ export default Plugin.define({
         if (ring.length > 6) ring.shift();
         st.recentSignatures = ring;
         st.lastSignature = sig;
+        // E120: duplicate tool call detection — consecutive identical tool
+        // calls count as a stall even when tools are running.
+        const toolSigs = toolCallSigs.get(sessionID) ?? [];
+        if (toolSigs.length >= 2 && toolSigs[toolSigs.length - 1] === toolSigs[toolSigs.length - 2]) {
+          st.stallCount += 1;
+        }
         if (st.stallCount >= cfg.stallLimit) {
           await stop(
             st,
@@ -741,6 +898,24 @@ export default Plugin.define({
         sessionID,
         `${MARK} Goal paused (the turn was interrupted${reason ? `: ${reason}` : ""}). Use \`/goal resume\` to keep going.`,
       );
+    };
+
+    /** GO-3: put the wall-clock budget back in the future when a goal resumes.
+     * Normal case (G3): extend the deadline by the paused span so a long pause
+     * does not instantly trip the timeout. But a goal that stopped *at* the
+     * deadline (status "timeout"), or whose extended deadline is still <= now,
+     * must get a fresh `maxMinutes` window — extending a deadline that is
+     * already in the past left the next evaluate() stopping the goal again, so
+     * each resume bought exactly one turn before "reached the time budget"
+     * returned and the loop stranded the goal in "active". */    const refreshDeadlineOnResume = (st: GoalState): void => {
+      if (!st.deadlineAt) return;
+      const now = Date.now();
+      const extended = st.deadlineAt + Math.max(0, now - (st.pausedAt ?? st.updatedAt));
+      if (st.status === "timeout" || extended <= now) {
+        st.deadlineAt = cfg.maxMinutes > 0 ? now + cfg.maxMinutes * 60_000 : null;
+      } else {
+        st.deadlineAt = extended;
+      }
     };
 
     /* --------------------------------------------------------- registration */
@@ -847,6 +1022,55 @@ export default Plugin.define({
                 };
               }) as AnyToolDef["execute"],
             });
+
+            // E115: criteria completion tracking tool.
+            editor.add({
+              name: "goal_criteria_done",
+              description:
+                "Session-scoped: no-ops without an active goal in this session. Mark a success criterion as complete by its 1-based index.",
+              input: z.object({
+                index: z.number().int().min(1).describe("1-based criterion index to mark complete."),
+              }),
+              execute: (async (args: { index: number }, toolCtx: { sessionID?: string }) => {
+                const sessionID = toolCtx?.sessionID ?? "";
+                const st = await load(sessionID);
+                if (!st) return { content: "No goal is set for this session." };
+                if (st.status !== "active") {
+                  return { content: `The goal is ${STATUS_LABEL[st.status]}; criteria cannot be updated.` };
+                }
+                if (args.index < 1 || args.index > st.criteria.length) {
+                  return { content: `Invalid criterion index ${args.index}. There are ${st.criteria.length} criteria.` };
+                }
+                if (!st.criteriaDone) st.criteriaDone = st.criteria.map(() => false);
+                st.criteriaDone[args.index - 1] = true;
+                st.updatedAt = Date.now();
+                await save(st);
+                return { content: `Criterion ${args.index} marked complete.` };
+              }) as AnyToolDef["execute"],
+            });
+
+            // E311: config tool.
+            editor.add({
+              name: "goal_config",
+              description: "Show the current goal plugin configuration.",
+              input: z.object({}),
+              execute: (async () => {
+                return {
+                  content: [
+                    `enabled: ${cfg.enabled}`,
+                    `maxIterations: ${cfg.maxIterations}`,
+                    `maxMinutes: ${cfg.maxMinutes}`,
+                    `stallLimit: ${cfg.stallLimit}`,
+                    `maxFailures: ${cfg.maxFailures}`,
+                    `requireEvidence: ${cfg.requireEvidence}`,
+                    `maxInjectChars: ${cfg.maxInjectChars}`,
+                    `notify: ${cfg.notify}`,
+                    `log: ${cfg.log}`,
+                    `maxTurnMinutes: ${cfg.maxTurnMinutes}`,
+                  ].join("\n"),
+                };
+              }) as AnyToolDef["execute"],
+            });
           }),
         );
       } catch (err) {
@@ -869,6 +1093,18 @@ export default Plugin.define({
             // GO-3/CR-5: cap toolActivity with the same FIFO eviction.
             evictSessionStateIfFull();
             toolActivity.add(sessionID);
+            // GO-6: a tool call proves a turn is running. Stamp its start when
+            // nothing stamped it yet (kick() covers the loop's own turns; this
+            // catches turns that began outside the plugin, e.g. after a
+            // takeover + resume) so maxTurnMinutes measures a real span.
+            if (!turnStartedAt.has(sessionID)) turnStartedAt.set(sessionID, Date.now());
+            // E120: track tool call signatures for duplicate detection.
+            const argsStr = event?.args ? JSON.stringify(event.args) : "";
+            const sig = `${tool}:${argsStr}`;
+            const arr = toolCallSigs.get(sessionID) ?? [];
+            arr.push(sig);
+            if (arr.length > 10) arr.shift();
+            toolCallSigs.set(sessionID, arr);
           }),
         );
       } catch (err) {
@@ -965,15 +1201,24 @@ export default Plugin.define({
                   case "resume": {
                     const st = await load(sessionID);
                     if (!st) return void (await note(sessionID, NO_GOAL));
-                    // G3: extend the wall-clock budget by the paused span so a
-                    // long pause doesn't instantly trip the timeout on resume.
-                    if (st.deadlineAt) {
-                      const pausedAt = st.pausedAt ?? st.updatedAt;
-                      st.deadlineAt += Math.max(0, Date.now() - pausedAt);
-                    }
+                    // GO-2 (was H1): only a goal that is active AND still under
+                    // plugin control has nothing to resume. G9 leaves status
+                    // "active" when the user takes over and tells them to run
+                    // `/goal resume`, so the bare active-check made that
+                    // documented recovery a silent no-op — the guard has to let
+                    // the takeover case through (and the flag is cleared below
+                    // before the kick).
+                    if (st.status === "active" && !st.userTookOver) return;
+                    // G3/GO-3: put the wall-clock budget back in the future
+                    // (fresh window when it already ran out).
+                    refreshDeadlineOnResume(st);
                     // GO-9: remove the key instead of assigning undefined, so
                     // persisted state never carries a pausedAt field.
                     delete st.pausedAt;
+                    // GO-3: the goal is running again — a resume that left the
+                    // old stop reason in the state made exported status output
+                    // claim the goal was still timed out/failed.
+                    delete st.stoppedReason;
                     st.status = "active";
                     st.failures = 0;
                     st.stallCount = 0;
@@ -999,9 +1244,200 @@ export default Plugin.define({
                     await note(sessionID, `${MARK} Goal cleared.`);
                     return;
                   }
+                  // E110: history command.
+                  case "history": {
+                    const keys = await c.storage?.keys?.() ?? [];
+                    const goalKeys = keys.filter((k) => k.startsWith(STORE_PREFIX));
+                    if (goalKeys.length === 0) {
+                      await note(sessionID, "No past goals found.");
+                      return;
+                    }
+                    const entries: string[] = [];
+                    for (const key of goalKeys) {
+                      const raw = await c.storage?.get?.(key);
+                      if (raw && typeof raw === "object") {
+                        const st = raw as GoalState;
+                        entries.push(`#${st.sessionID} [${st.status}] ${truncate(st.objective, 100)}`);
+                      }
+                    }
+                    await note(sessionID, `Past goals:\n${entries.join("\n")}`);
+                    return;
+                  }
+                  // E111: budget command.
+                  case "budget": {
+                    const st = await load(sessionID);
+                    if (!st) return void (await note(sessionID, NO_GOAL));
+                    if (st.status !== "active") {
+                      return void (await note(sessionID, `${MARK} Goal is already ${STATUS_LABEL[st.status]}.`));
+                    }
+                    const parts = arg.split(/\s+/);
+                    const iterations = Number.parseInt(parts[0], 10);
+                    if (!Number.isFinite(iterations) || iterations <= 0) {
+                      return void (await note(sessionID, `${MARK} Usage: /goal budget <iterations> [minutes]`));
+                    }
+                    st.maxIterations = iterations;
+                    if (parts[1]) {
+                      const minutes = Number.parseInt(parts[1], 10);
+                      if (Number.isFinite(minutes) && minutes > 0) {
+                        st.deadlineAt = Date.now() + minutes * 60_000;
+                      }
+                    }
+                    st.updatedAt = Date.now();
+                    await save(st);
+                    await note(sessionID, `${MARK} Budget updated: ${st.maxIterations} iterations${st.deadlineAt ? `, deadline in ${Math.round((st.deadlineAt - Date.now()) / 60000)} min` : ""}.`);
+                    return;
+                  }
+                  // E112: criteria command.
+                  case "criteria": {
+                    const st = await load(sessionID);
+                    if (!st) return void (await note(sessionID, NO_GOAL));
+                    if (arg) {
+                      st.criteria.push(arg);
+                      if (st.criteriaDone) st.criteriaDone.push(false);
+                      st.updatedAt = Date.now();
+                      await save(st);
+                      await note(sessionID, `${MARK} Criterion added: ${arg}`);
+                    } else {
+                      if (st.criteria.length === 0) {
+                        await note(sessionID, "No criteria set.");
+                      } else {
+                        const lines = st.criteria.map((c, i) => {
+                          const done = st.criteriaDone?.[i] ? "✓" : " ";
+                          return `  ${i + 1}. [${done}] ${truncate(c, 200)}`;
+                        });
+                        await note(sessionID, `Criteria:\n${lines.join("\n")}`);
+                      }
+                    }
+                    return;
+                  }
+                  // E113: objective command.
+                  case "objective": {
+                    const st = await load(sessionID);
+                    if (!st) return void (await note(sessionID, NO_GOAL));
+                    if (!arg) {
+                      await note(sessionID, `Objective: ${st.objective}`);
+                      return;
+                    }
+                    st.objective = arg;
+                    st.updatedAt = Date.now();
+                    await save(st);
+                    await note(sessionID, `${MARK} Objective updated.`);
+                    return;
+                  }
+                  // E119: log command.
+                  case "log": {
+                    if (logBuffer.length === 0) {
+                      await note(sessionID, "No log messages yet.");
+                    } else {
+                      await note(sessionID, `Recent log:\n${logBuffer.slice(-20).join("\n")}`);
+                    }
+                    return;
+                  }
+                  // E131: stats command.
+                  case "stats": {
+                    const keys = await c.storage?.keys?.() ?? [];
+                    const goalKeys = keys.filter((k) => k.startsWith(STORE_PREFIX));
+                    let total = 0;
+                    let active = 0;
+                    let complete = 0;
+                    let blocked = 0;
+                    let failed = 0;
+                    let totalIterations = 0;
+                    let totalFailures = 0;
+                    for (const key of goalKeys) {
+                      const raw = await c.storage?.get?.(key);
+                      if (raw && typeof raw === "object") {
+                        const st = raw as GoalState;
+                        total += 1;
+                        if (st.status === "active") active += 1;
+                        if (st.status === "complete") complete += 1;
+                        if (st.status === "blocked") blocked += 1;
+                        if (st.status === "failed") failed += 1;
+                        totalIterations += st.iterations;
+                        totalFailures += st.failures;
+                      }
+                    }
+                    await note(sessionID, [
+                      `Goal statistics:`,
+                      `  Total: ${total}`,
+                      `  Active: ${active}`,
+                      `  Complete: ${complete}`,
+                      `  Blocked: ${blocked}`,
+                      `  Failed: ${failed}`,
+                      `  Total iterations: ${totalIterations}`,
+                      `  Total failures: ${totalFailures}`,
+                    ].join("\n"));
+                    return;
+                  }
+                  // E127: export command.
+                  case "export": {
+                    const st = await load(sessionID);
+                    if (!st) return void (await note(sessionID, NO_GOAL));
+                    await note(sessionID, `Goal state JSON:\n\`\`\`json\n${JSON.stringify(st, null, 2)}\n\`\`\``);
+                    return;
+                  }
+                  // E127: import command.
+                  case "import": {
+                    if (!arg) return void (await note(sessionID, `${MARK} Usage: /goal import <json>`));
+                    try {
+                      const parsed = JSON.parse(arg) as GoalState;
+                      if (!parsed.objective || !parsed.sessionID) {
+                        await note(sessionID, `${MARK} Invalid goal state JSON.`);
+                        return;
+                      }
+                      parsed.sessionID = sessionID;
+                      await save(parsed);
+                      await note(sessionID, `${MARK} Goal imported.`);
+                    } catch {
+                      await note(sessionID, `${MARK} Failed to parse goal JSON.`);
+                    }
+                    return;
+                  }
+                  // E121: pause_all command.
+                  case "pause_all": {
+                    const keys = [...live.keys()];
+                    for (const sid of keys) {
+                      const st = live.get(sid);
+                      if (st && st.status === "active") {
+                        st.status = "paused";
+                        st.pausedAt = Date.now();
+                        st.updatedAt = Date.now();
+                        await save(st);
+                      }
+                    }
+                    await note(sessionID, `${MARK} Paused ${keys.length} goal(s).`);
+                    return;
+                  }
+                  // E121: resume_all command.
+                  case "resume_all": {
+                    const keys = [...live.keys()];
+                    for (const sid of keys) {
+                      const st = live.get(sid);
+                      if (st && st.status === "paused") {
+                        // GO-3: same deadline handling as a single resume, so a
+                        // paused goal whose window already lapsed gets a fresh
+                        // one instead of stopping on its first turn back.
+                        refreshDeadlineOnResume(st);
+                        delete st.pausedAt;
+                        delete st.stoppedReason;
+                        st.status = "active";
+                        st.failures = 0;
+                        st.stallCount = 0;
+                        st.userTookOver = false;
+                        st.updatedAt = Date.now();
+                        await save(st);
+                      }
+                    }
+                    await note(sessionID, `${MARK} Resumed ${keys.length} goal(s).`);
+                    return;
+                  }
                   default: {
                     const goal = parseGoalText(arg);
                     if (!goal.objective) return void (await note(sessionID, HELP));
+                    // E122: objective length validation.
+                    if (goal.objective.length < 10) {
+                      return void (await note(sessionID, `${MARK} Objective too short (min 10 chars).`));
+                    }
                     const st = newGoal(sessionID, goal.objective, goal.criteria);
                     await save(st);
                     await note(
@@ -1063,6 +1499,12 @@ export default Plugin.define({
           /* best effort */
         }
       }
+      // GO-4: teardown released the registrations but left the session-keyed
+      // scratch maps populated until the process died (and the FIFO cap only
+      // ever trims `live`-driven keys, never tool-hook-only sessions).
+      toolCallSigs.clear();
+      toolActivity.clear();
+      turnStartedAt.clear();
     };
   },
 });

@@ -8,9 +8,13 @@ import {
   readFileSync,
   statSync,
   rmSync,
+  chmodSync,
+  realpathSync,
+  watch as watchFs,
+  type FSWatcher,
 } from "fs";
 import { homedir } from "os";
-import { join, relative, sep, extname } from "path";
+import { join, relative, sep, extname, isAbsolute } from "path";
 import {
   openDatabase,
   applyPragmas,
@@ -100,9 +104,48 @@ const SKIP_FILES = new Set([
   ".ds_store", "thumbs.db", ".directory", "desktop.ini",
 ]);
 
-const CHUNK_SIZE = 50;
-const CHUNK_OVERLAP = 10;
-const MAX_FILE_SIZE = 512_000;
+/**
+ * CI-3: paths that carry credentials rather than source. Indexed content is
+ * served back through codebase_search (and can quote config values), so a
+ * `.env`, `secrets.yaml`, `token.json`, a mounted `~/.aws`/`~/.ssh` or a CI
+ * workflow with an inline secret turns the index into a secret-reading tool
+ * — secret-shield never sees these reads, they never pass a shielded tool
+ * argument. Fail closed: the denylist wins over the extension allowlist and
+ * over INDEX_DOT_DIRS. Matched against the slash-normalized lowercase
+ * relative path (all segments).
+ */
+function isSecretPath(relPath: string): boolean {
+  const segs = relPath.toLowerCase().split(/[\\/]+/).filter(Boolean);
+  if (!segs.length) return false;
+  if (segs.includes(".aws") || segs.includes(".ssh")) return true;
+  const wi = segs.lastIndexOf("workflows");
+  if (wi > 0 && segs[wi - 1] === ".github") return true;
+  const base = segs[segs.length - 1];
+  if (base.startsWith(".env")) return true; // .env, .env.local, .env.production…
+  if (/secret|credential|token/.test(base)) return true;
+  return false;
+}
+
+// E318: configurable chunk size / overlap / max file size via env vars.
+const CHUNK_SIZE = Number(process.env.INDEX_CHUNK_SIZE) > 0 ? Number(process.env.INDEX_CHUNK_SIZE) : 50;
+const CHUNK_OVERLAP = Number(process.env.INDEX_CHUNK_OVERLAP) > 0 ? Number(process.env.INDEX_CHUNK_OVERLAP) : 10;
+const MAX_FILE_SIZE = Number(process.env.INDEX_MAX_FILE_SIZE) > 0 ? Number(process.env.INDEX_MAX_FILE_SIZE) : 512_000;
+
+/**
+ * E317: merge env-var extensions and skip lists into the hardcoded sets.
+ * INDEX_EXTS: comma-separated extensions (e.g. ".vue,.svelte").
+ * INDEX_SKIP_DIRS: comma-separated directory names to skip.
+ * INDEX_SKIP_FILES: comma-separated filenames to skip.
+ */
+function mergeEnvLists(): void {
+  const exts = (process.env.INDEX_EXTS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  for (const ext of exts) DEFAULT_EXTS.add(ext.startsWith(".") ? ext : `.${ext}`);
+  const skipDirs = (process.env.INDEX_SKIP_DIRS ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  for (const d of skipDirs) SKIP_DIRS.add(d);
+  const skipFiles = (process.env.INDEX_SKIP_FILES ?? "").split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
+  for (const f of skipFiles) SKIP_FILES.add(f);
+}
+mergeEnvLists();
 
 /**
  * I1: canonical root-path form so index and lookup always agree — trailing
@@ -131,8 +174,52 @@ function dotDirsAllowed(): boolean {
   return v === "1" || v === "true" || v === "yes";
 }
 
+/**
+ * E324: Parse FTS5 query syntax (AND, OR, NOT, quoted phrases, ^).
+ * Returns a normalized FTS5 query string, or null if the query is empty.
+ *
+ * Supported syntax:
+ *   - "exact phrases" — quoted strings match exact phrases
+ *   - AND — both terms must match
+ *   - OR — either term must match
+ *   - NOT — exclude matches
+ *   - ^ — prefix match (term must start with the following text)
+ *   - (grouping) — parentheses for grouping
+ */
+function parseFtsQuery(query: string): string | null {
+  const trimmed = query.trim();
+  if (!trimmed) return null;
+
+  // If the query already contains FTS5 operators, pass it through
+  if (/\b(AND|OR|NOT)\b/i.test(trimmed) || trimmed.includes('"') || trimmed.includes("^") || trimmed.includes("(")) {
+    return trimmed;
+  }
+
+  // Otherwise, treat as a simple space-separated term list
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return null;
+  return tokens.join(" ");
+}
+
 let db: AnyDatabase | null = null;
 let lastBackupTime = 0;
+
+/**
+ * E316: total on-disk size of the index database — the main file plus the
+ * WAL/SHM sidecars when present (WAL mode means committed data can live in
+ * the -wal file, so the main file alone under-reports).
+ */
+function dbSizeBytes(): number {
+  let total = 0;
+  for (const suffix of ["", "-wal", "-shm"]) {
+    try {
+      total += statSync(`${DB_PATH}${suffix}`).size;
+    } catch {
+      // Sidecar absent (e.g. after a checkpoint) — skip it.
+    }
+  }
+  return total;
+}
 
 function getDb(): AnyDatabase {
   if (!db) {
@@ -141,6 +228,11 @@ function getDb(): AnyDatabase {
     try {
       if (!existsSync(DB_DIR)) mkdirSync(DB_DIR, { recursive: true });
       db = openDatabase(DB_PATH);
+      // CI-3: indexed content is served back through codebase_search and can
+      // quote anything a repo contains — keep the DB owner-only (SQLite
+      // creates it world/group-readable by default). Best effort: a platform
+      // without chmod must not fail the open.
+      try { chmodSync(DB_PATH, 0o600); } catch { /* best effort */ }
       applyPragmas(db);
       db.exec("PRAGMA foreign_keys=ON");
       initSchema(db);
@@ -391,7 +483,9 @@ async function writeDb<T>(fn: () => T | Promise<T>): Promise<T> {
           const result = await fn();
           try { backupDb(); } catch {}
           return result;
-        } catch {}
+        } catch (retryErr) {
+          return dbUnavailable(retryErr) as T;
+        }
       }
       // CR-3: never throw storage failures out of tools — every caller uses
       // the result as tool `content`, so surface a readable message instead.
@@ -420,7 +514,46 @@ async function readDb<T>(fn: () => T | Promise<T>): Promise<T> {
 
 // --- File scanning & chunking ---
 
-function* walkDir(dir: string): Generator<string> {
+type WalkScope = {
+  /** CI-4: realpath'd directories already walked — symlink `link -> ..` cycles used to recurse until the RangeError was swallowed, silently truncating the walk. */
+  seen: Set<string>;
+  /** CI-3: realpath of the indexed root — symlink targets resolving outside it are skipped (`config.json -> ~/.aws/credentials` used to be indexed verbatim). */
+  realRoot: string | null;
+};
+
+function* walkDir(root: string, dir: string = root, scope?: WalkScope): Generator<string> {
+  let ctx: WalkScope;
+  if (scope) {
+    ctx = scope;
+  } else {
+    ctx = { seen: new Set<string>(), realRoot: null };
+    try {
+      ctx.realRoot = realpathSync(root);
+      ctx.seen.add(ctx.realRoot);
+    } catch {
+      /* root unresolvable — containment degrades to allow, cycle guard still works per-link */
+    }
+  }
+  const withinRoot = (real: string): boolean => {
+    if (ctx.realRoot === null) return true;
+    const rel = relative(ctx.realRoot, real);
+    return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+  };
+  const relOf = (fullPath: string): string => {
+    try {
+      return relative(root, fullPath).split(sep).join("/");
+    } catch {
+      return fullPath;
+    }
+  };
+  const indexableFile = (fullPath: string, name: string): boolean => {
+    if (isSecretPath(relOf(fullPath))) return false;
+    if (SKIP_FILES.has(name.toLowerCase())) return false;
+    const ext = extname(name).toLowerCase();
+    // CI-5: extensionless well-known files via basename allowlist.
+    if (!DEFAULT_EXTS.has(ext) && (ext !== "" || !BASENAME_ALLOW.has(name.toLowerCase()))) return false;
+    return true;
+  };
   try {
     const entries = readdirSync(dir, { withFileTypes: true });
     for (const entry of entries) {
@@ -428,15 +561,44 @@ function* walkDir(dir: string): Generator<string> {
       if (entry.isDirectory()) {
         if (SKIP_DIRS.has(entry.name.toLowerCase())) continue;
         // CI-10: dot-directories are skipped by default; INDEX_DOT_DIRS=1
-        // opts in (SKIP_DIRS such as .git still always skipped).
+        // opts in (SKIP_DIRS such as .git still always skipped). CI-3: the
+        // secret denylist still wins.
         if (entry.name.startsWith(".") && !dotDirsAllowed()) continue;
-        yield* walkDir(fullPath);
+        if (isSecretPath(relOf(fullPath))) continue;
+        let real: string | null = null;
+        try {
+          real = realpathSync(fullPath);
+        } catch {
+          continue;
+        }
+        if (real && (ctx.seen.has(real) || !withinRoot(real))) continue;
+        if (real) ctx.seen.add(real);
+        yield* walkDir(root, fullPath, ctx);
       } else if (entry.isFile()) {
-        if (SKIP_FILES.has(entry.name.toLowerCase())) continue;
-        const ext = extname(entry.name).toLowerCase();
-        // CI-5: extensionless well-known files via basename allowlist.
-        if (!DEFAULT_EXTS.has(ext) && (ext !== "" || !BASENAME_ALLOW.has(entry.name.toLowerCase()))) continue;
+        if (!indexableFile(fullPath, entry.name)) continue;
         yield fullPath;
+      } else {
+        // L77: symlinks — Dirent.isFile() and isDirectory() both return false
+        // for symlinks, so fall back to statSync which follows the link.
+        // CI-3/CI-4: the resolved target must stay inside the indexed root,
+        // and symlinked directories join the visited set.
+        try {
+          const st = statSync(fullPath);
+          const real = realpathSync(fullPath);
+          if (!withinRoot(real)) continue;
+          if (st.isFile()) {
+            if (!indexableFile(fullPath, entry.name)) continue;
+            yield fullPath;
+          } else if (st.isDirectory()) {
+            if (SKIP_DIRS.has(entry.name.toLowerCase())) continue;
+            if (entry.name.startsWith(".") && !dotDirsAllowed()) continue;
+            if (isSecretPath(relOf(fullPath)) || ctx.seen.has(real)) continue;
+            ctx.seen.add(real);
+            yield* walkDir(root, fullPath, ctx);
+          }
+        } catch {
+          // broken symlink or vanished — skip
+        }
       }
     }
   } catch {}
@@ -472,9 +634,12 @@ function chunkFile(absPath: string, rootPath: string, fs: FsLike = { statSync, r
   }
   // CI-9: binary-as-text guard + BOM strip (BOM would otherwise be indexed).
   if (content.includes("\0")) return [];
-  if (content.charCodeAt(0) === 0xFEFF) content = content.slice(1);
+  // L79: strip multiple leading BOMs (e.g. files saved with double BOM).
+  content = content.replace(/^(\uFEFF)+/, "");
   const lines = content.split("\n");
-  if (lines.length === 0) return [];
+  // L78: defensive — content.split always returns at least one element,
+  // and the stat.size === 0 guard above already filters empty files.
+  // This is a safety net in case the code is refactored later.
 
   const relPath = relative(rootPath, absPath).split(sep).join("/");
   const chunks: Chunk[] = [];
@@ -496,10 +661,11 @@ function chunkFile(absPath: string, rootPath: string, fs: FsLike = { statSync, r
   return chunks;
 }
 
-function indexProject(rootPath: string): {
+function indexProject(rootPath: string, opts?: { force?: boolean; onProgress?: (done: number, total: number, file: string) => void }): {
   files: number; chunks: number; skipped: number;
   updated: number; unchanged: number; removed: number;
   emptySkipped?: boolean;
+  forced?: boolean;
 } {
   const database = getDb();
   const resolvedPath = normalizeRoot(rootPath);
@@ -556,6 +722,8 @@ function indexProject(rootPath: string): {
     let updated = 0;
     let unchanged = 0;
     let removed = 0;
+    let done = 0;
+    const total = [...walkDir(resolvedPath)].length;
 
     for (const filePath of walkDir(resolvedPath)) {
       // Stat first: the (mtime, size) fingerprint decides skip vs re-chunk.
@@ -578,8 +746,12 @@ function indexProject(rootPath: string): {
       }
       seen.add(fingerprint.relPath);
       const old = prev.get(fingerprint.relPath);
-      if (old && old.mtime_ms === fingerprint.mtimeMs && old.size_bytes === fingerprint.size) {
+      // E313: `force` skips the incremental fingerprint check and re-chunks
+      // every file, even when mtime/size are unchanged.
+      if (!opts?.force && old && old.mtime_ms === fingerprint.mtimeMs && old.size_bytes === fingerprint.size) {
         unchanged++;
+        done++;
+        opts?.onProgress?.(done, total, fingerprint.relPath);
         continue;
       }
 
@@ -611,6 +783,8 @@ function indexProject(rootPath: string): {
         // leave it out of the new index rather than failing everything.
         skipped++;
       }
+      done++;
+      opts?.onProgress?.(done, total, fingerprint.relPath);
     }
 
     // Files tracked in the DB but gone from disk leave the index.
@@ -644,6 +818,7 @@ function indexProject(rootPath: string): {
         unchanged: 0,
         removed: 0,
         emptySkipped: true,
+        forced: opts?.force === true,
       };
     }
 
@@ -654,11 +829,151 @@ function indexProject(rootPath: string): {
 
     database.exec("COMMIT");
 
-    return { files: fileCount, chunks: chunkCount, skipped, updated, unchanged, removed };
+    return { files: fileCount, chunks: chunkCount, skipped, updated, unchanged, removed, forced: opts?.force === true };
   } catch (err) {
     try { database.exec("ROLLBACK"); } catch {}
     throw err;
   }
+}
+
+// --- File watching (E319, CI-1/CI-2) ---
+
+/**
+ * CI-2: one watcher per normalized root, kept in a MODULE-scoped Map so a
+ * repeated `codebase_index {watch:true}` REPLACES the previous watcher
+ * instead of leaking a new recursive fs.watch per call (N watchers × M
+ * directories ⇒ inotify exhaustion), and every watcher is closed when the
+ * setup that created it is torn down.
+ */
+const watchers = new Map<string, FSWatcher>();
+
+/**
+ * CI-1: same filter semantics as walkDir applied to a watcher-supplied
+ * path — SKIP_DIRS / dot-dir rules / SKIP_FILES / the CI-3 secret denylist
+ * / the extension+basename allowlist. The old watcher applied none of them
+ * and indexed whatever the OS reported.
+ */
+function isPathIndexable(rootResolved: string, fullPath: string): boolean {
+  const rel = relative(rootResolved, fullPath);
+  if (!rel || rel.startsWith("..") || isAbsolute(rel)) return false;
+  const segs = rel.split(sep);
+  const base = segs[segs.length - 1];
+  for (const d of segs.slice(0, -1)) {
+    if (SKIP_DIRS.has(d.toLowerCase())) return false;
+    if (d.startsWith(".") && !dotDirsAllowed()) return false;
+  }
+  if (SKIP_FILES.has(base.toLowerCase())) return false;
+  if (isSecretPath(segs.join("/"))) return false;
+  const ext = extname(base).toLowerCase();
+  if (!DEFAULT_EXTS.has(ext) && (ext !== "" || !BASENAME_ALLOW.has(base.toLowerCase()))) return false;
+  return true;
+}
+
+/**
+ * CI-1: the per-file delta path indexProject uses — fingerprint check,
+ * re-chunk, scoped delete+insert+upsert — applied to ONE file of ONE
+ * project. The old watcher queried by rel_path alone with a hardcoded
+ * project_id = 1: a shared relative path (README.md in two projects) made
+ * one project's change DELETE every project's chunks and re-attribute the
+ * rows to project 1. Every statement below carries project_id. Caller runs
+ * this inside writeDb (withDbMutex serialization + corruption retry).
+ */
+function applyWatchEvent(rootResolved: string, fullPath: string): void {
+  const database = getDb();
+  const project = database
+    .query("SELECT id FROM projects WHERE root_path = ?")
+    .get(rootResolved) as { id: number } | null;
+  if (!project) return; // this root was never indexed — nothing to keep in sync
+  const projectId = Number(project.id);
+  const relPath = relative(rootResolved, fullPath).split(sep).join("/");
+  if (!relPath || relPath.startsWith("..") || isAbsolute(relPath)) return;
+
+  let stat: ReturnType<typeof statSync> | null = null;
+  try {
+    const s = statSync(fullPath);
+    if (s.isFile() && s.size > 0 && s.size <= MAX_FILE_SIZE && isPathIndexable(rootResolved, fullPath)) {
+      stat = s;
+    }
+  } catch {
+    stat = null;
+  }
+  const removable = stat === null;
+
+  database.exec("BEGIN TRANSACTION");
+  try {
+    if (removable) {
+      // Vanished (or no longer indexable) — drop only THIS project's rows.
+      database.query("DELETE FROM code_chunks WHERE project_id = ? AND rel_path = ?").run(projectId, relPath);
+      database.query("DELETE FROM indexed_files WHERE project_id = ? AND rel_path = ?").run(projectId, relPath);
+      database.exec("COMMIT");
+      return;
+    }
+    const good = stat as NonNullable<typeof stat>;
+    const mtimeMs = Math.floor(good.mtimeMs);
+    const prev = database
+      .query("SELECT mtime_ms, size_bytes FROM indexed_files WHERE project_id = ? AND rel_path = ?")
+      .get(projectId, relPath) as { mtime_ms: number; size_bytes: number } | null;
+    if (!(prev && prev.mtime_ms === mtimeMs && prev.size_bytes === good.size)) {
+      const chunks = chunkFile(fullPath, rootResolved);
+      database.query("DELETE FROM code_chunks WHERE project_id = ? AND rel_path = ?").run(projectId, relPath);
+      const insertChunk = database.query(
+        "INSERT INTO code_chunks (project_id, file_path, rel_path, chunk_index, start_line, end_line, content) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      );
+      for (const ch of chunks) {
+        insertChunk.run(projectId, ch.absPath, ch.relPath, ch.index, ch.startLine, ch.endLine, ch.content);
+      }
+      database
+        .query(
+          "INSERT INTO indexed_files (project_id, rel_path, mtime_ms, size_bytes, chunk_count) VALUES (?, ?, ?, ?, ?) ON CONFLICT(project_id, rel_path) DO UPDATE SET mtime_ms = excluded.mtime_ms, size_bytes = excluded.size_bytes, chunk_count = excluded.chunk_count",
+        )
+        .run(projectId, relPath, mtimeMs, good.size, chunks.length);
+      const totals = database
+        .query(
+          "SELECT COUNT(CASE WHEN chunk_count > 0 THEN 1 END) AS files, COALESCE(SUM(chunk_count), 0) AS chunks FROM indexed_files WHERE project_id = ?",
+        )
+        .get(projectId) as { files: number; chunks: number };
+      database
+        .query("UPDATE projects SET file_count = ?, chunk_count = ?, last_indexed_at = datetime('now') WHERE id = ?")
+        .run(Number(totals.files), Number(totals.chunks), projectId);
+    }
+    database.exec("COMMIT");
+  } catch (err) {
+    try { database.exec("ROLLBACK"); } catch { /* ignore */ }
+    throw err;
+  }
+}
+
+/** Apply one watcher event through the write mutex (watcher + tests entry point). */
+async function watchFileSync(rootResolved: string, fullPath: string): Promise<void> {
+  await writeDb(() => {
+    applyWatchEvent(rootResolved, fullPath);
+    return "";
+  });
+}
+
+function startWatcher(rootResolved: string, owned: Set<string>): void {
+  const previous = watchers.get(rootResolved);
+  if (previous) {
+    try { previous.close(); } catch { /* already closed */ }
+    watchers.delete(rootResolved);
+  }
+  const watcher = watchFs(rootResolved, { recursive: true }, (_event, filename) => {
+    if (!filename) return;
+    const full = join(rootResolved, String(filename));
+    // CI-1: route through watchFileSync (writeDb ⇒ withDbMutex). writeDb
+    // never rejects; the tool contract is "never throw out of a hook".
+    void watchFileSync(rootResolved, full);
+  });
+  try {
+    watcher.on("error", () => {
+      try { watcher.close(); } catch { /* ignore */ }
+      if (watchers.get(rootResolved) === watcher) watchers.delete(rootResolved);
+      owned.delete(rootResolved);
+    });
+  } catch { /* older runtimes without on() */ }
+  watcher.unref?.();
+  watchers.set(rootResolved, watcher);
+  owned.add(rootResolved);
 }
 
 // --- Tools ---
@@ -667,6 +982,9 @@ export default Plugin.define({
   id: "codebase-index",
   async setup(ctx) {
     const defaultDirectory = ctx.location.directory;
+    // CI-2: roots this setup started watchers for; the disposer below closes
+    // exactly these when the host tears the plugin down.
+    const ownedWatchers = new Set<string>();
     await ctx.tool.transform((editor) => {
       editor.add({
         name: "codebase_index",
@@ -674,16 +992,24 @@ export default Plugin.define({
           "Scan and index a codebase directory for full-text search. Reads source files, splits them into chunks, and builds an FTS5 index. Run this before using codebase_search. Re-runs are incremental: unchanged files are skipped, changed files are re-chunked, deleted files are dropped.",
         input: z.object({
           path: z.string().optional().describe("Root path of the codebase to index (default: current project directory)"),
+          force: z.boolean().optional().describe("Re-index every file, skipping the incremental fingerprint check"),
+          watch: z.boolean().optional().describe("Watch for file changes and auto-reindex (E319)."),
         }),
         execute: async (input, toolCtx) => {
-          const args = input as { path?: string };
+          const args = input as { path?: string; force?: boolean; watch?: boolean };
           // CI-3: writeDb/readDb are async and mutex-guarded — callers await.
           const out = await writeDb(() => {
             const rootPath = args.path || defaultDirectory;
             if (!rootPath || !existsSync(rootPath)) {
               return JSON.stringify({ error: `Path not found: ${rootPath}` });
             }
-            const result = indexProject(rootPath);
+            // E322: progress callback — reports every 10 files via console.error.
+            const onProgress = (done: number, total: number, file: string): void => {
+              if (done % 10 === 0 || done === total) {
+                console.error(`[codebase-index] progress: ${done}/${total} files (${file})`);
+              }
+            };
+            const result = indexProject(rootPath, { force: args.force === true, onProgress });
             return JSON.stringify({
               indexed: true,
               path: normalizeRoot(rootPath),
@@ -693,12 +1019,24 @@ export default Plugin.define({
               updated: result.updated,
               unchanged: result.unchanged,
               removed: result.removed,
+              // E313: surface a forced re-index so it is distinguishable from
+              // an incremental run.
+              ...(result.forced ? { forced: true } : {}),
               // CI-4: surface the refused empty commit so it is not silent.
               ...(result.emptySkipped
                 ? { warning: "No indexable files found — kept the previous index." }
                 : {}),
             });
           });
+          // E319: file-watching auto-reindex. CI-2: keyed by normalized root
+          // in the module Map — replace-previous, never one new watcher per
+          // call — and closed again by the setup disposer below.
+          if (args.watch) {
+            const rootPath = args.path || defaultDirectory;
+            if (rootPath && existsSync(rootPath)) {
+              startWatcher(normalizeRoot(rootPath), ownedWatchers);
+            }
+          }
           return { content: out };
         },
       });
@@ -711,11 +1049,13 @@ export default Plugin.define({
           query: z.string().describe("Search query — natural language or code terms describing what to find"),
           path: z.string().optional().describe("Root path of the indexed project (if omitted, searches all indexed projects)"),
           filter: z.string().optional().describe("Optional path filter — narrows results to files matching a substring or pattern (e.g. 'src/api' or '.ts')"),
+          ext: z.string().optional().describe("Optional file-extension filter — narrows results to files ending in this extension (e.g. 'ts')"),
           limit: z.number().optional().describe("Maximum results to return (1-50)"),
+          offset: z.number().int().min(0).optional().describe("Skip this many results (pagination)"),
         }),
         execute: async (input, toolCtx) => {
           const args = input as {
-            query: string; path?: string; filter?: string; limit?: number;
+            query: string; path?: string; filter?: string; ext?: string; limit?: number; offset?: number;
           };
           const out = await readDb(() => {
             const database = getDb();
@@ -736,18 +1076,35 @@ export default Plugin.define({
               projectWhere = "AND p.root_path = ?";
               scopeParams.push(targetPath);
             }
-            const tokens = args.query.trim().split(/\s+/).filter(Boolean);
+            // E324: parse FTS5 query syntax (AND, OR, NOT, quoted phrases, ^)
+            const parsedQuery = parseFtsQuery(args.query);
+            if (parsedQuery === null) return "No results (empty query).";
+            const tokens = parsedQuery.split(/\s+/).filter(Boolean);
             // I2/S4: an empty/whitespace query must not reach MATCH — an
             // empty MATCH string throws an FTS5 syntax error.
             if (tokens.length === 0) return "No results (empty query).";
             // Shared clampLimit: trunc + finite guard.
             const limit = clampLimit(args.limit ?? 15, 15, 50);
+            // E314: offset for pagination — non-finite/negative values fall
+            // back to 0 (the first page).
+            const offset = typeof args.offset === "number" && Number.isFinite(args.offset) && args.offset > 0 ? Math.trunc(args.offset) : 0;
             // CI-7: filter is a literal substring — escape LIKE wildcards.
             let filterWhere = "";
             const filterParams: unknown[] = [];
             if (args.filter) {
               filterWhere = "AND c.rel_path LIKE ? ESCAPE '\\'";
               filterParams.push(`%${escapeLike(args.filter)}%`);
+            }
+            // E323: ext is a suffix match on rel_path — a leading dot is
+            // tolerated (".ts" and "ts" behave the same).
+            let extWhere = "";
+            const extParams: unknown[] = [];
+            if (args.ext) {
+              const ext = args.ext.replace(/^\./, "").trim();
+              if (ext) {
+                extWhere = "AND c.rel_path LIKE ? ESCAPE '\\'";
+                extParams.push(`%.${escapeLike(ext)}`);
+              }
             }
 
             type SearchRow = {
@@ -759,6 +1116,7 @@ export default Plugin.define({
               root_path: string;
               project: string;
               rank: number;
+              snippet?: string | null;
             };
             let rows: SearchRow[];
             try {
@@ -769,17 +1127,25 @@ export default Plugin.define({
               if (long.length > 0) {
                 const ftsQuery = quoteFtsQuery(long.join(" "));
                 if (ftsQuery === null) return "No results (empty query).";
+                // E315: snippet() marks the matched terms with <mark> tags so
+                // the result shows WHERE in the chunk the match occurred.
+                // 128 tokens: the trigram tokenizer counts trigrams (not words),
+                // so a small count truncates long matches mid-token; 128 covers
+                // the match position in typical chunks.
                 rows = database.query(`
-                  SELECT c.id, c.rel_path, c.start_line, c.end_line, c.content, p.root_path, p.name as project, rank
+                  SELECT c.id, c.rel_path, c.start_line, c.end_line, c.content,
+                         snippet(code_chunks_fts, 0, '<mark>', '</mark>', '…', 128) AS snippet,
+                         p.root_path, p.name as project, rank
                   FROM code_chunks_fts
                   JOIN code_chunks c ON c.id = code_chunks_fts.rowid
                   JOIN projects p ON c.project_id = p.id
                   WHERE code_chunks_fts MATCH ?
                     ${projectWhere}
                     ${filterWhere}
+                    ${extWhere}
                   ORDER BY rank
-                  LIMIT ?
-                `).all(ftsQuery, ...scopeParams, ...filterParams, limit) as SearchRow[];
+                  LIMIT ? OFFSET ?
+                `).all(ftsQuery, ...scopeParams, ...filterParams, ...extParams, limit, offset) as SearchRow[];
               } else {
                 rows = database.query(`
                   SELECT c.id, c.rel_path, c.start_line, c.end_line, c.content, p.root_path, p.name as project, 0 AS rank
@@ -788,9 +1154,10 @@ export default Plugin.define({
                   WHERE c.content LIKE ? ESCAPE '\\'
                     ${projectWhere}
                     ${filterWhere}
+                    ${extWhere}
                   ORDER BY c.file_path, c.start_line
-                  LIMIT ?
-                `).all(`%${escapeLike(tokens.join(" "))}%`, ...scopeParams, ...filterParams, limit) as SearchRow[];
+                  LIMIT ? OFFSET ?
+                `).all(`%${escapeLike(tokens.join(" "))}%`, ...scopeParams, ...filterParams, ...extParams, limit, offset) as SearchRow[];
               }
             } catch (err) {
               return JSON.stringify({
@@ -811,20 +1178,32 @@ export default Plugin.define({
               else byFile.set(r.rel_path, [r]);
             }
 
-            const parts: string[] = [];
+            // L80: build without trailing separator instead of slicing it off.
+            const sections: string[] = [];
             for (const byFile of grouped.values()) {
               for (const [filePath, chunks] of byFile) {
-                parts.push(`## \`${filePath}\` (${chunks[0].project})`);
+                const lines: string[] = [`## \`${filePath}\` (${chunks[0].project})`];
                 for (const c of chunks) {
-                  parts.push(
-                    `**Chunk** (lines ${c.start_line}-${c.end_line}, score: ${c.rank.toFixed(2)})\n\`\`\`\n${c.content}\n\`\`\``
-                  );
+                  // E315: the FTS path returns a snippet with <mark> tags
+                  // around the matched terms — show it instead of the full
+                  // chunk so the match location is visible. The LIKE fallback
+                  // has no snippet, so it keeps the fenced full content.
+                  if (c.snippet) {
+                    lines.push(
+                      `**Chunk** (lines ${c.start_line}-${c.end_line}, score: ${c.rank.toFixed(2)})\n${c.snippet}`
+                    );
+                  } else {
+                    lines.push(
+                      `**Chunk** (lines ${c.start_line}-${c.end_line}, score: ${c.rank.toFixed(2)})\n\`\`\`\n${c.content}\n\`\`\``
+                    );
+                  }
                 }
-                parts.push("---");
+                lines.push("---");
+                sections.push(lines.join("\n"));
               }
             }
 
-            return `Found ${rows.length} result${rows.length === 1 ? "" : "s"}:\n\n${parts.slice(0, -1).join("\n\n")}`;
+            return `Found ${rows.length} result${rows.length === 1 ? "" : "s"}:\n\n${sections.join("\n\n")}`;
           });
           return { content: out };
         },
@@ -859,6 +1238,7 @@ export default Plugin.define({
               files: row.file_count,
               chunks: row.chunk_count,
               last_indexed: row.last_indexed_at,
+              dbSizeBytes: dbSizeBytes(),
             });
             }
 
@@ -868,7 +1248,7 @@ export default Plugin.define({
 
             return JSON.stringify(
               rows.length === 0
-                ? { indexed: false, projects: [] }
+                ? { indexed: false, projects: [], dbSizeBytes: dbSizeBytes() }
                 : {
                     indexed: true,
                     projects: rows.map((r) => ({
@@ -878,6 +1258,7 @@ export default Plugin.define({
                       chunks: r.chunk_count,
                       last_indexed: r.last_indexed_at,
                     })),
+                    dbSizeBytes: dbSizeBytes(),
                   },
               null,
               2
@@ -888,7 +1269,8 @@ export default Plugin.define({
       });
 
       editor.add({
-        name: "codebase_delete_index",        description:
+        name: "codebase_delete_index",
+        description:
           "Delete a project's index from the codebase database. Removes all chunks and FTS entries for the specified path.",
         input: z.object({
           path: z.string().describe("Root path of the project index to delete"),
@@ -909,17 +1291,146 @@ export default Plugin.define({
             // deleting the project row cascades to code_chunks/indexed_files.
             // The explicit deletes below are belt-and-braces for older DB
             // files created before the PRAGMA was added.
-            database.query("DELETE FROM code_chunks WHERE project_id = ?").run(project.id);
-            database.query("DELETE FROM indexed_files WHERE project_id = ?").run(project.id);
-            database.query("DELETE FROM projects WHERE id = ?").run(project.id);
+            database.exec("BEGIN TRANSACTION");
+            try {
+              database.query("DELETE FROM code_chunks WHERE project_id = ?").run(project.id);
+              database.query("DELETE FROM indexed_files WHERE project_id = ?").run(project.id);
+              database.query("DELETE FROM projects WHERE id = ?").run(project.id);
+              database.exec("COMMIT");
+            } catch (err) {
+              try { database.exec("ROLLBACK"); } catch {}
+              throw err;
+            }
             return JSON.stringify({ deleted: true, path: resolved, name: project.name });
           });
           return { content: out };
         },
       });
+
+      // E320: index health check — integrity_check, FTS trigger existence,
+      // orphaned row count.
+      editor.add({
+        name: "codebase_index_health",
+        description:
+          "Check the health of the codebase index: runs PRAGMA integrity_check, verifies FTS triggers exist, and counts orphaned rows.",
+        input: z.object({}),
+        execute: async () => {
+          const out = await readDb(() => {
+            const database = getDb();
+            const integrity = database.query("PRAGMA integrity_check").get() as { integrity_check: string };
+            const triggers = database
+              .query("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'chunks_%'")
+              .all() as Array<{ name: string }>;
+            const expectedTriggers = ["chunks_ai", "chunks_ad", "chunks_au"];
+            const missingTriggers = expectedTriggers.filter(
+              (t) => !triggers.some((r) => r.name === t)
+            );
+            // Orphaned chunks: rows in code_chunks whose project_id has no
+            // matching projects row.
+            const orphanedChunks = database
+              .query("SELECT COUNT(*) as n FROM code_chunks c LEFT JOIN projects p ON c.project_id = p.id WHERE p.id IS NULL")
+              .get() as { n: number };
+            const orphanedFiles = database
+              .query("SELECT COUNT(*) as n FROM indexed_files f LEFT JOIN projects p ON f.project_id = p.id WHERE p.id IS NULL")
+              .get() as { n: number };
+            return JSON.stringify({
+              integrity: integrity?.integrity_check ?? "unknown",
+              triggers: triggers.map((t) => t.name),
+              missingTriggers,
+              orphanedChunks: orphanedChunks?.n ?? 0,
+              orphanedFiles: orphanedFiles?.n ?? 0,
+              healthy: integrity?.integrity_check === "ok" && missingTriggers.length === 0 && (orphanedChunks?.n ?? 0) === 0 && (orphanedFiles?.n ?? 0) === 0,
+            });
+          });
+          return { content: out };
+        },
+      });
+
+      // E321: diff index vs disk — walk the directory, compare against
+      // indexed_files, return three lists: added, modified, removed.
+      editor.add({
+        name: "codebase_index_diff",
+        description:
+          "Compare the on-disk files against the index. Returns three lists: files on disk but not in the index (added), files in both but with different mtime/size (modified), and files in the index but not on disk (removed).",
+        input: z.object({
+          path: z.string().optional().describe("Root path of the codebase (default: current project directory)"),
+        }),
+        execute: async (input) => {
+          const args = input as { path?: string };
+          const out = await readDb(() => {
+            const rootPath = args.path || defaultDirectory;
+            if (!rootPath || !existsSync(rootPath)) {
+              return JSON.stringify({ error: `Path not found: ${rootPath}` });
+            }
+            const database = getDb();
+            const resolved = normalizeRoot(rootPath);
+            const project = database
+              .query("SELECT id FROM projects WHERE root_path = ?")
+              .get(resolved) as { id: number } | null;
+            if (!project) {
+              return JSON.stringify({ error: "Project not indexed", path: resolved });
+            }
+            const indexed = database
+              .query("SELECT rel_path, mtime_ms, size_bytes FROM indexed_files WHERE project_id = ?")
+              .all(project.id) as Array<{ rel_path: string; mtime_ms: number; size_bytes: number }>;
+            const indexedMap = new Map(indexed.map((r) => [r.rel_path, r]));
+            const diskFiles = new Map<string, { mtimeMs: number; size: number }>();
+            for (const filePath of walkDir(resolved)) {
+              try {
+                const stat = statSync(filePath);
+                if (!stat.isFile()) continue;
+                const rel = relative(resolved, filePath).split(sep).join("/");
+                diskFiles.set(rel, { mtimeMs: Math.floor(stat.mtimeMs), size: stat.size });
+              } catch {
+                // skip unreadable files
+              }
+            }
+            const added: string[] = [];
+            const modified: string[] = [];
+            for (const [rel, stat] of diskFiles) {
+              const row = indexedMap.get(rel);
+              if (!row) added.push(rel);
+              else if (row.mtime_ms !== stat.mtimeMs || row.size_bytes !== stat.size) modified.push(rel);
+            }
+            const removed: string[] = [];
+            for (const rel of indexedMap.keys()) {
+              if (!diskFiles.has(rel)) removed.push(rel);
+            }
+            return JSON.stringify({ added, modified, removed });
+          });
+          return { content: out };
+        },
+      });
     });
+
+    // CI-2: watchers used to be "alive for the process lifetime" — one leaked
+    // recursive fs.watch per watch:true call, never closed. Close everything
+    // this setup started when the host disposes the plugin.
+    return async (): Promise<void> => {
+      for (const root of ownedWatchers) {
+        const watcher = watchers.get(root);
+        try {
+          watcher?.close();
+        } catch {
+          /* already closed */
+        }
+        if (watcher && watchers.get(root) === watcher) watchers.delete(root);
+      }
+      ownedWatchers.clear();
+    };
   },
 });
 
 /** Test hooks: unit access without a database. */
-export const __test__ = { chunkFile, normalizeRoot, escapeLike, walkDir, SKIP_DIRS, SKIP_FILES };
+export const __test__ = {
+  chunkFile,
+  normalizeRoot,
+  escapeLike,
+  walkDir,
+  SKIP_DIRS,
+  SKIP_FILES,
+  isSecretPath,
+  isPathIndexable,
+  watchFileSync,
+  watchers,
+};

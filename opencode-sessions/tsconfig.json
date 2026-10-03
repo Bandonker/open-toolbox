@@ -10,5 +10,5 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "include": ["helpers.ts", "opencode-sessions.ts", "unit.test.mjs"]
+  "include": ["helpers.ts", "opencode-sessions.ts"]
 }

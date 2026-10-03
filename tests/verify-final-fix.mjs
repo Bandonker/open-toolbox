@@ -25,19 +25,19 @@ test("OS-2: asBool maps false-tokens to false", () => {
 
 // --- opencode-sessions markers ---
 test("OS-3: sessions options honor env fallbacks", () => {
-  has("plugins/opencode-sessions.ts", "OPENCODE_SESSIONS_AUTO_INJECT");
+  has("opencode-sessions/opencode-sessions.ts", "OPENCODE_SESSIONS_AUTO_INJECT");
 });
 test("OS-4: session_send/launch await startTurn", () => {
-  has("plugins/opencode-sessions.ts", "await startTurn");
-  missing("plugins/opencode-sessions.ts", "void startTurn(t, args.text)");
+  has("opencode-sessions/opencode-sessions.ts", "await startTurn");
+  missing("opencode-sessions/opencode-sessions.ts", "void startTurn(t, args.text)");
 });
 test("OS-5: outcome cache present", () => {
-  has("plugins/opencode-sessions.ts", "OUTCOME_CACHE_TTL_MS");
+  has("opencode-sessions/opencode-sessions.ts", "OUTCOME_CACHE_TTL_MS");
 });
 test("OS-6: server calls race a timeout (withTimeout Promise.race)", () => {
   // ctx.* helpers accept no AbortSignal, so the plugin races server calls
   // against a timeout instead (see comment above withTimeout).
-  has("plugins/opencode-sessions.ts", "withTimeout");
+  has("opencode-sessions/opencode-sessions.ts", "withTimeout");
 });
 test("OS-6: withTimeout rejects on a never-resolving promise", async () => {
   // withTimeout is closure-scoped in the plugin, so this mirrors its logic
@@ -52,19 +52,19 @@ test("OS-6: withTimeout rejects on a never-resolving promise", async () => {
   await assert.rejects(() => withTimeout(new Promise(() => {}), 10, "hung-call"), /hung-call timed out after 10ms/);
 });
 test("OS-7: parentDefaults capped", () => {
-  has("plugins/opencode-sessions.ts", "MAX_PARENT_DEFAULTS");
+  has("opencode-sessions/opencode-sessions.ts", "MAX_PARENT_DEFAULTS");
 });
 test("OS-8: resolveTarget reuses one parent lookup", () => {
-  has("plugins/opencode-sessions.ts", "inherited");
+  has("opencode-sessions/opencode-sessions.ts", "inherited");
 });
 test("OS-9: adopted children stay visible via sentinel", () => {
-  has("plugins/opencode-sessions.ts", "unknown");
+  has("opencode-sessions/opencode-sessions.ts", "unknown");
 });
 test("OS-10: waitFor refreshes outcome on timeout", () => {
-  has("plugins/opencode-sessions.ts", "best-effort");
+  has("opencode-sessions/opencode-sessions.ts", "best-effort");
 });
 test("OS-12: directory validated early", () => {
-  has("plugins/opencode-sessions.ts", "isDirectory");
+  has("opencode-sessions/opencode-sessions.ts", "isDirectory");
 });
 
 // --- session-export markers ---

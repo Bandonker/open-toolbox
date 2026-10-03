@@ -55,9 +55,34 @@ test("deriveTitle takes the first line and caps length", () => {
 
 test("truncate leaves short text and marks long text", () => {
   assert.equal(truncate("short", 10), "short");
-  const out = truncate("x".repeat(20), 10);
-  assert.equal(out.startsWith("x".repeat(10)), true);
-  assert.match(out, /truncated 10 chars/);
+  // OS-17: the marker counts against `max`. A 60-char budget of 100 chars of
+  // text keeps head + marker inside 60 and states the real removed count.
+  const out = truncate("x".repeat(100), 60);
+  assert.ok(out.length <= 60, `must fit the budget, got ${out.length}`);
+  assert.ok(out.startsWith("x".repeat(30)), out.slice(0, 40));
+  assert.match(out, /truncated 6\d chars/);
+  const removed = Number(out.match(/truncated (\d+) chars/)[1]);
+  const kept = out.match(/^x*/)[0].length;
+  assert.equal(kept + removed, 100, "the marker's count adds up to the input");
+});
+
+test("truncate never exceeds max, for any position or budget", () => {
+  const text = "abcdefghij".repeat(50); // 500 chars
+  for (const position of ["end", "start", "middle"]) {
+    for (const max of [1, 2, 12, 25, 26, 40, 80, 120, 499]) {
+      const out = truncate(text, max, position);
+      assert.ok(out.length <= max, `${position}/${max}: got ${out.length} chars`);
+    }
+  }
+  assert.equal(truncate(text, 0), "");
+  // A budget too small for the wording still honours the bound.
+  assert.equal(truncate(text, 5, "end"), "abcd…");
+  // A real cut keeps the signal and the right end.
+  const tail = truncate(text, 80, "start");
+  assert.match(tail, /truncated \d+ chars/);
+  assert.ok(tail.endsWith(text.slice(-1)), "start position keeps the tail");
+  const both = truncate(text, 120, "middle");
+  assert.ok(both.startsWith("abcdefg") && both.endsWith(text.slice(-1)), "middle keeps both ends");
 });
 
 test("schemaInstruction embeds the schema and JSON wording", () => {

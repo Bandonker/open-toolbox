@@ -102,15 +102,18 @@ assert.equal(t.isProtected(probe, protectedCfg), true, "CP-11: isProtected hits"
 assert.equal(t.isProtected(probe, protectedCfg), true, "CP-11: isProtected stays stable on repeat");
 
 // CP-2: overlapping recall persists are serialized through a per-session
-// chain (no read-modify-write race). The chain lives inside setup's closure
-// with no seam, so assert the mechanism is present in source.
+// chain (no read-modify-write race). CP-14 strengthened the mechanism: the
+// chain now RE-READS the stored array inside itself and unions by `at`, because
+// `loadRecall` is load-once and never merged anything after the first flush.
+// The chain lives inside setup's closure with no seam, so assert the mechanism
+// is present in source.
 import { readFileSync as cp2Read } from "node:fs";
 const prunerSrc = cp2Read(new URL("../plugins/context-pruner.ts", import.meta.url), "utf8");
 assert.ok(
   prunerSrc.includes("persistChains.get(sessionID)") &&
-    prunerSrc.includes(".then(() => loadRecall(sessionID, st))") &&
+    prunerSrc.includes("mergeRecallEntries(st, parseRecallEntries(await readStore(`recall:${sessionID}`") &&
     prunerSrc.includes("persistChains.set(sessionID, head)"),
-  "CP-2: per-session persist chain must serialize recall flushes",
+  "CP-2/CP-14: per-session persist chain must serialize AND merge recall flushes",
 );
 
 // CP-8: per-request JSON.stringify(event.tools) is memoized on the event

@@ -16,7 +16,8 @@ import {
 export type ModelRef = { providerID: string; modelID: string };
 
 export function clampInt(value: unknown, fallback: number, min: number, max: number): number {
-  const n = typeof value === "number" ? value : Number(value);
+  // Accept numbers and numeric strings; reject everything else.
+  const n = typeof value === "number" ? value : typeof value === "string" ? Number(value) : NaN;
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(n)));
 }
@@ -33,19 +34,76 @@ export function asBool(value: unknown, fallback: boolean): boolean {
 }
 
 export function shortId(): string {
-  return Math.random().toString(36).slice(2, 8);
+  return crypto.randomUUID().replace(/-/g, "").slice(0, 8);
 }
 
 export function deriveTitle(prompt: string): string {
   const firstLine = prompt.split(/\r?\n/)[0] ?? "";
-  const trimmed = firstLine.trim().replace(/\s+/g, " ");
+  // Strip control characters (including \x00-\x1f and \x7f) that would render
+  // as garbage or invisibly corrupt the title in logs and the session list.
+  const cleaned = firstLine.replace(/[\x00-\x1f\x7f]/g, "");
+  const trimmed = cleaned.trim().replace(/\s+/g, " ");
   if (!trimmed) return "untitled task";
-  return trimmed.length > 60 ? trimmed.slice(0, 57) + "..." : trimmed;
+  if (trimmed.length <= 60) return trimmed;
+  // Break on a word boundary when truncating: find the last space within the
+  // budget and cut there, so a very long single word is sliced mid-string but
+  // normal prose ends at a word edge.
+  const slice = trimmed.slice(0, 57);
+  const lastSpace = slice.lastIndexOf(" ");
+  const cut = lastSpace > 32 ? slice.slice(0, lastSpace) : slice;
+  return `${cut}...`;
 }
 
-export function truncate(text: string, max: number): string {
+/**
+ * Truncate text to at most `max` characters, marker included.
+ *
+ * OS-17: the doc said "at most `max`" and the implementation returned `max`
+ * *content* characters plus a ~25-character marker, so every caller that relied
+ * on the bound (`peerNoticeMaxChars`, the injection caps) overflowed it by that
+ * much. The marker now counts against the budget — which makes the reported
+ * "N chars" and the kept length depend on each other, so the pair is solved by a
+ * short fixed-point pass (the digit count of N can only shift once).
+ *
+ * `position` controls which end is kept:
+ *  - "end"   (default) keep the head, mark the cut at the tail — for prose.
+ *  - "start"  keep the tail, prepend a marker — for long outputs where the
+ *             end (final message / verdict) holds the important part.
+ *  - "middle" keep both head and tail with a marker between them.
+ */
+export function truncate(
+  text: string,
+  max: number,
+  position: "end" | "start" | "middle" = "end",
+): string {
+  if (max <= 0) return "";
   if (text.length <= max) return text;
-  return text.slice(0, max) + `\n... [truncated ${text.length - max} chars]`;
+  const markerFor = (n: number) => `\n... [truncated ${n} chars]`;
+  // First estimate assumes the marker is free, then each pass re-derives the
+  // removed count from the space the marker actually left.
+  let removed = text.length - max;
+  let marker = markerFor(removed);
+  for (let i = 0; i < 4; i++) {
+    const next = text.length - Math.max(0, max - marker.length);
+    if (next === removed) break;
+    removed = next;
+    marker = markerFor(removed);
+  }
+  const room = max - marker.length;
+  if (room < (position === "end" ? 1 : 2)) {
+    // The budget cannot hold the wording at all: honour the bound rather than
+    // the message, and mark the cut with a single character.
+    return `${text.slice(0, Math.max(0, max - 1))}…`;
+  }
+  if (position === "start") {
+    return `${marker}\n${text.slice(text.length - (room - 1))}`;
+  }
+  if (position === "middle") {
+    const budget = room - 1;
+    const headLen = Math.ceil(budget / 2);
+    const tailLen = budget - headLen;
+    return `${text.slice(0, headLen)}${marker}\n${text.slice(text.length - tailLen)}`;
+  }
+  return `${text.slice(0, room)}${marker}`;
 }
 
 /**
@@ -68,9 +126,22 @@ export function describeError(err: unknown): string {
   const anyErr = err as { name?: string; message?: string; data?: unknown };
   const name = anyErr.name ? `${anyErr.name}: ` : "";
   const message = anyErr.message ?? "";
-  const data = anyErr.data ? ` ${JSON.stringify(anyErr.data)}` : "";
+  // L61: JSON.stringify can throw on circular references — wrap in try/catch.
+  let data = "";
+  if (anyErr.data) {
+    try {
+      data = ` ${JSON.stringify(anyErr.data)}`;
+    } catch {
+      data = ` [unserializable data]`;
+    }
+  }
   const out = `${name}${message}${data}`.trim();
-  return out || JSON.stringify(err);
+  if (out) return out;
+  try {
+    return JSON.stringify(err);
+  } catch {
+    return String(err);
+  }
 }
 
 /** Best-effort extraction of the first JSON object/array from free text. */
@@ -93,8 +164,14 @@ export function parseJsonFromText(text: string): unknown {
   candidates.push(text.trim());
   for (const c of candidates) {
     if (!c) continue;
+    // Tolerate JSON-with-comments: strip `//` line comments and trailing
+    // commas before `}`/`]` before parsing. Models frequently emit these
+    // and JSON.parse rejects them outright.
+    const cleaned = c
+      .replace(/,\s*([}\]])/g, "$1")
+      .replace(/^\s*\/\/.*$/gm, "");
     try {
-      return JSON.parse(c);
+      return JSON.parse(cleaned);
     } catch {
       /* try next */
     }
@@ -202,8 +279,15 @@ export function extractEditPaths(input: unknown): string[] {
   const walk = (node: unknown, depth: number): void => {
     if (budget-- <= 0 || depth > MAX_SCAN_DEPTH) return;
     if (typeof node === "string") {
+      // L59: these regexes match any string containing lines starting with
+      // `*** Add File:` or `+++ b/...`. This is a heuristic — it can match
+      // prose that happens to contain such lines. The risk is low because
+      // extractEditPaths is only called on tool inputs, not arbitrary text.
       for (const m of node.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)) add(m[1]);
-      for (const m of node.matchAll(/^\+\+\+ (?:b\/)?(.+?)(?:\t.*)?$/gm)) add(m[1]);
+      // L58: filter out /dev/null which appears in +++ /dev/null for deleted files.
+      for (const m of node.matchAll(/^\+\+\+ (?:b\/)?(.+?)(?:\t.*)?$/gm)) {
+        if (m[1] !== "/dev/null") add(m[1]);
+      }
       return;
     }
     if (Array.isArray(node)) {
@@ -236,8 +320,10 @@ export function extractEditPaths(input: unknown): string[] {
 export function normalizeClaimPath(raw: string, directory: string): string | undefined {
   const trimmed = raw.trim().replace(/^['"]|['"]$/g, "");
   if (!trimmed || trimmed.length > 4096) return undefined;
-  const abs = isAbsolute(trimmed) ? resolvePath(trimmed) : resolvePath(directory, trimmed);
-  let rel = relativePath(directory, abs);
+  // L60: resolve directory to absolute first so relative paths work correctly.
+  const absDir = isAbsolute(directory) ? directory : resolvePath(directory);
+  const abs = isAbsolute(trimmed) ? resolvePath(trimmed) : resolvePath(absDir, trimmed);
+  let rel = relativePath(absDir, abs);
   if (!rel || rel.split(sep).includes("..")) rel = abs;
   const slashed = rel.split(sep).join("/");
   return CASE_INSENSITIVE_FS ? slashed.toLowerCase() : slashed;
@@ -282,4 +368,79 @@ export function tasksOverlap(a: string | undefined, b: ReadonlySet<string>): boo
   if (!a) return false;
   for (const tok of taskTokens(a)) if (b.has(tok)) return true;
   return false;
+}
+
+/** Cancellable sleep: resolves after `ms`, or immediately when `signal` aborts. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Aborted", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Aborted", "AbortError"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+export type RetryOptions = {
+  /** Maximum number of attempts (default 3). */
+  attempts?: number;
+  /** Base delay in ms; doubles each attempt (default 250). */
+  baseMs?: number;
+  /** Upper bound for any single backoff sleep in ms (default 5000). */
+  maxMs?: number;
+  /** Fraction of jitter to apply, 0-1 (default 0.2). */
+  jitter?: number;
+  /** Called before each retry sleep; return false to stop retrying. */
+  onRetry?: (err: unknown, attempt: number) => boolean | Promise<boolean>;
+  /** Signal that aborts the retry loop when fired. */
+  signal?: AbortSignal;
+};
+
+/**
+ * Run an async function with exponential backoff and jitter.
+ *
+ * Every attempt runs; on failure the delay is `baseMs * 2^(n-1)` (capped at
+ * `maxMs`) plus a random jitter of up to `jitter * delay`. The last failure is
+ * rethrown. `onRetry` can veto further attempts (return false to give up).
+ */
+export async function retry<T>(fn: () => Promise<T>, opts: RetryOptions = {}): Promise<T> {
+  const { attempts = 3, baseMs = 250, maxMs = 5000, jitter = 0.2, onRetry, signal } = opts;
+  let lastErr: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      if (attempt === attempts) break;
+      if (onRetry && !(await onRetry(err, attempt))) break;
+      const exp = Math.min(maxMs, baseMs * 2 ** (attempt - 1));
+      const delay = exp + Math.random() * jitter * exp;
+      await sleep(delay, signal);
+    }
+  }
+  throw lastErr;
+}
+
+/** Format a byte count as a human-readable string: "512 B", "1.5 KB", "3.2 MB". */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes)) return "unknown";
+  if (bytes < 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"] as const;
+  if (bytes < 1024) return `${bytes} B`;
+  let value = bytes;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const rounded = value >= 100 ? Math.round(value) : Math.round(value * 10) / 10;
+  return `${rounded} ${units[unit]}`;
 }

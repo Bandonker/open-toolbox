@@ -53,6 +53,11 @@ function toolMsgs(n = 3, prefix = "q") {
       role: "tool",
       content: [{ type: "tool-result", tool: "read", callID: id, result: { value: `${BIG}#${i}` } }],
     })),
+    // CP-1: a closing user message marks the tool output above as a CLOSED
+    // turn. With the user message first the whole transcript is the live turn,
+    // which the pruner must never touch (invariant C2) — the shape this fixture
+    // needs to reach a stub at all.
+    { role: "user", content: [{ type: "text", text: "Continue." }] },
   ];
 }
 
