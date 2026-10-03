@@ -2,9 +2,19 @@ import { Plugin } from "@opencode/plugin";
 import { z } from "zod";
 import { homedir } from "os";
 import { join } from "path";
-import { mkdirSync, writeFileSync } from "fs";
+import { mkdirSync, writeFileSync, statSync } from "fs";
 import { spawn } from "node:child_process";
 import { openDatabase, applyPragmas, type AnyDatabase } from "../lib/sqlite.ts";
+import {
+  fmtUsd,
+  fmtUsdOrDash,
+  fmtRate,
+  fmtInt,
+  fmtCompact,
+  fmtShortUsd,
+  fmtShortUsdOrDash,
+} from "../lib/format.ts";
+import { envStr, asBool, asInt } from "../lib/config.ts";
 
 /**
  * usage-stats
@@ -66,11 +76,25 @@ interface UsageState {
   /** Set by every record; the refresh timer regenerates the dashboard while true. */
   dirty: boolean;
   /** Last model we attributed per session, so http.request doesn't rewrite every call. */
-  sessionModels: Map<string, string>;
-  /** In-flight tool calls keyed by call id, for duration measurement. */
-  pending: Map<string, { tool: string; startedMs: number }>;
+  sessionModels: Map<string, { model: string; updatedMs: number }>;
+  /** Last US-6 threshold-gated sessionModels sweep (epoch ms). */
+  lastSessionModelsSweep: number;
+  /**
+   * In-flight tool calls keyed by call id, for duration measurement.
+   * US-7/TA-6: once a call outlives the pending TTL it is marked
+   * `unknownDuration` instead of being dropped, so a late `execute.after`
+   * still records the call — with an unknown (null) duration.
+   * US-3: the session id is captured at `execute.before` (the after event in
+   * some hosts carries no sessionID) so the per-session tool upsert in
+   * recordToolCall knows which session to attribute the call to.
+   */
+  pending: Map<string, { tool: string; startedMs: number; unknownDuration?: boolean; sessionID?: string }>;
   /** Last US-6 threshold-gated pending sweep (epoch ms). */
   lastPendingSweep: number;
+  /** Whether the event subscription pump is currently alive. */
+  eventPumpAlive: boolean;
+  /** Last pricing fetch attempt (epoch ms) — TTL gate for refreshPricing (E44). */
+  lastPricingFetchMs: number;
 }
 
 function createState(): UsageState {
@@ -83,27 +107,10 @@ function createState(): UsageState {
     sessionModels: new Map(),
     pending: new Map(),
     lastPendingSweep: 0,
+    lastSessionModelsSweep: 0,
+    eventPumpAlive: false,
+    lastPricingFetchMs: 0,
   };
-}
-
-function envStr(name: string): string | undefined {
-  const v = process.env[name];
-  return v === undefined || v === "" ? undefined : v;
-}
-
-function asBool(value: unknown, fallback: boolean): boolean {
-  if (typeof value === "boolean") return value;
-  if (typeof value === "string") {
-    const s = value.trim().toLowerCase();
-    if (["1", "true", "yes", "on"].includes(s)) return true;
-    if (["0", "false", "no", "off"].includes(s)) return false;
-  }
-  return fallback;
-}
-
-function asInt(value: unknown, fallback: number): number {
-  const n = typeof value === "number" ? value : Number(value);
-  return Number.isFinite(n) ? Math.trunc(n) : fallback;
 }
 
 function resolveConfig(options: unknown): Config {
@@ -207,13 +214,17 @@ function selectRate(entries: PriceEntry[], inputTokens: number): PriceEntry | nu
 /**
  * List-price cost in USD for one usage delta, or null when the model price is unknown.
  * Reasoning tokens are billed at the output rate.
+ * US-5: the context tier is selected from the request's context size
+ * (input + cacheRead + cacheWrite), not the uncached-input delta — cached
+ * turns report cache_read separately, so the old basis made tiered
+ * ("context over 200k") rates effectively unreachable.
  */
 function computedCost(model: string, t: Tokens, state: UsageState): number | null {
   const key = baseModelKey(model);
   // User overrides win over the provider's published rates (e.g. local models).
   const entries = state.priceOverrides.get(key) ?? state.pricing.get(key);
   if (!entries || entries.length === 0) return null;
-  const rate = selectRate(entries, t.input);
+  const rate = selectRate(entries, t.input + t.cacheRead + t.cacheWrite);
   if (!rate) return null;
   return (
     (t.input * rate.input +
@@ -239,27 +250,52 @@ function entryFrom(c: Record<string, unknown>): PriceEntry {
 }
 
 /**
+ * US-4: a cost object is priced when it explicitly carries any rate key —
+ * an all-zero rate is a real price (free/local models render $0.00), not a
+ * missing price. Only entries with *no* rate keys at all count as unpriced.
+ */
+function hasRateKeys(raw: unknown): boolean {
+  if (!raw || typeof raw !== "object") return false;
+  const c = raw as Record<string, unknown>;
+  const cache = (c.cache && typeof c.cache === "object" ? c.cache : {}) as Record<string, unknown>;
+  return (
+    c.input !== undefined ||
+    c.output !== undefined ||
+    c.cache_read !== undefined ||
+    c.cache_write !== undefined ||
+    cache.read !== undefined ||
+    cache.write !== undefined
+  );
+}
+
+/**
  * Accept both shapes the model registry can hand us:
  *  - `ModelCost[]` (what the API types declare): `{ tier?, input, output, cache: { read, write } }`
  *  - the models.dev object (what the cache holds): `{ input, output, cache_read, cache_write, tiers, context_over_200k }`
+ * US-4: entries whose rate keys are present-but-zero are kept (free models
+ * are priced at $0.00); only rate-less entries are dropped.
  */
 function readPriceEntries(raw: unknown): PriceEntry[] {
+  const kept: PriceEntry[] = [];
+  const consider = (item: unknown, forcedTierSize?: number): void => {
+    if (!item || typeof item !== "object") return;
+    const e = entryFrom(item as Record<string, unknown>);
+    const entry = forcedTierSize === undefined ? e : { ...e, tierSize: forcedTierSize };
+    if (entry.tierSize !== null || hasRateKeys(item)) kept.push(entry);
+  };
   if (Array.isArray(raw)) {
-    return raw
-      .filter((item) => item && typeof item === "object")
-      .map((item) => entryFrom(item as Record<string, unknown>));
+    for (const item of raw) consider(item);
+    return kept;
   }
   if (!raw || typeof raw !== "object") return [];
   const o = raw as Record<string, unknown>;
-  const entries: PriceEntry[] = [entryFrom(o)];
+  consider(o);
   const tiers = Array.isArray(o.tiers) ? o.tiers : [];
-  for (const t of tiers) {
-    if (t && typeof t === "object") entries.push(entryFrom(t as Record<string, unknown>));
-  }
+  for (const t of tiers) consider(t);
   if (o.context_over_200k && typeof o.context_over_200k === "object") {
-    entries.push({ ...entryFrom(o.context_over_200k as Record<string, unknown>), tierSize: 200_000 });
+    consider(o.context_over_200k, 200_000);
   }
-  return entries.filter((e) => e.tierSize !== null || e.input || e.output || e.cacheRead || e.cacheWrite);
+  return kept;
 }
 
 /**
@@ -299,7 +335,11 @@ async function refreshPricing(
   ctx: { model?: unknown },
   log: (message: string) => void,
   state: UsageState,
+  force = false,
 ): Promise<void> {
+  const now = Date.now();
+  if (!force && now - state.lastPricingFetchMs < 30_000) return;
+  state.lastPricingFetchMs = now;
   try {
     const api = (ctx as { model?: { list?: (input?: unknown) => unknown } }).model;
     if (!api || typeof api.list !== "function") return;
@@ -318,62 +358,6 @@ async function refreshPricing(
   } catch (err) {
     log(`pricing refresh failed: ${String(err)}`);
   }
-}
-
-function fmtUsd(n: number): string {
-  return `$${(Number.isFinite(n) ? n : 0).toFixed(6)}`;
-}
-
-function fmtUsdOrDash(n: number | null): string {
-  return n === null ? "—" : fmtUsd(n);
-}
-
-function fmtRate(n: number): string {
-  return `$${Number.isFinite(n) ? n : 0}`;
-}
-
-function fmtInt(n: number): string {
-  return String(Math.round(Number.isFinite(n) ? n : 0));
-}
-
-// Compact dashboard display for large counts: exact below 1000, otherwise
-// k/m/b suffixes (1400 -> "1.4k", 1000000000 -> "1b"). Text-tool output keeps
-// using fmtInt so CLI results stay exact.
-function fmtCompact(n: number): string {
-  const v = Math.round(Number.isFinite(n) ? n : 0);
-  if (Math.abs(v) < 1000) return String(v);
-  const units = ["k", "m", "b"];
-  let u = -1;
-  let x = v;
-  while (Math.abs(x) >= 1000 && u < units.length - 1) {
-    x /= 1000;
-    u++;
-  }
-  const short = (y: number): string => (Math.abs(y) >= 100 ? String(Math.round(y)) : String(Math.round(y * 10) / 10));
-  let s = short(x);
-  if (parseFloat(s) >= 1000 && u < units.length - 1) {
-    x /= 1000;
-    u++;
-    s = short(x);
-  }
-  return `${s}${units[u]}`;
-}
-
-// Short dashboard display for USD: trims noise ($0.001000 -> "$.001",
-// $0.025000 -> "$.025", $0 -> "$0"). Text-tool output keeps fmtUsd.
-function fmtShortUsd(n: number): string {
-  const v = Number.isFinite(n) ? n : 0;
-  if (v === 0) return "$0";
-  const s = v
-    .toFixed(6)
-    .replace(/(\.\d*?)0+$/, "$1")
-    .replace(/\.$/, "")
-    .replace(/^(-?)0\./, "$1.");
-  return `$${s}`;
-}
-
-function fmtShortUsdOrDash(n: number | null): string {
-  return n === null ? "—" : fmtShortUsd(n);
 }
 
 // A table cell that shows a shortened display value but keeps the exact
@@ -443,7 +427,8 @@ function initSchema(database: AnyDatabase): void {
       succeeded INTEGER NOT NULL DEFAULT 0,
       failed INTEGER NOT NULL DEFAULT 0,
       total_ms INTEGER NOT NULL DEFAULT 0,
-      max_ms INTEGER NOT NULL DEFAULT 0
+      max_ms INTEGER NOT NULL DEFAULT 0,
+      timed_calls INTEGER NOT NULL DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS daily_models (
       day TEXT NOT NULL,
@@ -466,6 +451,7 @@ function initSchema(database: AnyDatabase): void {
       failed INTEGER NOT NULL DEFAULT 0,
       total_ms INTEGER NOT NULL DEFAULT 0,
       max_ms INTEGER NOT NULL DEFAULT 0,
+      timed_calls INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (day, tool)
     );
     CREATE TABLE IF NOT EXISTS sources (
@@ -490,11 +476,30 @@ function initSchema(database: AnyDatabase): void {
       cost REAL NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL DEFAULT ''
     );
+    -- US-3: real per-session tool counters, written from recordToolCall.
+    -- The old stats_sessions joined session_state.updated_at (a day key) to
+    -- the global daily rollup and printed that day's totals as if they were
+    -- the session's own. This table is what those columns should have read.
+    -- CREATE TABLE IF NOT EXISTS is this plugin's migration mechanism (same
+    -- as every other table above): existing databases gain the table on open.
+    CREATE TABLE IF NOT EXISTS session_tools (
+      session_id TEXT NOT NULL,
+      tool TEXT NOT NULL,
+      calls INTEGER NOT NULL DEFAULT 0,
+      ok INTEGER NOT NULL DEFAULT 0,
+      fail INTEGER NOT NULL DEFAULT 0,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      PRIMARY KEY (session_id, tool)
+    );
   `);
   for (const statement of [
     "ALTER TABLE daily ADD COLUMN cost_computed REAL",
     "ALTER TABLE model_totals ADD COLUMN cost_computed REAL",
     "ALTER TABLE sources ADD COLUMN cost_computed REAL",
+    // US-7/TA-6: number of calls that contributed a duration; avg is
+    // total_ms / timed_calls so unknown-duration calls never drag it down.
+    "ALTER TABLE tool_totals ADD COLUMN timed_calls INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE daily_tools ADD COLUMN timed_calls INTEGER NOT NULL DEFAULT 0",
   ]) {
     try {
       database.exec(statement);
@@ -587,6 +592,19 @@ function prune(state: UsageState, cfg: Config, force: boolean): void {
     database.prepare("DELETE FROM daily WHERE day < ?").run(cutoff);
     database.prepare("DELETE FROM daily_models WHERE day < ?").run(cutoff);
     database.prepare("DELETE FROM daily_tools WHERE day < ?").run(cutoff);
+    // US-3: per-session tool rows are day-scoped detail like daily_tools, so
+    // they age out with the same retention window. session_state itself is
+    // exempt below (U1), so age session_tools off that row's updated_at day
+    // key rather than deleting it alongside its session.
+    database
+      .prepare(
+        `DELETE FROM session_tools
+          WHERE session_id IN (
+            SELECT session_id FROM session_state
+             WHERE updated_at != '' AND updated_at < ?
+          )`,
+      )
+      .run(cutoff);
     // U1: never prune session_state rows that hold cumulative usage — a
     // resumed session would otherwise re-add its entire lifetime as one
     // delta (double counting everything). Only rows with no recorded
@@ -781,7 +799,7 @@ function addBackgroundUsage(
   // US-3: attribute background usage to a model as well, storing a computed
   // list-price cost — without this, cost_computed is never written for
   // background traffic and per-model totals miss it entirely.
-  const model = state.sessionModels.get(sessionID) ?? loadSession(database, sessionID)?.model ?? "unknown";
+  const model = state.sessionModels.get(sessionID)?.model ?? loadSession(database, sessionID)?.model ?? "unknown";
   const modelCost = computedCost(model, t, state);
   addModelUsage(database, model, t, cost, 1, modelCost);
   addDailyModelUsage(database, day, model, t, cost, 1, modelCost);
@@ -832,6 +850,11 @@ function recordUsageUpdated(
   // failure would double-count the delta against session_state on the next
   // event. U4: the upsert below already creates the row, so the separate
   // ensureSession INSERT was redundant.
+  // US-1: the baseline write is monotonic (MAX of stored vs incoming) — a
+  // downward-revised cumulative snapshot (session.revert.committed, or an
+  // out-of-order/replayed event) must never lower the stored baseline, or
+  // the same tokens/cost get counted a second time when the total climbs
+  // back up.
   database.exec("BEGIN TRANSACTION");
   try {
     if (changed) {
@@ -844,12 +867,12 @@ function recordUsageUpdated(
         `INSERT INTO session_state(session_id, input, output, reasoning, cache_read, cache_write, cost, updated_at)
          VALUES(?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(session_id) DO UPDATE SET
-           input = excluded.input,
-           output = excluded.output,
-           reasoning = excluded.reasoning,
-           cache_read = excluded.cache_read,
-           cache_write = excluded.cache_write,
-           cost = excluded.cost,
+           input = MAX(input, excluded.input),
+           output = MAX(output, excluded.output),
+           reasoning = MAX(reasoning, excluded.reasoning),
+           cache_read = MAX(cache_read, excluded.cache_read),
+           cache_write = MAX(cache_write, excluded.cache_write),
+           cost = MAX(cost, excluded.cost),
            updated_at = excluded.updated_at`,
       )
       .run(sessionID, current.input, current.output, current.reasoning, current.cacheRead, current.cacheWrite, cost, day);
@@ -887,8 +910,13 @@ function recordSessionCreated(database: AnyDatabase, sessionID: string, state: U
  * `http.request` hook, which carries the model on every request.
  */
 function rememberModel(state: UsageState, sessionID: string, model: string): void {
-  if (!sessionID || !model || state.sessionModels.get(sessionID) === model) return;
-  state.sessionModels.set(sessionID, model);
+  if (!sessionID || !model) return;
+  const existing = state.sessionModels.get(sessionID);
+  if (existing && existing.model === model) {
+    existing.updatedMs = Date.now();
+    return;
+  }
+  state.sessionModels.set(sessionID, { model, updatedMs: Date.now() });
   try {
     if (state.db) recordModelSelected(state.db, sessionID, model, state);
   } catch {
@@ -896,23 +924,44 @@ function rememberModel(state: UsageState, sessionID: string, model: string): voi
   }
 }
 
-function addDailyToolUsage(database: AnyDatabase, day: string, tool: string, ok: boolean, durationMs: number): void {
+/**
+ * US-7/TA-6: `durationMs` may be null for calls whose pending entry expired
+ * (a call longer than the sweep TTL, or a lost execute.before). The call is
+ * still counted — total_ms/max_ms just get 0 and timed_calls stays 0, so
+ * averages divide by timed calls only.
+ */
+function addDailyToolUsage(
+  database: AnyDatabase,
+  day: string,
+  tool: string,
+  ok: boolean,
+  durationMs: number | null,
+): void {
+  const ms = durationMs === null ? 0 : durationMs;
   database
     .prepare(
-      `INSERT INTO daily_tools(day, tool, calls, succeeded, failed, total_ms, max_ms)
-       VALUES(?, ?, 1, ?, ?, ?, ?)
+      `INSERT INTO daily_tools(day, tool, calls, succeeded, failed, total_ms, max_ms, timed_calls)
+       VALUES(?, ?, 1, ?, ?, ?, ?, ?)
        ON CONFLICT(day, tool) DO UPDATE SET
          calls = calls + 1,
          succeeded = succeeded + excluded.succeeded,
          failed = failed + excluded.failed,
          total_ms = total_ms + excluded.total_ms,
-         max_ms = MAX(max_ms, excluded.max_ms)`,
+         max_ms = MAX(max_ms, excluded.max_ms),
+         timed_calls = timed_calls + excluded.timed_calls`,
     )
-    .run(day, tool, ok ? 1 : 0, ok ? 0 : 1, durationMs, durationMs);
+    .run(day, tool, ok ? 1 : 0, ok ? 0 : 1, ms, ms, durationMs === null ? 0 : 1);
 }
 
-function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durationMs: number, state: UsageState): void {
-  const ms = Math.max(0, Math.round(durationMs));
+function recordToolCall(
+  database: AnyDatabase,
+  tool: string,
+  ok: boolean,
+  durationMs: number | null,
+  sessionID: string,
+  state: UsageState,
+): void {
+  const ms = durationMs === null ? null : Math.max(0, Math.round(durationMs));
   const day = dayKey();
   // U3: both rollups are written atomically; U2: the daily increment is
   // mirrored into the never-pruned lifetime rollup.
@@ -920,16 +969,34 @@ function recordToolCall(database: AnyDatabase, tool: string, ok: boolean, durati
   try {
     database
       .prepare(
-        `INSERT INTO tool_totals(tool, calls, succeeded, failed, total_ms, max_ms)
-         VALUES(?, 1, ?, ?, ?, ?)
+        `INSERT INTO tool_totals(tool, calls, succeeded, failed, total_ms, max_ms, timed_calls)
+         VALUES(?, 1, ?, ?, ?, ?, ?)
          ON CONFLICT(tool) DO UPDATE SET
            calls = calls + 1,
            succeeded = succeeded + excluded.succeeded,
            failed = failed + excluded.failed,
            total_ms = total_ms + excluded.total_ms,
-           max_ms = MAX(max_ms, excluded.max_ms)`,
+           max_ms = MAX(max_ms, excluded.max_ms),
+           timed_calls = timed_calls + excluded.timed_calls`,
       )
-      .run(tool, ok ? 1 : 0, ok ? 0 : 1, ms, ms);
+      .run(tool, ok ? 1 : 0, ok ? 0 : 1, ms ?? 0, ms ?? 0, ms === null ? 0 : 1);
+    // US-3: per-session counters alongside the global ones, so stats_sessions
+    // can report this session's own calls instead of the day's rollup.
+    // Calls with no known session (hooks fired without a sessionID) still
+    // count toward tool_totals/daily — they just land in no session row.
+    if (sessionID) {
+      database
+        .prepare(
+          `INSERT INTO session_tools(session_id, tool, calls, ok, fail, duration_ms)
+           VALUES(?, ?, 1, ?, ?, ?)
+           ON CONFLICT(session_id, tool) DO UPDATE SET
+             calls = calls + 1,
+             ok = ok + excluded.ok,
+             fail = fail + excluded.fail,
+             duration_ms = duration_ms + excluded.duration_ms`,
+        )
+        .run(sessionID, tool, ok ? 1 : 0, ok ? 0 : 1, ms ?? 0);
+    }
     addDailyToolUsage(database, day, tool, ok, ms);
     for (const table of ["daily", "lifetime"] as const) {
       database
@@ -984,6 +1051,17 @@ function num(v: unknown): number {
 
 function numOrNull(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/**
+ * US-7/TA-6: denominator for average durations — timed calls only, so
+ * unknown-duration (swept) calls never drag the average toward zero. Rows
+ * written before the timed_calls column existed report 0 timed calls while
+ * holding accumulated durations; those fall back to `calls` so their
+ * pre-existing averages keep rendering as before.
+ */
+function avgDenominator(timedCalls: number, calls: number): number {
+  return timedCalls > 0 ? timedCalls : calls;
 }
 
 function totalsOf(r: Record<string, unknown> | null | undefined): UsageTotals {
@@ -1129,14 +1207,17 @@ function summaryText(database: AnyDatabase): string {
 function toolsText(database: AnyDatabase, limit: number): string {
   const rows = database
     .prepare(
-      "SELECT tool, calls, succeeded, failed, total_ms, max_ms FROM tool_totals ORDER BY calls DESC, tool ASC LIMIT ?",
+      "SELECT tool, calls, succeeded, failed, total_ms, max_ms, timed_calls FROM tool_totals ORDER BY calls DESC, tool ASC LIMIT ?",
     )
     .all(limit) as Array<Record<string, unknown>>;
   if (rows.length === 0) return "No tool calls recorded yet.";
   const lines = [`Tool usage (${rows.length} tools)`];
   for (const r of rows) {
     const calls = num(r.calls);
-    const avg = calls > 0 ? num(r.total_ms) / calls : 0;
+    // US-7/TA-6: average over timed calls only; legacy rows (no timed data)
+    // fall back to averaging over all calls, matching pre-fix behavior.
+    const timed = avgDenominator(num(r.timed_calls), calls);
+    const avg = timed > 0 ? num(r.total_ms) / timed : 0;
     lines.push(
       `  ${String(r.tool)}: calls=${fmtInt(calls)} ok=${fmtInt(num(r.succeeded))} failed=${fmtInt(num(r.failed))} avg=${Math.round(avg)}ms max=${fmtInt(num(r.max_ms))}ms`,
     );
@@ -1289,7 +1370,7 @@ function dayBreakdowns(database: AnyDatabase, grid: HeatGrid): Map<string, DayBr
   }
   const tools = database
     .prepare(
-      `SELECT day, tool, calls, succeeded, failed, total_ms, max_ms
+      `SELECT day, tool, calls, succeeded, failed, total_ms, max_ms, timed_calls
        FROM daily_tools
        WHERE day >= ? AND day <= ?
        ORDER BY day ASC, calls DESC, tool ASC`,
@@ -1302,7 +1383,11 @@ function dayBreakdowns(database: AnyDatabase, grid: HeatGrid): Map<string, DayBr
       calls,
       succeeded: num(row.succeeded),
       failed: num(row.failed),
-      avgMs: calls > 0 ? num(row.total_ms) / calls : 0,
+      // US-7/TA-6: average over timed calls only (legacy rows fall back to
+      // calls), so unknown-duration calls do not drag the mean down.
+      avgMs: avgDenominator(num(row.timed_calls), calls) > 0
+        ? num(row.total_ms) / avgDenominator(num(row.timed_calls), calls)
+        : 0,
       maxMs: num(row.max_ms),
     });
   }
@@ -1366,6 +1451,29 @@ function heatmapDayTitle(
   return lines.join("\n");
 }
 
+/**
+ * The heatmap window adapts to the history the database actually
+ * holds: never wider than cfg.heatmapWeeks, and never wider than
+ * the oldest recorded day, so it grows as months of data accrue
+ * instead of showing empty leading columns forever.
+ */
+function effectiveHeatmapWeeks(cfg: Config, database: AnyDatabase, requested?: number): number {
+  let weeks = requested ?? cfg.heatmapWeeks;
+  const oldest = database.prepare("SELECT MIN(day) AS d FROM daily").get() as
+    | { d: string | null }
+    | null;
+  const oldestDay = oldest?.d;
+  if (oldestDay) {
+    const days = Math.round(
+      (Date.now() - Date.parse(oldestDay + "T00:00:00Z")) / 86_400_000,
+    );
+    weeks = Math.min(weeks, Math.max(1, Math.ceil((days + 1) / 7)));
+  } else {
+    weeks = 1; // no daily rows yet: just the current week
+  }
+  return Math.max(1, Math.min(weeks, requested ?? cfg.heatmapWeeks));
+}
+
 function heatmapText(database: AnyDatabase, weeks: number, metric: HeatMetric, includeBackground: boolean): string {
   const grid = heatmapGrid(database, weeks, metric, includeBackground);
   const lines: string[] = [`Usage heatmap (last ${weeks} weeks, metric=${metric})`];
@@ -1397,11 +1505,38 @@ function heatCellLabel(value: number, metric: HeatMetric): string {
   return metric === "cost" ? fmtShortUsd(value) : fmtCompact(value);
 }
 
+/** All three metrics at once, so the heatmap can carry client-side toggle data. */
+const HEAT_METRICS: ReadonlyArray<HeatMetric> = ["tokens", "cost", "calls"];
+
+/** Metric switch for the heatmap. aria-pressed carries the state for AT. */
+function metricToggleHtml(current: HeatMetric): string {
+  const label: Record<HeatMetric, string> = { tokens: "Tokens", cost: "Cost", calls: "Calls" };
+  return (
+    `<div class="metric-toggle" role="group" aria-label="Heatmap metric">` +
+    HEAT_METRICS.map(
+      (m) =>
+        `<button type="button" data-metric="${m}" aria-pressed="${m === current ? "true" : "false"}">${label[m]}</button>`,
+    ).join("") +
+    `</div>`
+  );
+}
+
 function buildHeatmapHtml(
   grid: HeatGrid,
   breakdowns: Map<string, DayBreakdown>,
   includeBackground: boolean,
 ): string {
+  // Per-metric peak, needed to compute each cell's level for the toggle.
+  const metricsMax: Record<HeatMetric, number> = { tokens: 0, cost: 0, calls: 0 };
+  for (const col of grid.columns) {
+    for (const cell of col) {
+      if (!cell.inRange || !cell.row) continue;
+      for (const m of HEAT_METRICS) {
+        const v = metricValue(cell.row, m, includeBackground);
+        if (v > metricsMax[m]) metricsMax[m] = v;
+      }
+    }
+  }
   const cells: string[] = [];
   for (let col = 0; col < grid.weeks; col++) {
     for (let row = 0; row < 7; row++) {
@@ -1412,7 +1547,18 @@ function buildHeatmapHtml(
       const title = cell.inRange && cell.row
         ? heatmapDayTitle(cell.row, grid.metric, includeBackground, breakdowns.get(cell.day))
         : `${cell.day}: no usage recorded`;
-      cells.push(`<span class="${cls}" tabindex="0" role="button" data-tooltip="${escapeHtml(title)}" aria-label="${escapeHtml(`${cell.day} usage details`)}"></span>`);
+      // Client-side metric switching: emit the level and the line-1 label for
+      // every metric up front so the toggle is instant and needs no reload.
+      // Only line 1 of the tooltip is metric-specific; the rest (tokens,
+      // tools, models, cost) is metric-independent detail.
+      const metricData = (HEAT_METRICS as readonly HeatMetric[])
+        .map((m) => {
+          const v = cell.inRange && cell.row ? metricValue(cell.row, m, includeBackground) : 0;
+          const lv = cell.inRange ? heatLevel(v, metricsMax[m]) : 0;
+          return ` data-lv-${m}="${lv}" data-v-${m}="${escapeHtml(heatCellLabel(v, m))}"`;
+        })
+        .join("");
+      cells.push(`<span class="${cls}" tabindex="0" role="button" data-day="${escapeHtml(cell.day)}" data-tooltip="${escapeHtml(title)}"${metricData} aria-label="${escapeHtml(`${cell.day} usage details`)}"></span>`);
     }
   }
   const monthSpans = grid.months
@@ -1432,7 +1578,7 @@ function buildHeatmapHtml(
     `<div class="hm-grid" style="grid-template-columns:repeat(${grid.weeks},24px)">${cells.join("")}</div>`,
     `</div>`,
     `</div>`,
-    `<div class="hm-legend"><span class="muted">Less</span>${legend}<span class="muted">More</span><span class="hm-max">peak ${escapeHtml(heatCellLabel(grid.max, grid.metric))}</span></div>`,
+    `<div class="hm-legend"><span class="muted">Less</span>${legend}<span class="muted">More</span><span class="hm-max" data-peak-tokens="${escapeHtml(heatCellLabel(metricsMax.tokens, "tokens"))}" data-peak-cost="${escapeHtml(heatCellLabel(metricsMax.cost, "cost"))}" data-peak-calls="${escapeHtml(heatCellLabel(metricsMax.calls, "calls"))}">peak ${escapeHtml(heatCellLabel(grid.max, grid.metric))}</span></div>`,
   ].join("");
 }
 
@@ -1536,7 +1682,10 @@ function tableHtml(
           .join("")
       : `<tr><td colspan="${headers.length}" class="muted">No data yet</td></tr>`;
   const idAttribute = tableId ? ` id="${escapeHtml(tableId)}"` : "";
-  return `<div class="tbl-wrap"><table${idAttribute} class="tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
+  // Long tables get their own scroll box so a sticky header has somewhere to
+  // stick to; short tables keep the plain wrapper.
+  const wrapClass = rows.length > 12 ? "tbl-wrap tall" : "tbl-wrap";
+  return `<div class="${wrapClass}"><table${idAttribute} class="tbl"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
 type AppInfo = { name?: string; version?: string; channel?: string };
@@ -1552,7 +1701,8 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
   const tools = lifetimeTools(database);
   const sessions = countSessions(database);
   const bg = backgroundTotals(database);
-  const grid = heatmapGrid(database, cfg.heatmapWeeks, cfg.heatmapMetric, cfg.includeBackground);
+  const hmWeeks = effectiveHeatmapWeeks(cfg, database);
+  const grid = heatmapGrid(database, hmWeeks, cfg.heatmapMetric, cfg.includeBackground);
   const breakdowns = dayBreakdowns(database, grid);
   const recent = dailyRows(database, dayKey(shiftDays(new Date(), -29)));
   // Success rate is measured over completed calls (ok + fail). Older rows
@@ -1562,13 +1712,56 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
   const pending = Math.max(0, tools.calls - completed);
   const rate = completed > 0 ? (tools.ok / completed) * 100 : 0;
 
+  // First-run state: nothing recorded yet, so explain the page instead of
+  // rendering a wall of zeroed KPIs and empty tables.
+  const usageRecorded = tokenTotal(life) > 0 || tools.calls > 0 || sessions > 0;
+  const firstRunHtml = [
+    `<section class="empty-state">`,
+    `<h2>No usage recorded yet</h2>`,
+    `<p>Nothing has been counted in <code>${escapeHtml(DB_NAME)}</code> yet. Start a session, run some tools, and the heatmap, charts and tables below will fill in automatically.</p>`,
+    `<p class="hint">If you have already been running sessions, check <code>stats_health</code> to confirm the stats database is writable.</p>`,
+    `</section>`,
+  ].join("\n");
+
+  // KPI deltas: trailing 30 days vs the 30 days before it. Lifetime cards
+  // stay lifetime totals; the delta is just the sub-label.
+  const dayEnd = dayKey(new Date());
+  const dayStart = dayKey(shiftDays(new Date(), -29));
+  const dayPrevStart = dayKey(shiftDays(new Date(), -59));
+  const windowRows = dailyRows(database, dayPrevStart).filter((r) => r.day >= dayPrevStart && r.day <= dayEnd);
+  const sumWin = (from: string, pick: (r: DayRow) => number): number =>
+    windowRows.filter((r) => r.day >= from && r.day <= dayEnd).reduce((s, r) => s + pick(r), 0);
+  const bgTokens = (r: DayRow): number =>
+    r.bg_input + r.bg_output + r.bg_reasoning + r.bg_cache_read + r.bg_cache_write;
+  const windowTokens = {
+    life: sumWin(dayStart, (r) => tokenTotal(r) + (cfg.includeBackground ? bgTokens(r) : 0)),
+    prev: sumWin(dayPrevStart, (r) => tokenTotal(r) + (cfg.includeBackground ? bgTokens(r) : 0)),
+  };
+  const windowCost = {
+    life: sumWin(dayStart, (r) => r.cost + (cfg.includeBackground ? r.bg_cost : 0)),
+    prev: sumWin(dayPrevStart, (r) => r.cost + (cfg.includeBackground ? r.bg_cost : 0)),
+  };
+  const windowCostComputed = {
+    life: sumWin(dayStart, (r) => r.costComputed ?? 0),
+    prev: sumWin(dayPrevStart, (r) => r.costComputed ?? 0),
+  };
+  const deltaText = (cur: number, prev: number): string => {
+    if (prev <= 0 || cur <= 0) return "";
+    const pct = ((cur - prev) / prev) * 100;
+    if (!isFinite(pct) || Math.abs(pct) < 0.5) return "";
+    return ` · ${pct > 0 ? "▲" : "▼"}${Math.round(Math.abs(pct))}% vs prior 30d`;
+  };
+
   const toolRows = (
     database.prepare("SELECT * FROM tool_totals ORDER BY calls DESC, tool ASC LIMIT 15").all() as Array<
       Record<string, unknown>
     >
   ).map((r) => {
     const calls = num(r.calls);
-    const avg = calls > 0 ? num(r.total_ms) / calls : 0;
+    // US-7/TA-6: average over timed calls only (legacy rows fall back to
+    // calls) — unknown-duration calls must not drag the mean down.
+    const timed = avgDenominator(num(r.timed_calls), calls);
+    const avg = timed > 0 ? num(r.total_ms) / timed : 0;
     return [
       String(r.tool),
       compactCell(calls),
@@ -1646,9 +1839,9 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
   const generated = new Date().toISOString().replace("T", " ").slice(0, 19) + " UTC";
 
   const cards: Array<[string, string, string, string]> = [
-    ["Total tokens", fmtCompact(tokenTotal(life)), "c1", "in + out + cache"],
-    ["Cost (reported)", fmtShortUsd(life.cost), "c2", "USD billed by the provider"],
-    ["Cost (list price)", fmtShortUsdOrDash(life.costComputed), "c2", "API-equivalent USD"],
+    ["Total tokens", fmtCompact(tokenTotal(life)), "c1", `in + out + cache${deltaText(windowTokens.life, windowTokens.prev)}`],
+    ["Cost (reported)", fmtShortUsd(life.cost), "c2", `USD billed by the provider${deltaText(windowCost.life, windowCost.prev)}`],
+    ["Cost (list price)", fmtShortUsdOrDash(life.costComputed), "c2", `API-equivalent USD${deltaText(windowCostComputed.life, windowCostComputed.prev)}`],
     ["Sessions", fmtCompact(sessions), "c3", "tracked"],
     ["Tool calls", fmtCompact(tools.calls), "c4", `${fmtCompact(tools.ok)} ok · ${fmtCompact(tools.fail)} failed${pending > 0 ? ` · ${fmtCompact(pending)} pending` : ""}`],
     ["Success rate", `${rate.toFixed(1)}%`, "c5", "completed calls"],
@@ -1665,11 +1858,11 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ":root{--font-display:Georgia,'Iowan Old Style','Times New Roman',serif;--font-text:ui-monospace,'SF Mono','Cascadia Code',Menlo,Consolas,monospace;",
     "--step--1:0.75rem;--step-0:1rem;--step-1:1.333rem;--step-2:1.777rem;--step-3:2.369rem;--step-4:3.157rem;--step-5:4.209rem;",
     "--space-3xs:0.25rem;--space-2xs:0.5rem;--space-xs:0.75rem;--space-s:1rem;--space-m:1.5rem;--space-l:2rem;--space-xl:3rem;--space-2xl:4.5rem;--space-3xl:7rem;",
-    "--base:#f4f1ea;--surface:#fdfcf7;--surface-2:#ece5d3;--line:#d9d1c1;--ink:#161310;--ink-2:#575046;--ink-3:#726b61;",
+    "--base:#f4f1ea;--surface:#fdfcf7;--surface-2:#ece5d3;--line:#d9d1c1;--ink:#161310;--ink-2:#575046;--ink-3:#6b645a;",
     "--accent:#a92c1a;--accent-deep:#7e1f12;--ok:#1e6b3a;",
     "--hm0:#e5ddcb;--hm1:#d8b9a5;--hm2:#d08a6d;--hm3:#c15535;--hm4:#9e2a16;",
     "--radius:0;--shadow:none}",
-    "@media (prefers-color-scheme:dark){:root{--base:#14110e;--surface:#1d1a15;--surface-2:#2a251d;--line:#38312a;--ink:#ece5d8;--ink-2:#b8ae9f;--ink-3:#8f8577;",
+    "@media (prefers-color-scheme:dark){:root{--base:#14110e;--surface:#1d1a15;--surface-2:#2a251d;--line:#38312a;--ink:#ece5d8;--ink-2:#b8ae9f;--ink-3:#9b9184;",
     "--accent:#e2603f;--accent-deep:#f08663;--ok:#5fce8a;",
     "--hm0:#26211b;--hm1:#4a2a20;--hm2:#7a3420;--hm3:#b04a2a;--hm4:#e2603f;",
     "--radius:0;--shadow:none}}",
@@ -1721,8 +1914,30 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ".bar{fill:var(--ink);opacity:1;cursor:pointer}.bar:hover,.bar:focus-visible{fill:var(--accent)}.bar:last-of-type{fill:var(--accent)}",
     ".hm-cell{cursor:pointer}",
     "[data-tooltip]{cursor:help}",
-    ".usage-tooltip{position:fixed;z-index:100;width:max-content;max-width:min(36rem,calc(100vw - 1.5rem));max-height:min(32rem,calc(100vh - 1.5rem));overflow:auto;padding:var(--space-s);background:var(--surface);border:1px solid var(--ink);border-left:3px solid var(--accent);box-shadow:5px 5px 0 var(--surface-2);color:var(--ink);font:400 var(--step--1)/1.55 var(--font-text);white-space:pre-wrap;overflow-wrap:anywhere;pointer-events:auto;overscroll-behavior:contain}",
+    ".usage-tooltip{position:fixed;z-index:100;width:min(30rem,calc(100vw - 1.5rem));max-height:min(32rem,calc(100vh - 1.5rem));overflow:auto;padding:var(--space-s) var(--space-m);background:var(--surface);border:1px solid var(--ink);border-left:3px solid var(--accent);box-shadow:5px 5px 0 var(--surface-2);color:var(--ink);font:400 var(--step--1)/1.55 var(--font-text);white-space:normal;overflow-wrap:anywhere;pointer-events:auto;overscroll-behavior:contain}",
+    // Compact hover card for heatmap cells: headline plus a
+    // small 2x2 stat grid, narrow enough that it never hides
+    // the map. The full card still appears pinned (click)
+    // and in the day-detail panel.
+    ".usage-tooltip.mini{width:min(17rem,calc(100vw - 1.5rem));padding:var(--space-2xs) var(--space-s)}",
+    ".usage-tooltip.mini .tt-sec{display:none}",
+    ".tt-grid{display:grid;grid-template-columns:1fr 1fr;gap:var(--space-2xs) var(--space-s);margin-top:var(--space-2xs)}",
+    ".tt-cell b{display:block;font-size:var(--step--1);font-weight:400;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3)}",
+    ".tt-cell span{font-family:var(--font-text);font-weight:700;font-variant-numeric:tabular-nums}",
     ".usage-tooltip[hidden]{display:none}",
+    // Tooltip card structure: title row (day + headline value),
+    // then labelled sections with inline values and detail rows.
+    ".tt-head{display:flex;align-items:baseline;justify-content:space-between;gap:var(--space-xs);border-bottom:1px solid var(--ink);padding-bottom:var(--space-2xs);margin-bottom:var(--space-2xs)}",
+    ".tt-day{font-family:var(--font-display);font-size:var(--step-1);letter-spacing:-0.01em}",
+    ".tt-value{font-family:var(--font-text);font-weight:700;color:var(--accent);font-variant-numeric:tabular-nums;white-space:nowrap}",
+    ".tt-value em{font-style:normal;font-weight:400;color:var(--ink-3);text-transform:uppercase;letter-spacing:.06em;font-size:var(--step--1)}",
+    ".tt-sec{margin-top:var(--space-xs)}",
+    ".tt-sec h4{margin:0 0 1px;font-size:var(--step--1);font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3)}",
+    ".tt-val{font-family:var(--font-text);margin:0;font-variant-numeric:tabular-nums}",
+    ".tt-rows{list-style:none;margin:var(--space-3xs) 0 0;padding:0;display:grid;gap:1px;font-size:var(--step--1);font-family:var(--font-text)}",
+    ".tt-row{margin:var(--space-3xs) 0 0;display:flex;flex-wrap:wrap;gap:0 var(--space-xs)}",
+    ".tt-kv{white-space:nowrap}",
+    ".tt-kv b{font-weight:400;color:var(--ink-3)}",
     ".gl{stroke:var(--line);stroke-width:1}",
     ".axis{fill:var(--ink-3);font-size:10.5px;font-family:var(--font-text);font-variant-numeric:tabular-nums}",
     ".axis-line{stroke:var(--ink);stroke-width:1}",
@@ -1747,11 +1962,100 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     "p.sub{max-width:68ch}",
     ":focus-visible{outline:2px solid var(--accent);outline-offset:2px}",
     "footer{color:var(--ink-3);font-size:11.5px;text-transform:uppercase;letter-spacing:.06em;text-align:left;border-top:3px double var(--ink);padding:var(--space-xs) 0 0}",
+    // First-run state: no rows at all yet. Keeps the hero so the page still
+    // reads as ours, but replaces zeroed KPIs with an explanation instead of
+    // a wall of 0s and empty tables.
+    ".empty-state{display:grid;gap:var(--space-s);border-top:2px solid var(--ink);background:var(--surface);padding:var(--space-l) var(--space-m);margin-bottom:var(--space-xl)}",
+    ".empty-state h2{font-family:var(--font-display);font-weight:400;font-size:var(--step-2);margin:0;line-height:1.1}",
+    ".empty-state p{margin:0;max-width:68ch;color:var(--ink-2);font-size:var(--step-0)}",
+    ".empty-state .hint{font-size:var(--step--1);color:var(--ink-3);text-transform:uppercase;letter-spacing:.06em}",
+    // Metric toggle for the heatmap. aria-pressed carries the state for AT;
+    // the filled style is the visual echo of it.
+    ".metric-toggle{display:flex;gap:0;border:1px solid var(--ink);align-self:center}",
+    ".metric-toggle button{font:inherit;font-size:var(--step--1);text-transform:uppercase;letter-spacing:.06em;color:var(--ink);background:transparent;border:0;border-left:1px solid var(--ink);border-radius:0;padding:var(--space-3xs) var(--space-2xs);cursor:pointer}",
+    ".metric-toggle button:first-child{border-left:0}",
+    ".metric-toggle button:hover,.metric-toggle button:focus-visible{background:var(--surface-2)}",
+    ".metric-toggle button[aria-pressed=true]{background:var(--ink);color:var(--surface)}",
+    // Persistent day breakdown: the tooltip pins on click, this keeps the
+    // selected day's detail on the page after the tooltip dismisses.
+    ".day-detail{margin-top:var(--space-s);border:1px solid var(--line);border-left:3px solid var(--accent);border-top:2px solid var(--ink);background:var(--surface);padding:var(--space-s);font:400 var(--step--1)/1.55 var(--font-text);white-space:pre-wrap;overflow-wrap:anywhere}",
+    ".day-detail[hidden]{display:none}",
+    // Sticky headers only where the table actually scrolls internally;
+    // otherwise the header would stick to a container that never scrolls.
+    ".tbl-wrap.tall{max-height:65vh;overflow:auto}",
+    ".tbl-wrap.tall thead th{position:sticky;top:0;z-index:1;background:var(--surface);box-shadow:inset 0 -1px 0 var(--ink)}",
   ].join("\n");
 
   const tooltipScript = [
     `<script>`,
     `(function(){`,
+    `function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}`,
+    `function kvRow(line){var out="";var re=/([a-z_]+)=(\\S+)/g;var m;var any=false;while((m=re.exec(line))!==null){any=true;out+='<span class="tt-kv"><b>'+esc(m[1])+"</b> "+esc(m[2])+"</span>";}return any?'<p class="tt-row">'+out+"</p>":null;}`,
+    // Parse the plain-text tooltip into a titled, sectioned card.
+    // Line 1 is the headline ("2026-10-01 — 7.6k tokens" or
+    // "2026-10-01: 7615 tokens"); lines like "Tokens: 7615 total"
+    // open a labelled section; two-space-indented lines are detail
+    // rows, with a=b pairs rendered as key/value chips.
+    `function renderTip(text){`,
+    `  var lines=String(text).split("\\n");`,
+    `  var head=lines[0]||"";`,
+    `  var sep=head.match(/\\s—\\s|: /);`,
+    `  var day=head,rest=head;`,
+    `  if(sep){var i=head.indexOf(sep[0]);day=head.slice(0,i);rest=head.slice(i+sep[0].length);}`,
+    `  var words=rest.split(/\\s+/).filter(Boolean);`,
+    `  var metric=words.length>1?words[words.length-1]:"";`,
+    `  var value=words.slice(0,words.length>1?-1:words.length).join(" ");`,
+    `  var parts=['<div class="tt-head"><span class="tt-day">'+esc(day)+'</span><span class="tt-value">'+esc(value)+(metric?" <em>"+esc(metric)+"</em>":"")+"</span></div>"];`,
+    `  var secs=[];`,
+    `  for(var i=1;i<lines.length;i++){`,
+    `    var l=lines[i];`,
+    `    if(!l)continue;`,
+    `    if(l.indexOf("  ")===0){`,
+    `      var s=secs[secs.length-1];`,
+    `      if(!s){parts.push("<p>"+esc(l.trim())+"</p>");continue;}`,
+    `      var kv=kvRow(l);`,
+    `      s.rows.push(kv?kv:"<li>"+esc(l.trim())+"</li>");`,
+    `    }else{`,
+    `      var idx=l.indexOf(":");`,
+    `      secs.push({title:idx>=0?l.slice(0,idx):l,val:idx>=0?l.slice(idx+1).trim():"",rows:[]});`,
+    `    }`,
+    `  }`,
+    `  for(var j=0;j<secs.length;j++){`,
+    `    var sec=secs[j];`,
+    `    parts.push('<div class="tt-sec"><h4>'+esc(sec.title)+"</h4>"+(sec.val?'<p class="tt-val">'+esc(sec.val)+"</p>":"")+(sec.rows.length?'<ul class="tt-rows">'+sec.rows.join("")+"</ul>":"")+"</div>");`,
+    `  }`,
+    `  return parts.join("");`,
+    `}`,
+    // Compact card for heatmap hovers: headline plus a
+    // 2x2 stat grid (tokens / cost / calls / models).
+    // Full detail stays one click away in the pinned card.
+    `function renderMini(text){`,
+    `  var lines=String(text).split("\\n");`,
+    `  var head=lines[0]||"";`,
+    `  var sep=head.match(/\\s—\\s|: /);`,
+    `  var day=head,rest=head;`,
+    `  if(sep){var i=head.indexOf(sep[0]);day=head.slice(0,i);rest=head.slice(i+sep[0].length);}`,
+    `  var words=rest.split(/\\s+/).filter(Boolean);`,
+    `  var metric=words.length>1?words[words.length-1]:"";`,
+    `  var value=words.slice(0,words.length>1?-1:words.length).join(" ");`,
+    `  var stats={};`,
+    `  for(var i=1;i<lines.length;i++){`,
+    `    var l=lines[i];`,
+    `    if(!l||l.indexOf("  ")===0)continue;`,
+    `    var idx=l.indexOf(":");`,
+    `    if(idx<0)continue;`,
+    `    stats[l.slice(0,idx)]=l.slice(idx+1).trim();`,
+    `  }`,
+    `  var cell=function(label,val){return val?'<div class="tt-cell"><b>'+esc(label)+'</b><span>'+esc(val)+"</span></div>":"";};`,
+    `  return '<div class="tt-head"><span class="tt-day">'+esc(day)+'</span><span class="tt-value">'+esc(value)+(metric?" <em>"+esc(metric)+"</em>":"")+"</span></div>"+`,
+    `    '<div class="tt-grid">'+`,
+    `    cell("Tokens",(stats.Tokens||"").replace(/ total$/,""))+`,
+    `    cell("Cost",(stats.Cost||"").replace(/ reported$/,""))+`,
+    `    cell("Tool calls",(stats.Tools||"").replace(/ calls.*/,""))+`,
+    `    cell("Models",(stats.Models||"").replace(/ used$/,""))+`,
+    `    "</div>";`,
+    `}`,
+    `window.__renderTip=renderTip;`,
     `var tooltip=document.getElementById("usage-tooltip");`,
     `if(!tooltip)return;`,
     `var active=null;`,
@@ -1759,9 +2063,24 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `var returnFocus=null;`,
     `var returning=false;`,
     `var hideTimer;`,
-    `function position(target){tooltip.style.left="0px";tooltip.style.top="0px";var box=target.getBoundingClientRect();var gap=10;var edge=12;var width=tooltip.offsetWidth;var height=tooltip.offsetHeight;var left=box.left+box.width/2-width/2;var top=box.bottom+gap;left=Math.max(edge,Math.min(left,window.innerWidth-width-edge));if(top+height>window.innerHeight-edge)top=box.top-height-gap;top=Math.max(edge,Math.min(top,window.innerHeight-height-edge));tooltip.style.left=left+"px";tooltip.style.top=top+"px";}`,
+    `function position(target,mini){tooltip.style.left="0px";tooltip.style.top="0px";var box=target.getBoundingClientRect();var gap=10;var edge=12;var width=tooltip.offsetWidth;var height=tooltip.offsetHeight;var left;var top;`,
+    `  if(mini){`,
+    `    // Side placement: a compact card to the right (or`,
+    `    // left) of the cell so it never covers the map.`,
+    `    left=box.right+gap;`,
+    `    if(left+width>window.innerWidth-edge)left=box.left-width-gap;`,
+    `    if(left<edge)left=Math.max(edge,box.left+box.width/2-width/2);`,
+    `    top=box.top+box.height/2-height/2;`,
+    `  }else{`,
+    `    left=box.left+box.width/2-width/2;`,
+    `    top=box.bottom+gap;`,
+    `    left=Math.max(edge,Math.min(left,window.innerWidth-width-edge));`,
+    `    if(top+height>window.innerHeight-edge)top=box.top-height-gap;`,
+    `  }`,
+    `  top=Math.max(edge,Math.min(top,window.innerHeight-height-edge));`,
+    `  tooltip.style.left=left+"px";tooltip.style.top=top+"px";}`,
     `function hide(){var focusTarget=returnFocus;var restoreFocus=!!(focusTarget&&document.activeElement===tooltip);if(active)active.removeAttribute("aria-describedby");active=null;pinned=false;returnFocus=null;tooltip.hidden=true;tooltip.setAttribute("aria-hidden","true");if(restoreFocus){returning=true;focusTarget.focus();setTimeout(function(){returning=false;},0);}}`,
-    `function show(target,pin,keyboard){var text=target.getAttribute("data-tooltip");if(!text||returning)return;clearTimeout(hideTimer);if(active&&active!==target)active.removeAttribute("aria-describedby");active=target;pinned=pin===true;returnFocus=keyboard?target:null;tooltip.textContent=text;tooltip.hidden=false;tooltip.setAttribute("aria-hidden","false");target.setAttribute("aria-describedby","usage-tooltip");position(target);if(keyboard)tooltip.focus();}`,
+    `function show(target,pin,keyboard){var text=target.getAttribute("data-tooltip");if(!text||returning)return;clearTimeout(hideTimer);if(active&&active!==target)active.removeAttribute("aria-describedby");active=target;pinned=pin===true;returnFocus=keyboard?target:null;var mini=target.classList.contains("hm-cell")&&!pinned;tooltip.classList.toggle("mini",mini);tooltip.innerHTML=mini?renderMini(text):renderTip(text);tooltip.hidden=false;tooltip.setAttribute("aria-hidden","false");target.setAttribute("aria-describedby","usage-tooltip");position(target,mini);if(keyboard)tooltip.focus();}`,
     `function scheduleHide(){clearTimeout(hideTimer);hideTimer=setTimeout(function(){if(!pinned&&document.activeElement!==active&&!tooltip.matches(":hover"))hide();},120);}`,
     `function toggle(target,keyboard){if(active===target&&pinned)hide();else show(target,true,keyboard);}`,
     `function bind(target){target.addEventListener("mouseenter",function(){show(target,false);});target.addEventListener("mouseleave",function(){scheduleHide();});target.addEventListener("focus",function(){if(target.classList.contains("hm-cell"))setHeatIndex(target);if(!returning)show(target,false);});target.addEventListener("blur",function(){scheduleHide();});target.addEventListener("click",function(event){event.stopPropagation();toggle(target,false);});target.addEventListener("keydown",function(event){if(event.key==="Escape"){hide();}else if(event.key==="Enter"||event.key===" "){event.preventDefault();toggle(target,true);}});}`,
@@ -1809,6 +2128,50 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `</script>`,
   ].join("\n");
 
+  // Metric switch for the heatmap + click-through day detail. Both operate
+  // purely on data already embedded above, so switching is instant.
+  const heatmapToggleScript = [
+    `<script>`,
+    `(function(){`,
+    `function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}`,
+    `var toggle=document.querySelector(".metric-toggle");`,
+    `if(!toggle)return;`,
+    `var cells=Array.prototype.slice.call(document.querySelectorAll(".hm-grid .hm-cell"));`,
+    `var peak=document.querySelector(".hm-max");`,
+    `var sub=document.querySelector("[data-hm-sub]");`,
+    `var btns=Array.prototype.slice.call(toggle.querySelectorAll("button"));`,
+    `var current="tokens";`,
+    `var tooltip=document.getElementById("usage-tooltip");`,
+    `var detail=document.getElementById("day-detail");`,
+    `function firstLine(cell,metric){var day=cell.getAttribute("data-day");var v=cell.getAttribute("data-v-"+metric)||"";return day+" — "+v+" "+metric;}`,
+    `function setMetric(metric){`,
+    `  if(!metric)return;current=metric;`,
+    `  btns.forEach(function(b){b.setAttribute("aria-pressed",b.getAttribute("data-metric")===metric?"true":"false");});`,
+    `  cells.forEach(function(cell){`,
+    `    if(cell.classList.contains("hm-out"))return;`,
+    `    var lv=cell.getAttribute("data-lv-"+metric)||"0";`,
+    `    cell.className="hm-cell hm-l"+lv;`,
+    `    var full=cell.getAttribute("data-tooltip")||"";`,
+    `    var nl=full.indexOf("\\n");`,
+    `    cell.setAttribute("data-tooltip",firstLine(cell,metric)+(nl>=0?full.slice(nl):""));`,
+    `    if(detail&&!detail.hidden&&detail.getAttribute("data-day")===cell.getAttribute("data-day"))refreshDetail(cell);`,
+    `  });`,
+    `  if(peak)peak.textContent="peak "+(peak.getAttribute("data-peak-"+metric)||"");`,
+    `  if(sub)sub.textContent=sub.textContent.replace(/metric: \\S+$/,"metric: "+metric);`,
+    `  if(tooltip&&tooltip.getAttribute("aria-hidden")==="false"){`,
+    `    var focused=document.activeElement;`,
+    `    if(focused&&focused.classList&&focused.classList.contains("hm-cell")){`,
+    `      var t=focused.getAttribute("data-tooltip");if(t)tooltip.textContent=t;`,
+    `    }`,
+    `  }`,
+    `}`,
+    `function refreshDetail(cell){if(!detail)return;var t=cell.getAttribute("data-tooltip")||"";detail.innerHTML=window.__renderTip?window.__renderTip(t):esc(t);detail.setAttribute("data-day",cell.getAttribute("data-day")||"");}`,
+    `btns.forEach(function(b){b.addEventListener("click",function(){setMetric(b.getAttribute("data-metric"));});});`,
+    `cells.forEach(function(cell){cell.addEventListener("click",function(){if(!detail)return;refreshDetail(cell);detail.hidden=false;});});`,
+    `})();`,
+    `</script>`,
+  ].join("\n");
+
   return [
     "<!DOCTYPE html>",
     '<html lang="en"><head><meta charset="utf-8"/>',
@@ -1825,9 +2188,11 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `<p class="meta">${escapeHtml(name)} ${escapeHtml(version)} · ${escapeHtml(channel)} · generated ${escapeHtml(generated)}</p>`,
     `</header>`,
     `<section class="kpis">${cardsHtml}</section>`,
+    ...(!usageRecorded ? [firstRunHtml] : [
     `<section class="panel">`,
-    `<div class="panel-head"><h2>Activity</h2><span class="sub">last ${grid.weeks} weeks · metric: ${escapeHtml(grid.metric)}</span></div>`,
+    `<div class="panel-head"><h2>Activity</h2><span class="sub" data-hm-sub>last ${grid.weeks} weeks · metric: ${escapeHtml(grid.metric)}</span>${metricToggleHtml(grid.metric)}</div>`,
     buildHeatmapHtml(grid, breakdowns, cfg.includeBackground),
+    `<div class="day-detail" id="day-detail" role="region" aria-live="polite" aria-label="Selected day breakdown" hidden></div>`,
     `</section>`,
     `<section class="panel">`,
     `<div class="panel-head"><h2>Activity per day</h2><span class="sub">last 30 days · metric: ${escapeHtml(cfg.heatmapMetric)}</span></div>`,
@@ -1855,6 +2220,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `<p class="sub">Hidden spend recorded outside the main session counters: <b>${escapeHtml(fmtCompact(bg.total))}</b> tokens · <b>${escapeHtml(fmtShortUsd(bg.cost))}</b>.</p>`,
     tableHtml(["source", "events", "tokens", "cost", "cost (list)"], sourceRows),
     `</section>`,
+    ]),
     `<p class="sub">List-price cost is computed from the provider's published per-million-token rates. ` +
       `Subscription plans (e.g. opencode Zen or a flat account) may report <b>$0</b> billed while the ` +
       `list-price column shows the API-equivalent value. Unknown prices render <b>—</b>, never $0.</p>`,
@@ -1863,6 +2229,7 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `<div id="usage-tooltip" class="usage-tooltip" role="tooltip" tabindex="-1" aria-hidden="true" hidden></div>`,
     tooltipScript,
     modelFilterScript,
+    heatmapToggleScript,
     "</body></html>",
   ].join("\n");
 }
@@ -1889,8 +2256,12 @@ function renderDashboard(
  * asking the model to do it (which would spend tokens). Set
  * OPENCODE_USAGE_STATS_NO_OPEN=1 to suppress (headless/test environments).
  */
-function openInBrowser(filePath: string): boolean {
-  if (process.env.OPENCODE_USAGE_STATS_NO_OPEN) return false;
+type OpenResult = { opened: boolean; path: string; error?: string };
+
+function openInBrowser(filePath: string): OpenResult {
+  if (process.env.OPENCODE_USAGE_STATS_NO_OPEN) {
+    return { opened: false, path: filePath, error: "OPENCODE_USAGE_STATS_NO_OPEN is set" };
+  }
   try {
     // US-2: never pass the path through a shell (cmd /c start re-parses
     // metacharacters such as `&` — a command-injection vector). Launch the
@@ -1905,12 +2276,64 @@ function openInBrowser(filePath: string): boolean {
         : process.platform === "darwin"
           ? spawn("open", [filePath], { detached: true, stdio: "ignore" })
           : spawn("xdg-open", [filePath], { detached: true, stdio: "ignore" });
-    child.on("error", () => {});
+    child.on("error", (err) => {
+      console.error(`[usage-stats] failed to open ${filePath}: ${String(err)}`);
+    });
     child.unref?.();
-    return true;
-  } catch {
-    return false;
+    return { opened: true, path: filePath };
+  } catch (err) {
+    return { opened: false, path: filePath, error: String(err) };
   }
+}
+
+// --- E41/E42/E43/E45 helpers -----------------------------------------------
+
+/** Escape a value for CSV output per RFC 4180. */
+function csvEscape(value: unknown): string {
+  const s = String(value ?? "");
+  if (/[",\n\r]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+/** Convert rows to CSV with a header row. */
+function toCsv(rows: Array<Record<string, unknown>>): string {
+  if (rows.length === 0) return "";
+  const headers = Object.keys(rows[0]!);
+  const lines = [headers.join(",")];
+  for (const row of rows) {
+    lines.push(headers.map((h) => csvEscape(row[h])).join(","));
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Parse a date string to a day key (YYYY-MM-DD). Accepts ISO dates and "Nd"
+ * relative spans.
+ * US-6: a bare YYYY-MM-DD input is already a day key — pass it through after
+ * validation instead of round-tripping through Date + local getters, which
+ * shifted the day backwards in UTC-x timezones (a UTC-8 server asked for
+ * "2026-10-01" got "2026-09-30"). "Nd" spans exactly N days inclusive:
+ * "7d" starts 6 days back so [start, today] covers 7 days.
+ */
+function parseDayKey(value: unknown): string | undefined {
+  if (typeof value !== "string" || !value.trim()) return undefined;
+  const s = value.trim();
+  const rel = /^(\d+)d$/i.exec(s);
+  if (rel) {
+    return dayKey(shiftDays(new Date(), -(Math.max(1, Number(rel[1])) - 1)));
+  }
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    // Validate the calendar date (rejects 2026-02-30) then pass it through.
+    const d = new Date(`${s}T00:00:00Z`);
+    return isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== s ? undefined : s;
+  }
+  const d = new Date(s);
+  if (!isNaN(d.getTime())) {
+    return dayKey(d);
+  }
+  return undefined;
 }
 
 export default Plugin.define({
@@ -1951,7 +2374,7 @@ export default Plugin.define({
     // Price list: fetch once at startup, then refresh periodically.
     state.priceOverrides = parsePriceOverrides(cfg.prices);
     if (state.priceOverrides.size > 0) log(`price overrides loaded for ${state.priceOverrides.size} model(s)`);
-    await refreshPricing(ctx, log, state);
+    await refreshPricing(ctx, log, state, true);
     if (cfg.pricingRefreshMin > 0) {
       const timer = setInterval(() => {
         void refreshPricing(ctx, log, state);
@@ -1987,17 +2410,44 @@ export default Plugin.define({
           // map cannot grow without bound in long-lived servers. The full
           // scan is threshold-gated — it only runs when the map is large or
           // a minute has passed since the last sweep, not on every tool call.
+          // US-7/TA-6: a swept entry is first marked duration-unknown (a late
+          // execute.after still records the call, just without a duration);
+          // only entries left orphaned for hours after that mark are dropped,
+          // keeping the map bounded.
           const now = Date.now();
           if (state.pending.size > 500 || now - state.lastPendingSweep > 60_000) {
             state.lastPendingSweep = now;
-            const cutoff = now - 600_000;
+            const markCutoff = now - 600_000;
+            const dropCutoff = now - 6 * 3_600_000;
             for (const [k, v] of state.pending) {
-              if (v.startedMs < cutoff) state.pending.delete(k);
+              if (!v.unknownDuration) {
+                if (v.startedMs < markCutoff) v.unknownDuration = true;
+              } else if (v.startedMs < dropCutoff) {
+                state.pending.delete(k);
+              }
             }
           }
-          state.pending.set(key, { tool: String(event.tool ?? "unknown"), startedMs: Date.now() });
+          // US-6: sweep stale sessionModels entries so the map cannot grow
+          // without bound in long-lived servers. Same threshold-gated pattern
+          // as the pending sweep above.
+          if (state.sessionModels.size > 500 || now - state.lastSessionModelsSweep > 60_000) {
+            state.lastSessionModelsSweep = now;
+            const cutoff = now - 600_000;
+            for (const [k, v] of state.sessionModels) {
+              if (v.updatedMs < cutoff) state.sessionModels.delete(k);
+            }
+          }
+          // US-3: capture the session id so execute.after can attribute the
+          // call to a session even when its own event carries no sessionID.
+          state.pending.set(key, {
+            tool: String(event.tool ?? "unknown"),
+            startedMs: Date.now(),
+            sessionID: String((event as { sessionID?: unknown }).sessionID ?? ""),
+          });
         } catch (err) {
-          log(`execute.before failed: ${String(err)}`);
+          // US-2: recording-path failures are always reported (rate-limited),
+          // never hidden behind the optional cfg.log flag.
+          logDbError(`execute.before failed: ${String(err)}`);
         }
       }),
     );
@@ -2006,14 +2456,21 @@ export default Plugin.define({
       await ctx.tool.hook("execute.after", (event) => {
         try {
           const key = String(event.id ?? "");
-          const entry = state.pending.get(key);
-          const tool = String(event.tool ?? entry?.tool ?? "unknown");
-          const duration = entry ? Date.now() - entry.startedMs : 0;
+          const entry = key ? state.pending.get(key) : undefined;
+          if (!entry) return;
           state.pending.delete(key);
+          const tool = String(event.tool ?? entry.tool ?? "unknown");
+          // US-7/TA-6: a swept (unknown-duration) entry still records the
+          // call — with a null duration instead of a bogus number.
+          const duration = entry.unknownDuration ? null : Date.now() - entry.startedMs;
           const status = String((event as { status?: unknown }).status ?? "completed");
-          recordToolCall(database(), tool, status === "completed", duration, state);
+          // US-3: prefer the after event's sessionID, fall back to the one
+          // captured at execute.before (some hosts only send it there).
+          const sessionID =
+            String((event as { sessionID?: unknown }).sessionID ?? "") || entry.sessionID || "";
+          recordToolCall(database(), tool, status === "completed", duration, sessionID, state);
         } catch (err) {
-          log(`execute.after failed: ${String(err)}`);
+          logDbError(`execute.after failed: ${String(err)}`);
         }
       }),
     );
@@ -2021,6 +2478,7 @@ export default Plugin.define({
     const abort = new AbortController();
     const pump = (async (): Promise<void> => {
       try {
+        state.eventPumpAlive = true;
         for await (const raw of ctx.event.subscribe({ signal: abort.signal })) {
           const ev = raw as unknown as { type?: string; data?: Record<string, unknown> };
           const data = (ev.data ?? {}) as Record<string, unknown>;
@@ -2057,11 +2515,15 @@ export default Plugin.define({
             }
             prune(state, cfg, false);
           } catch (err) {
-            log(`event ${String(ev.type)} failed: ${String(err)}`);
+            // US-2: data-path failures surface unconditionally (rate-limited)
+            // even with options.log=false; the chatty info logs elsewhere stay
+            // behind cfg.log.
+            logDbError(`event ${String(ev.type)} failed: ${String(err)}`);
           }
         }
       } catch (err) {
-        log(`event pump stopped: ${String(err)}`);
+        state.eventPumpAlive = false;
+        logDbError(`event pump stopped: ${String(err)}`);
       }
     })();
     void pump;
@@ -2076,7 +2538,7 @@ export default Plugin.define({
               rememberModel(state, String(event.sessionID), modelKey(event.model));
             }
           } catch (err) {
-            log(`http.request model attribution failed: ${String(err)}`);
+            logDbError(`http.request model attribution failed: ${String(err)}`);
           }
         }),
       );
@@ -2143,7 +2605,7 @@ export default Plugin.define({
           }),
           execute: async (input) => {
             const args = input as { weeks?: number; metric?: HeatMetric };
-            const weeks = Math.min(Math.max(args.weeks ?? cfg.heatmapWeeks, 1), 104);
+            const weeks = effectiveHeatmapWeeks(cfg, database(), Math.min(Math.max(args.weeks ?? cfg.heatmapWeeks, 1), 104));
             const metric = args.metric ?? cfg.heatmapMetric;
             try {
               return { content: heatmapText(database(), weeks, metric, cfg.includeBackground) };
@@ -2170,6 +2632,240 @@ export default Plugin.define({
             }
           },
         });
+
+        // E41 — stats_export
+        editor.add({
+          name: "stats_export",
+          description: "Export usage data as JSON or CSV for external analysis.",
+          input: z.object({
+            format: z.enum(["json", "csv"]).optional().describe("Output format (default json)"),
+            table: z.enum(["daily", "models", "tools", "sources"]).optional().describe("Table to export (default daily)"),
+            since: z.string().optional().describe('Start date (ISO date or "7d" for last 7 days)'),
+            to: z.string().optional().describe("End date (ISO date)"),
+          }),
+          execute: async (input) => {
+            const args = input as { format?: string; table?: string; since?: string; to?: string };
+            try {
+              const db = database();
+              const format = args.format ?? "json";
+              const table = args.table ?? "daily";
+              const sinceDay = parseDayKey(args.since);
+              const toDay = parseDayKey(args.to);
+
+              let rows: Array<Record<string, unknown>>;
+              if (table === "daily") {
+                let sql = "SELECT * FROM daily";
+                const params: unknown[] = [];
+                if (sinceDay) {
+                  sql += " WHERE day >= ?";
+                  params.push(sinceDay);
+                }
+                if (toDay) {
+                  sql += sinceDay ? " AND day <= ?" : " WHERE day <= ?";
+                  params.push(toDay);
+                }
+                sql += " ORDER BY day ASC";
+                rows = db.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+              } else if (table === "models") {
+                rows = db.prepare("SELECT * FROM model_totals ORDER BY model ASC").all() as Array<Record<string, unknown>>;
+              } else if (table === "tools") {
+                rows = db.prepare("SELECT * FROM tool_totals ORDER BY tool ASC").all() as Array<Record<string, unknown>>;
+              } else {
+                rows = db.prepare("SELECT * FROM sources ORDER BY source ASC").all() as Array<Record<string, unknown>>;
+              }
+
+              if (rows.length === 0) return { content: "No data to export." };
+
+              if (format === "csv") {
+                return { content: toCsv(rows) };
+              }
+              return { content: JSON.stringify(rows, null, 2) };
+            } catch (err) {
+              return { content: `stats_export failed: ${String(err)}` };
+            }
+          },
+        });
+
+        // E42 — stats_compare
+        editor.add({
+          name: "stats_compare",
+          description: "Compare current period vs previous period (week or month).",
+          input: z.object({
+            period: z.enum(["week", "month"]).optional().describe("Period to compare (default week)"),
+          }),
+          execute: async (input) => {
+            const args = input as { period?: string };
+            try {
+              const db = database();
+              const period = args.period ?? "week";
+              const days = period === "week" ? 7 : 30;
+
+              const now = new Date();
+              const currentStart = dayKey(shiftDays(now, -(days - 1)));
+              const currentEnd = dayKey(now);
+              const prevStart = dayKey(shiftDays(now, -(2 * days - 1)));
+              const prevEnd = dayKey(shiftDays(now, -days));
+
+              const currentRows = db
+                .prepare("SELECT * FROM daily WHERE day >= ? AND day <= ?")
+                .all(currentStart, currentEnd) as Array<Record<string, unknown>>;
+              const prevRows = db
+                .prepare("SELECT * FROM daily WHERE day >= ? AND day <= ?")
+                .all(prevStart, prevEnd) as Array<Record<string, unknown>>;
+
+              const sumTokens = (rows: Array<Record<string, unknown>>): number => {
+                let t = 0;
+                for (const r of rows) {
+                  t += num(r.input) + num(r.output) + num(r.reasoning) + num(r.cache_read) + num(r.cache_write);
+                }
+                return t;
+              };
+              const sumCost = (rows: Array<Record<string, unknown>>): number => {
+                let c = 0;
+                for (const r of rows) c += num(r.cost);
+                return c;
+              };
+              const sumCalls = (rows: Array<Record<string, unknown>>): number => {
+                let c = 0;
+                for (const r of rows) c += num(r.tool_calls);
+                return c;
+              };
+
+              const currentTokens = sumTokens(currentRows);
+              const prevTokens = sumTokens(prevRows);
+              const currentCost = sumCost(currentRows);
+              const prevCost = sumCost(prevRows);
+              const currentCalls = sumCalls(currentRows);
+              const prevCalls = sumCalls(prevRows);
+
+              const pctChange = (curr: number, prev: number): string => {
+                if (prev === 0) return curr === 0 ? "0%" : "+∞";
+                const pct = ((curr - prev) / prev) * 100;
+                return `${pct >= 0 ? "+" : ""}${pct.toFixed(1)}%`;
+              };
+
+              const lines = [
+                `Period comparison (${period})`,
+                `  current: ${currentStart} → ${currentEnd}`,
+                `  previous: ${prevStart} → ${prevEnd}`,
+                "",
+                `  tokens: ${fmtInt(currentTokens)} vs ${fmtInt(prevTokens)} (${pctChange(currentTokens, prevTokens)})`,
+                `  cost: ${fmtUsd(currentCost)} vs ${fmtUsd(prevCost)} (${pctChange(currentCost, prevCost)})`,
+                `  tool calls: ${fmtInt(currentCalls)} vs ${fmtInt(prevCalls)} (${pctChange(currentCalls, prevCalls)})`,
+              ];
+              return { content: lines.join("\n") };
+            } catch (err) {
+              return { content: `stats_compare failed: ${String(err)}` };
+            }
+          },
+        });
+
+        // E43 — stats_sessions
+        editor.add({
+          name: "stats_sessions",
+          description: "Per-session token and cost breakdown.",
+          input: z.object({
+            limit: z.number().int().positive().max(100).optional().describe("Max sessions (default 20)"),
+          }),
+          execute: async (input) => {
+            const args = input as { limit?: number };
+            const limit = Math.min(Math.max(args.limit ?? 20, 1), 100);
+            try {
+              const db = database();
+              // US-3: the old query joined session_state.updated_at (a day
+              // key) to the global `daily` rollup and printed that day's
+              // tool_calls/tool_ok/tool_fail as if they were the session's.
+              // The counters are now real: session_tools is written per call
+              // from recordToolCall and joined here (top N tools per session).
+              const rows = db
+                .prepare(
+                  `SELECT s.session_id, s.model, s.input, s.output, s.reasoning, s.cache_read, s.cache_write, s.cost, s.updated_at
+                   FROM session_state s
+                   ORDER BY s.cost DESC, s.session_id ASC
+                   LIMIT ?`,
+                )
+                .all(limit) as Array<Record<string, unknown>>;
+
+              if (rows.length === 0) return { content: "No sessions recorded yet." };
+
+              // One query for every listed session, grouped in JS — avoids a
+              // per-session query and keeps the join on the real counter table.
+              const ids = rows.map((r) => String(r.session_id));
+              const toolRows = db
+                .prepare(
+                  `SELECT session_id, tool, calls, ok, fail, duration_ms
+                     FROM session_tools
+                    WHERE session_id IN (${ids.map(() => "?").join(",")})
+                    ORDER BY session_id ASC, calls DESC, tool ASC`,
+                )
+                .all(...ids) as Array<Record<string, unknown>>;
+              const toolsBySession = new Map<string, Array<Record<string, unknown>>>();
+              for (const t of toolRows) {
+                const key = String(t.session_id);
+                const list = toolsBySession.get(key);
+                if (list) list.push(t);
+                else toolsBySession.set(key, [t]);
+              }
+              const TOP_TOOLS = 5;
+
+              const lines = [`Per-session breakdown (${rows.length} sessions)`];
+              for (const r of rows) {
+                const tokens =
+                  num(r.input) + num(r.output) + num(r.reasoning) + num(r.cache_read) + num(r.cache_write);
+                lines.push(
+                  `  ${String(r.session_id)}: tokens=${fmtInt(tokens)} cost=${fmtUsd(num(r.cost))} model=${String(r.model ?? "unknown")} updated=${String(r.updated_at)}`,
+                );
+                // US-3: this session's own tool calls, straight from
+                // session_tools — never the global daily rollup.
+                const tools = toolsBySession.get(String(r.session_id)) ?? [];
+                if (tools.length === 0) continue;
+                const totalCalls = tools.reduce((sum, t) => sum + num(t.calls), 0);
+                const shown = tools.slice(0, TOP_TOOLS).map(
+                  (t) =>
+                    `${String(t.tool)}×${fmtInt(num(t.calls))} [ok ${fmtInt(num(t.ok))}, fail ${fmtInt(num(t.fail))}, ${fmtInt(num(t.duration_ms))}ms]`,
+                );
+                if (tools.length > TOP_TOOLS) shown.push(`+${tools.length - TOP_TOOLS} more`);
+                lines.push(
+                  `    tools this session (${fmtInt(totalCalls)} calls): ${shown.join(", ")}`,
+                );
+              }
+              return { content: lines.join("\n") };
+            } catch (err) {
+              return { content: `stats_sessions failed: ${String(err)}` };
+            }
+          },
+        });
+
+        // E45 — stats_health
+        editor.add({
+          name: "stats_health",
+          description: "Health check: db path, size, last prune, pricing, pending calls, event subscription.",
+          input: z.object({}),
+          execute: async () => {
+            try {
+              database();
+              const dbPath = join(cfg.dir, DB_NAME);
+              let dbSize = 0;
+              try {
+                dbSize = statSync(dbPath).size;
+              } catch {
+                // db file may not exist yet
+              }
+
+              const lines = [
+                `db: ${dbPath}`,
+                `size: ${dbSize} bytes`,
+                `last prune: ${state.lastPruneMs > 0 ? new Date(state.lastPruneMs).toISOString() : "never"}`,
+                `pricing models: ${state.pricing.size}`,
+                `pending calls: ${state.pending.size}`,
+                `event subscription: ${state.eventPumpAlive ? "active" : "inactive"}`,
+              ];
+              return { content: lines.join("\n") };
+            } catch (err) {
+              return { content: `stats_health failed: ${String(err)}` };
+            }
+          },
+        });
       }),
     );
 
@@ -2184,8 +2880,8 @@ export default Plugin.define({
             try {
               const dash = renderDashboard(database(), cfg, app, state);
               state.dirty = false;
-              const opened = openInBrowser(dash.path);
-              log(`/stats refreshed ${dash.path} (${dash.bytes} bytes)${opened ? ", opened in browser" : ""}`);
+              const result = openInBrowser(dash.path);
+              log(`/stats refreshed ${dash.path} (${dash.bytes} bytes)${result.opened ? ", opened in browser" : `, open failed: ${result.error ?? "unknown"}`}`);
             } catch (err) {
               log(`/stats failed: ${String(err)}`);
             }
