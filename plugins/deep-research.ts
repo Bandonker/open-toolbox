@@ -771,6 +771,58 @@ function storeRun(db: AnyDatabase, row: RunRow): void {
   );
 }
 
+/** Filesystem-safe folder name for a topic. */
+function topicSlug(topic: string): string {
+  const slug = topic
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60)
+    .replace(/-+$/g, "");
+  return slug || "untitled";
+}
+
+/**
+ * Research lives under the project's docs/research/<topic>/, not in the plugin
+ * data dir, so findings sit next to the code they concern and can be committed.
+ * Every level is created on demand: the user should not have to pre-create
+ * docs/, research/, or the topic folder.
+ */
+function researchRoot(c: any): string {
+  const base = String(c.directory?.path ?? c.app?.path?.cwd ?? process.cwd());
+  return join(base, "docs", "research");
+}
+
+function topicDir(c: any, topic: string): string {
+  return join(researchRoot(c), topicSlug(topic));
+}
+
+const FINDINGS_FILE = "findings.md";
+const DELIBERATION_FILE = "deliberation.md";
+const REPORT_FILE = "report.md";
+
+function readIfExists(path: string): string | null {
+  try {
+    return existsSync(path) ? readFileSync(path, "utf8") : null;
+  } catch {
+    return null;
+  }
+}
+
+/** How many questions are already in a deliberation log. */
+function countQuestions(deliberation: string): number {
+  return (deliberation.match(/^### Q\d+:/gm) ?? []).length;
+}
+
+function appendDeliberation(c: any, topic: string, block: string): string {
+  const dir = topicDir(c, topic);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, DELIBERATION_FILE);
+  const existing = readIfExists(path);
+  writeFileSync(path, (existing ?? `# Deliberation: ${topic}\n\n`) + block, "utf8");
+  return path;
+}
+
 function writeReport(
   cfg: Config,
   runId: string,
@@ -811,6 +863,58 @@ function writeReport(
     }
     lines.push("");
   }
+  writeFileSync(path, lines.join("\n"), "utf8");
+  return path;
+}
+
+/**
+ * Write the same digest into the project's docs/research/<topic>/ as
+ * findings.md, creating docs/, research/ and the topic folder as needed.
+ */
+function writeTopicFindings(
+  c: any,
+  topic: string,
+  depth: Depth,
+  results: ChildResult[],
+  digest: string,
+  stats: { children: number; claims: number; rounds: number; failures: number; ms: number },
+): string {
+  const dir = topicDir(c, topic);
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, FINDINGS_FILE);
+  const lines: string[] = [
+    `# Findings: ${topic}`,
+    "",
+    `- depth: ${depth}`,
+    `- mode: ${stats.children > 0 ? `parallel (${stats.children} agents, ${stats.rounds} round(s))` : "inline"}`,
+    `- findings: ${stats.claims} (${stats.failures} agent failure(s))`,
+    `- generated: ${new Date().toISOString()}`,
+    "",
+    "## Findings",
+    "",
+    digest || "_No findings were returned._",
+    "",
+    "## Per-agent detail",
+    "",
+  ];
+  for (const r of results) {
+    lines.push(`### ${r.angle}`, "", `*Angle:* ${r.brief}`, "");
+    if (r.ok) {
+      if (r.summary) lines.push(r.summary, "");
+      for (const g of r.gaps) lines.push(`- gap: ${g}`);
+      if (!r.gaps.length) lines.push("- no gaps reported");
+    } else {
+      lines.push(`_Failed: ${r.error ?? "unknown"}_`);
+    }
+    lines.push("");
+  }
+  lines.push(
+    "---",
+    "",
+    "Ask follow-up questions with `deep_research_deliberate`; they and their answers are",
+    "recorded in deliberation.md. Then `deep_research_consolidate` merges both into report.md.",
+    "",
+  );
   writeFileSync(path, lines.join("\n"), "utf8");
   return path;
 }
@@ -973,6 +1077,9 @@ export default Plugin.define({
       };
 
       const reportPath = writeReport(cfg, runId, topic, depth, results, digest, stats);
+      // Also persist into the project so findings live next to the code, can be
+      // committed, and are readable for later deliberation.
+      const findingsPath = writeTopicFindings(c, topic, depth, results, digest, stats);
       const headline = `${unique} findings, ${conflicts} conflict(s), ${failures} failure(s)`;
       storeRun(getDb(), {
         id: runId,
@@ -1047,6 +1154,35 @@ export default Plugin.define({
                 reportPath: null,
                 summary: "inline (no child sessions)",
               });
+              // Create the topic folder and seed findings.md so deliberation
+              // works for inline runs too — otherwise there is nothing on disk
+              // to question.
+              const dir = topicDir(c, topic);
+              mkdirSync(dir, { recursive: true });
+              const n = budgetAngleCount(depth);
+              writeFileSync(
+                join(dir, FINDINGS_FILE),
+                [
+                  "# Findings: " + topic,
+                  "",
+                  "- depth: " + depth,
+                  "- mode: inline (researched in this session, no child agents)",
+                  "- generated: " + new Date().toISOString(),
+                  "",
+                  "## Angles covered",
+                  "",
+                  ...ANGLES.slice(0, n).map((a, i) => (i + 1) + ". **" + a.id + "** — " + a.brief),
+                  "",
+                  "## Findings",
+                  "",
+                  "_Pending: the answer for this topic has not been written to this file yet._",
+                  "",
+                  "Ask follow-up questions with `deep_research_deliberate`; they and their answers are",
+                  "recorded in deliberation.md. Then `deep_research_consolidate` merges both into report.md.",
+                  "",
+                ].join("\n"),
+                "utf8",
+              );
               await c.session.prompt({ sessionID: parentID, text: inlineBrief(topic, depth) });
               return {
                 content: [
@@ -1093,6 +1229,151 @@ export default Plugin.define({
               log(`failed: ${String(err)}`);
               return { content: `deep_research failed: ${String(err)}` };
             }
+          },
+        });
+
+        editor.add({
+          name: "deep_research_deliberate",
+          description:
+            "Ask a follow-up question about a research topic. The question is recorded in the topic folder and answered against the stored findings; record the answer with deep_research_answer so the discussion accumulates.",
+          input: z.object({
+            topic: z.string().min(3).describe("The research topic, matching the original run"),
+            question: z.string().min(3).describe("What you want to know about the findings"),
+          }),
+          execute: async (input: any, toolCtx: any) => {
+            const topic = String(input.topic ?? "").trim();
+            const question = String(input.question ?? "").trim();
+            const dir = topicDir(c, topic);
+            const findings = readIfExists(join(dir, FINDINGS_FILE));
+            if (!findings) {
+              return {
+                content:
+                  'No findings for "' +
+                  topic +
+                  '" at ' +
+                  join(dir, FINDINGS_FILE) +
+                  ". Run deep_research for this topic first.",
+              };
+            }
+            const n = countQuestions(readIfExists(join(dir, DELIBERATION_FILE)) ?? "");
+            appendDeliberation(c, topic, "### Q" + (n + 1) + ": " + question + "\n\n_(awaiting answer)_\n\n");
+            await c.session.prompt({
+              sessionID: toolCtx.sessionID,
+              text: [
+                "The user is questioning the deep-research findings on: " + topic,
+                "",
+                "Their question:",
+                question,
+                "",
+                "Answer it from the findings below. Where the findings do not settle it, say so and say",
+                "what would settle it. Do not fill the gap with recall presented as evidence.",
+                "",
+                "Then record your answer with:",
+                "deep_research_answer({ topic: " +
+                  JSON.stringify(topic) +
+                  ", question: " +
+                  JSON.stringify(question) +
+                  ', answer: "<your answer>" })',
+                "",
+                "--- findings.md ---",
+                findings,
+              ].join("\n"),
+            });
+            return {
+              content:
+                "Question recorded as Q" +
+                (n + 1) +
+                " in " +
+                join(dir, DELIBERATION_FILE) +
+                " and sent to this session for answering.",
+            };
+          },
+        });
+
+        editor.add({
+          name: "deep_research_answer",
+          description:
+            "Record the answer to a deep_research_deliberate question, so the Q&A lands in the topic folder.",
+          input: z.object({ topic: z.string().min(3), question: z.string().min(3), answer: z.string().min(1) }),
+          execute: async (input: any) => {
+            const topic = String(input.topic ?? "").trim();
+            const question = String(input.question ?? "").trim();
+            const answer = String(input.answer ?? "").trim();
+            const path = join(topicDir(c, topic), DELIBERATION_FILE);
+            const existing = readIfExists(path);
+            if (existing === null) {
+              return { content: "No deliberation log for " + topic + " at " + path + "." };
+            }
+            const idx = existing.indexOf(question);
+            if (idx >= 0) {
+              // Replace the placeholder under the matching question heading.
+              const head = existing.lastIndexOf("### Q", idx);
+              const after = existing.indexOf("_(awaiting answer)_", idx);
+              if (head >= 0 && after >= 0) {
+                const end = after + "_(awaiting answer)_".length;
+                const updated = existing.slice(0, after) + answer + existing.slice(end);
+                writeFileSync(path, updated, "utf8");
+                return { content: "Answer recorded in " + path + "." };
+              }
+            }
+            writeFileSync(path, existing + "\n" + answer + "\n\n", "utf8");
+            return { content: "Answer appended to " + path + "." };
+          },
+        });
+
+        editor.add({
+          name: "deep_research_consolidate",
+          description:
+            "Merge a topic's findings and its deliberation Q&A into one report.md in the topic folder. Send the brief, then write the file with deep_research_write_report.",
+          input: z.object({ topic: z.string().min(3) }),
+          execute: async (input: any, toolCtx: any) => {
+            const topic = String(input.topic ?? "").trim();
+            const dir = topicDir(c, topic);
+            const findings = readIfExists(join(dir, FINDINGS_FILE));
+            if (!findings) {
+              return { content: "No findings for " + topic + " at " + join(dir, FINDINGS_FILE) + "." };
+            }
+            const deliberation = readIfExists(join(dir, DELIBERATION_FILE)) ?? "_No questions asked yet._";
+            await c.session.prompt({
+              sessionID: toolCtx.sessionID,
+              text: [
+                'Consolidate the deep research on "' + topic + '" into a single report.',
+                "",
+                "Write it with:",
+                "deep_research_write_report({ topic: " +
+                  JSON.stringify(topic) +
+                  ', report: "<the full markdown report>" })',
+                "",
+                "Fold the answers into the narrative rather than appending a Q&A appendix. Where the",
+                "findings and a later answer disagree, show the disagreement. End with what is still open.",
+                "",
+                "--- findings.md ---",
+                findings,
+                "",
+                "--- deliberation.md ---",
+                deliberation,
+              ].join("\n"),
+            });
+            return {
+              content:
+                "Consolidation brief sent to this session. Write the result with deep_research_write_report.",
+            };
+          },
+        });
+
+        editor.add({
+          name: "deep_research_write_report",
+          description: "Write the consolidated report.md for a research topic.",
+          input: z.object({ topic: z.string().min(3), report: z.string().min(20) }),
+          execute: async (input: any) => {
+            const topic = String(input.topic ?? "").trim();
+            const report = String(input.report ?? "").trim();
+            const dir = topicDir(c, topic);
+            mkdirSync(dir, { recursive: true });
+            const path = join(dir, REPORT_FILE);
+            const body = report.startsWith("#") ? report : "# Research report: " + topic + "\n\n" + report;
+            writeFileSync(path, body.endsWith("\n") ? body : body + "\n", "utf8");
+            return { content: "Report written to " + path + "." };
           },
         });
 

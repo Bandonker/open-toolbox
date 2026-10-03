@@ -156,6 +156,41 @@ if (commands.has("deep-research")) {
   check("command handles no topic", noTopic.includes("no topic"));
 }
 
+
+/* ---------------------------------------------- docs/research topic folders */
+
+const TOPIC = "test topic for deep research";
+const deliberate = await byName.get("deep_research_deliberate").execute(
+  { topic: TOPIC, question: "is quantization actually reliable?" },
+  toolCtx,
+);
+check("deliberate works after a parallel run", /Question recorded as Q1/.test(deliberate.content), deliberate.content.split("\n")[0]);
+
+const answerRes = await byName.get("deep_research_answer").execute(
+  { topic: TOPIC, question: "is quantization actually reliable?", answer: "Contested; sources disagree." },
+  toolCtx,
+);
+check("answer is recorded", /recorded|appended/i.test(answerRes.content), answerRes.content);
+
+check("deliberate rejects an unknown topic", /No findings/.test((await byName.get("deep_research_deliberate").execute({ topic: "never researched topic at all", question: "why" }, toolCtx)).content));
+
+await byName.get("deep_research_consolidate").execute({ topic: TOPIC }, toolCtx);
+const wrote = await byName.get("deep_research_write_report").execute(
+  { topic: TOPIC, report: "# Research report\n\nConsolidated body that is definitely long enough." },
+  toolCtx,
+);
+check("consolidated report is written to the topic folder", /report\.md/.test(wrote.content), wrote.content);
+
+// The topic folder must have been created under <project>/docs/research/<slug>/.
+const projDir = process.env.OPENCODE_DEEP_RESEARCH_TEST_PROJECT ?? sandbox;
+const slug = "test-topic-for-deep-research";
+const topicFolder = join(projDir, "docs", "research", slug);
+check("docs/research/<topic>/ was created on demand", existsSync(topicFolder), topicFolder);
+check("findings.md lives in the topic folder", existsSync(join(topicFolder, "findings.md")));
+check("deliberation.md holds the question", /quantization actually reliable/.test(readFileSync(join(topicFolder, "deliberation.md"), "utf8")));
+check("the awaiting placeholder was replaced by the answer", /Contested; sources disagree/.test(readFileSync(join(topicFolder, "deliberation.md"), "utf8")));
+check("report.md lives in the topic folder", existsSync(join(topicFolder, "report.md")));
+
 rmSync(sandbox, { recursive: true, force: true });
 const failed = results.filter((r) => !r.ok).length;
 console.log(`\n${results.length - failed}/${results.length} checks passed`);
