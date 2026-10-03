@@ -1829,12 +1829,221 @@ function resolveConfig(options: Record<string, unknown> | undefined): PlanConfig
 
 /* --------------------------------------------------------------- rendering */
 
+/* Derived aggregates.
+ *
+ * statusText, metricsText, buildReminder, buildPrompt and evaluate() all walk
+ * st.steps/st.risks/st.criteria/st.childSessions to recompute the same handful
+ * of counts. metricsText alone did six full st.steps.filter passes, and one
+ * turn asking for `/plan status` twice (or a context event plus a command)
+ * re-walked every array on each call. Compute them in a single pass and memoise
+ * behind st.updatedAt — the same change token save() and evaluate() already
+ * dedupe on — so repeated reads inside one turn cost one pass.
+ *
+ * Only values that are a pure function of the plan data are cached. Anything
+ * derived from the current clock (elapsed minutes, in-flight durations, plan
+ * age) is recomputed per call from the cached startedAt lists, so a stale
+ * reading can never leak into the output.
+ *
+ * No timers and no debounce: the cache is a WeakMap keyed by the live PlanState,
+ * so it is purely synchronous, always consistent with whatever state the caller
+ * holds, and a cleared or discarded plan is collected with its entry. */
+type PlanAggregates = {
+  /* steps */
+  total: number;
+  completed: number;
+  inProgress: number;
+  pending: number;
+  skipped: number;
+  failed: number;
+  /** complete + skipped — the "how far along" figure used for stuck detection */
+  done: number;
+  /** Math.round(completed / total * 100), 0 when the plan has no steps */
+  pct: number;
+  /** first step still pending or in progress, else undefined */
+  nextPending: PlanStep | undefined;
+  /** sum of estimatedDurationMin over every step */
+  totalEstimatedMin: number;
+  /** earliest startedAt across every step, else undefined */
+  firstStepStart: number | undefined;
+  /** complete steps whose duration is fully settled (startedAt + completedAt) */
+  settledCompletedCount: number;
+  settledCompletedMs: number;
+  /** complete steps missing completedAt — their duration needs the clock */
+  looseCompletedStartedAt: number[];
+  /** summed per-step rounded minutes for steps that have a completedAt */
+  settledActualMin: number;
+  /** startedAt of steps still in flight (started, no completedAt) */
+  runningStartedAt: number[];
+  /* risks */
+  riskTotal: number;
+  risksMitigated: number;
+  risksOccurred: number;
+  risksOpen: number;
+  risksAccepted: number;
+  /** highest riskScore across open risks, 0 when nothing is open */
+  maxOpenRiskScore: number;
+  /** open risks scoring >= 8 (high or critical) */
+  openHighRisks: Risk[];
+  /* success criteria */
+  criteriaTotal: number;
+  criteriaPassing: number;
+  criteriaFailing: number;
+  criteriaPending: number;
+  criteriaUnverifiable: number;
+  /* child sessions */
+  childTotal: number;
+  childCompleted: number;
+  childFailed: number;
+  childRunning: number;
+};
+
+function computeAggregates(st: PlanState): PlanAggregates {
+  let completed = 0;
+  let inProgress = 0;
+  let pending = 0;
+  let skipped = 0;
+  let failed = 0;
+  let totalEstimatedMin = 0;
+  let firstStepStart: number | undefined;
+  let settledCompletedCount = 0;
+  let settledCompletedMs = 0;
+  let settledActualMin = 0;
+  let nextPending: PlanStep | undefined;
+  const looseCompletedStartedAt: number[] = [];
+  const runningStartedAt: number[] = [];
+
+  for (const s of st.steps) {
+    switch (s.status) {
+      case "complete":
+        completed++;
+        break;
+      case "in_progress":
+        inProgress++;
+        break;
+      case "pending":
+        pending++;
+        break;
+      case "skipped":
+        skipped++;
+        break;
+      case "failed":
+        failed++;
+        break;
+      default:
+        break;
+    }
+    if (nextPending === undefined && (s.status === "pending" || s.status === "in_progress")) {
+      nextPending = s;
+    }
+    totalEstimatedMin += s.estimatedDurationMin ?? 0;
+    if (s.startedAt) {
+      if (firstStepStart === undefined || s.startedAt < firstStepStart) firstStepStart = s.startedAt;
+      if (s.completedAt !== undefined) {
+        settledActualMin += Math.max(0, Math.round((s.completedAt - s.startedAt) / 60000));
+        if (s.status === "complete") {
+          settledCompletedCount++;
+          settledCompletedMs += Math.max(0, s.completedAt - s.startedAt);
+        }
+      } else {
+        runningStartedAt.push(s.startedAt);
+        if (s.status === "complete") looseCompletedStartedAt.push(s.startedAt);
+      }
+    }
+  }
+
+  let risksMitigated = 0;
+  let risksOccurred = 0;
+  let risksOpen = 0;
+  let risksAccepted = 0;
+  let maxOpenRiskScore = 0;
+  const openHighRisks: Risk[] = [];
+  for (const r of st.risks) {
+    if (r.status === "mitigated") risksMitigated++;
+    else if (r.status === "realized") risksOccurred++;
+    else if (r.status === "accepted") risksAccepted++;
+    else if (r.status === "open") {
+      risksOpen++;
+      const score = riskScore(r);
+      if (score > maxOpenRiskScore) maxOpenRiskScore = score;
+      if (score >= 8) openHighRisks.push(r);
+    }
+  }
+
+  let criteriaPassing = 0;
+  let criteriaFailing = 0;
+  let criteriaPending = 0;
+  let criteriaUnverifiable = 0;
+  for (const c of st.criteria) {
+    if (c.status === "passing") criteriaPassing++;
+    else if (c.status === "failing") criteriaFailing++;
+    else if (c.status === "pending") criteriaPending++;
+    else if (c.status === "unverifiable") criteriaUnverifiable++;
+  }
+
+  let childCompleted = 0;
+  let childFailed = 0;
+  let childRunning = 0;
+  for (const cs of st.childSessions) {
+    if (cs.status === "completed") childCompleted++;
+    else if (cs.status === "failed") childFailed++;
+    else if (cs.status === "running" || cs.status === "pending") childRunning++;
+  }
+
+  const total = st.steps.length;
+  return {
+    total,
+    completed,
+    inProgress,
+    pending,
+    skipped,
+    failed,
+    done: completed + skipped,
+    pct: total > 0 ? Math.round((completed / total) * 100) : 0,
+    nextPending,
+    totalEstimatedMin,
+    firstStepStart,
+    settledCompletedCount,
+    settledCompletedMs,
+    looseCompletedStartedAt,
+    settledActualMin,
+    runningStartedAt,
+    riskTotal: st.risks.length,
+    risksMitigated,
+    risksOccurred,
+    risksOpen,
+    risksAccepted,
+    maxOpenRiskScore,
+    openHighRisks,
+    criteriaTotal: st.criteria.length,
+    criteriaPassing,
+    criteriaFailing,
+    criteriaPending,
+    criteriaUnverifiable,
+    childTotal: st.childSessions.length,
+    childCompleted,
+    childFailed,
+    childRunning,
+  };
+}
+
+const aggregatesCache = new WeakMap<PlanState, { key: string; agg: PlanAggregates }>();
+
+function aggregatesOf(st: PlanState): PlanAggregates {
+  // st.updatedAt is the plan's change token (every mutating tool bumps it).
+  // The array lengths ride along so a step/risk/criterion/child added in the
+  // same Date.now() millisecond as the previous bump still invalidates.
+  const key = `${st.updatedAt}|${st.steps.length}|${st.risks.length}|${st.criteria.length}|${st.childSessions.length}`;
+  const hit = aggregatesCache.get(st);
+  if (hit && hit.key === key) return hit.agg;
+  const agg = computeAggregates(st);
+  aggregatesCache.set(st, { key, agg });
+  return agg;
+}
+
 function statusText(st: PlanState): string {
   const now = Date.now();
   const elapsedMin = Math.max(0, Math.round((now - st.createdAt) / 60000));
-  const completed = st.steps.filter((s) => s.status === "complete").length;
-  const total = st.steps.length;
-  const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+  const { completed, total, pct } = aggregatesOf(st);
 
   const lines = [
     `${MARK} Plan (${STATUS_LABEL[st.status]})`,
@@ -2085,19 +2294,14 @@ function costText(st: PlanState): string {
 
 function metricsText(st: PlanState): string {
   const now = Date.now();
+  const a = aggregatesOf(st);
   const lines: string[] = [
     `${MARK} Plan Metrics & Analytics`,
     ``,
   ];
 
   // --- Step counts ---
-  const total = st.steps.length;
-  const completed = st.steps.filter((s) => s.status === "complete").length;
-  const inProgress = st.steps.filter((s) => s.status === "in_progress").length;
-  const pending = st.steps.filter((s) => s.status === "pending").length;
-  const skipped = st.steps.filter((s) => s.status === "skipped").length;
-  const failed = st.steps.filter((s) => s.status === "failed").length;
-  const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+  const { total, completed, inProgress, pending, skipped, failed, pct } = a;
 
   lines.push(`## Steps`);
   lines.push(`  Total:     ${total}`);
@@ -2110,32 +2314,20 @@ function metricsText(st: PlanState): string {
   lines.push(``);
 
   // --- Duration ---
-  const completedSteps = st.steps.filter((s) => s.status === "complete" && s.startedAt);
+  // Settled durations come from the cache; only the still-running steps and the
+  // rare complete-without-completedAt ones need the current clock.
+  const completedStepCount = a.settledCompletedCount + a.looseCompletedStartedAt.length;
+  let completedDurationMs = a.settledCompletedMs;
+  for (const startedAt of a.looseCompletedStartedAt) completedDurationMs += Math.max(0, now - startedAt);
   const avgDurationMin =
-    completedSteps.length > 0
-      ? Math.round(
-          (completedSteps.reduce((sum, s) => {
-            const end = s.completedAt ?? now;
-            return sum + Math.max(0, end - (s.startedAt ?? end));
-          }, 0) /
-            completedSteps.length /
-            60000) *
-            10,
-        ) / 10
-      : 0;
+    completedStepCount > 0 ? Math.round((completedDurationMs / completedStepCount / 60000) * 10) / 10 : 0;
 
-  const totalEstimatedMin = st.steps.reduce(
-    (sum, s) => sum + (s.estimatedDurationMin ?? 0),
-    0,
-  );
-  const totalActualMin = st.steps.reduce((sum, s) => {
-    if (!s.startedAt) return sum;
-    const end = s.completedAt ?? now;
-    return sum + Math.max(0, Math.round((end - s.startedAt) / 60000));
-  }, 0);
+  const totalEstimatedMin = a.totalEstimatedMin;
+  let totalActualMin = a.settledActualMin;
+  for (const startedAt of a.runningStartedAt) totalActualMin += Math.max(0, Math.round((now - startedAt) / 60000));
 
   lines.push(`## Duration`);
-  lines.push(`  Avg step duration: ${avgDurationMin} min (${completedSteps.length} completed steps)`);
+  lines.push(`  Avg step duration: ${avgDurationMin} min (${completedStepCount} completed steps)`);
   lines.push(`  Total estimated:  ${totalEstimatedMin} min`);
   lines.push(`  Total actual:     ${totalActualMin} min`);
   if (totalEstimatedMin > 0) {
@@ -2174,56 +2366,35 @@ function metricsText(st: PlanState): string {
   lines.push(``);
 
   // --- Child sessions ---
-  const childTotal = st.childSessions.length;
-  const childCompleted = st.childSessions.filter((cs) => cs.status === "completed").length;
-  const childFailed = st.childSessions.filter((cs) => cs.status === "failed").length;
-  const childRunning = st.childSessions.filter((cs) => cs.status === "running" || cs.status === "pending").length;
-
   lines.push(`## Child Sessions`);
-  lines.push(`  Spawned:   ${childTotal}`);
-  lines.push(`  Completed: ${childCompleted}`);
-  lines.push(`  Running:   ${childRunning}`);
-  lines.push(`  Failed:    ${childFailed}`);
+  lines.push(`  Spawned:   ${a.childTotal}`);
+  lines.push(`  Completed: ${a.childCompleted}`);
+  lines.push(`  Running:   ${a.childRunning}`);
+  lines.push(`  Failed:    ${a.childFailed}`);
   lines.push(``);
 
   // --- Risks ---
-  const risksIdentified = st.risks.length;
-  const risksMitigated = st.risks.filter((r) => r.status === "mitigated").length;
-  const risksOccurred = st.risks.filter((r) => r.status === "realized").length;
-  const risksOpen = st.risks.filter((r) => r.status === "open").length;
-  const risksAccepted = st.risks.filter((r) => r.status === "accepted").length;
-
   lines.push(`## Risks`);
-  lines.push(`  Identified: ${risksIdentified}`);
-  lines.push(`  Mitigated:  ${risksMitigated}`);
-  lines.push(`  Occurred:   ${risksOccurred}`);
-  lines.push(`  Open:       ${risksOpen}`);
-  lines.push(`  Accepted:   ${risksAccepted}`);
+  lines.push(`  Identified: ${a.riskTotal}`);
+  lines.push(`  Mitigated:  ${a.risksMitigated}`);
+  lines.push(`  Occurred:   ${a.risksOccurred}`);
+  lines.push(`  Open:       ${a.risksOpen}`);
+  lines.push(`  Accepted:   ${a.risksAccepted}`);
   lines.push(``);
 
   // --- Success criteria ---
-  const criteriaTotal = st.criteria.length;
-  const criteriaPassed = st.criteria.filter((c) => c.status === "passing").length;
-  const criteriaFailed = st.criteria.filter((c) => c.status === "failing").length;
-  const criteriaPending = st.criteria.filter((c) => c.status === "pending").length;
-  const criteriaUnverifiable = st.criteria.filter((c) => c.status === "unverifiable").length;
-
   lines.push(`## Success Criteria`);
-  lines.push(`  Defined:      ${criteriaTotal}`);
-  lines.push(`  Passed:       ${criteriaPassed}`);
-  lines.push(`  Failed:       ${criteriaFailed}`);
-  lines.push(`  Pending:      ${criteriaPending}`);
-  lines.push(`  Unverifiable: ${criteriaUnverifiable}`);
+  lines.push(`  Defined:      ${a.criteriaTotal}`);
+  lines.push(`  Passed:       ${a.criteriaPassing}`);
+  lines.push(`  Failed:       ${a.criteriaFailing}`);
+  lines.push(`  Pending:      ${a.criteriaPending}`);
+  lines.push(`  Unverifiable: ${a.criteriaUnverifiable}`);
   lines.push(``);
 
   // --- Time ---
   const planAgeMs = now - st.createdAt;
   const planAgeMin = Math.round((planAgeMs / 60000) * 10) / 10;
-  const firstStepStart = st.steps.reduce<number | undefined>((earliest, s) => {
-    if (!s.startedAt) return earliest;
-    if (earliest === undefined || s.startedAt < earliest) return s.startedAt;
-    return earliest;
-  }, undefined);
+  const firstStepStart = a.firstStepStart;
   const executionTimeMin =
     firstStepStart !== undefined ? Math.round(((now - firstStepStart) / 60000) * 10) / 10 : 0;
 
@@ -2284,9 +2455,14 @@ function optimizeText(st: PlanState): string {
   } else {
     // 1. Steps with high token usage relative to description length
     const avgDescLen = st.steps.reduce((sum, s) => sum + s.description.length, 0) / st.steps.length;
-    const longSteps = st.steps.filter((s) => s.description.length > avgDescLen * 2);
-    if (longSteps.length > 0) {
-      const stepNums = longSteps.map((s) => `Step ${st.steps.indexOf(s) + 1}`).join(", ");
+    // Indexed collection: indexOf() inside a map() is O(n) per element, which
+    // made this whole report O(n^2) on long plans.
+    const longStepNums: number[] = [];
+    for (let i = 0; i < st.steps.length; i++) {
+      if (st.steps[i].description.length > avgDescLen * 2) longStepNums.push(i + 1);
+    }
+    if (longStepNums.length > 0) {
+      const stepNums = longStepNums.map((n) => `Step ${n}`).join(", ");
       recommendations.push(
         `Steps with unusually long descriptions (${stepNums}) — consider splitting into smaller, more focused steps to reduce per-step token overhead.`,
       );
@@ -2339,22 +2515,28 @@ function optimizeText(st: PlanState): string {
     }
 
     // 4. Steps with low confidence that might need re-planning
-    const lowConfSteps = st.steps.filter((s) => s.confidence === "low");
-    if (lowConfSteps.length > 0) {
-      const stepNums = lowConfSteps.map((s) => `Step ${st.steps.indexOf(s) + 1}`).join(", ");
+    const lowConfStepNums: number[] = [];
+    for (let i = 0; i < st.steps.length; i++) {
+      if (st.steps[i].confidence === "low") lowConfStepNums.push(i + 1);
+    }
+    if (lowConfStepNums.length > 0) {
+      const stepNums = lowConfStepNums.map((n) => `Step ${n}`).join(", ");
       recommendations.push(
         `Steps with low confidence (${stepNums}) — consider re-planning before execution to avoid costly retries.`,
       );
-      potentialSavingsTokens += lowConfSteps.length * 1000;
-      potentialSavingsCost += lowConfSteps.length * 0.02;
+      potentialSavingsTokens += lowConfStepNums.length * 1000;
+      potentialSavingsCost += lowConfStepNums.length * 0.02;
     }
 
     // 5. Skipped steps that might be unnecessary
-    const skippedSteps = st.steps.filter((s) => s.status === "skipped");
-    if (skippedSteps.length > 0) {
-      const stepNums = skippedSteps.map((s) => `Step ${st.steps.indexOf(s) + 1}`).join(", ");
+    const skippedStepNums: number[] = [];
+    for (let i = 0; i < st.steps.length; i++) {
+      if (st.steps[i].status === "skipped") skippedStepNums.push(i + 1);
+    }
+    if (skippedStepNums.length > 0) {
+      const stepNums = skippedStepNums.map((n) => `Step ${n}`).join(", ");
       recommendations.push(
-        `${skippedSteps.length} step(s) were skipped (${stepNums}) — consider removing them from the plan to reduce clutter.`,
+        `${skippedStepNums.length} step(s) were skipped (${stepNums}) — consider removing them from the plan to reduce clutter.`,
       );
     }
   }
@@ -3333,8 +3515,8 @@ function risksText(st: PlanState): string {
     return `${MARK} No risks identified yet. Use plan_add_risk to add risks.`;
   }
   const sorted = [...st.risks].sort((a, b) => riskScore(b) - riskScore(a));
-  const open = st.risks.filter((r) => r.status === "open");
-  const highRisk = open.filter((r) => riskScore(r) >= 8);
+  const agg = aggregatesOf(st);
+  const openCount = agg.risksOpen;
   const lines: string[] = [
     `${MARK} Risk Matrix`,
     ``,
@@ -3359,15 +3541,15 @@ function risksText(st: PlanState): string {
     lines.push(`  ${lik}    ${cells.join(" ")}`);
   }
   lines.push(``, `Legend: C=critical(15-25) H=high(8-14) M=medium(4-7) L=low(1-3) ·=empty`);
-  if (highRisk.length > 0) {
+  if (agg.openHighRisks.length > 0) {
     lines.push(``, `HIGH-RISK ITEMS (score >= 8):`);
-    for (const r of highRisk) {
+    for (const r of agg.openHighRisks) {
       lines.push(`  [${riskScore(r)}] ${r.description}`);
       if (r.mitigation) lines.push(`    Mitigation: ${r.mitigation}`);
       if (r.contingency) lines.push(`    Contingency: ${r.contingency}`);
     }
   }
-  lines.push(``, `ALL RISKS (${st.risks.length} total, ${open.length} open):`);
+  lines.push(``, `ALL RISKS (${st.risks.length} total, ${openCount} open):`);
   for (const r of sorted) {
     const score = riskScore(r);
     const statusMark = r.status === "mitigated" ? "✓" : r.status === "accepted" ? "○" : r.status === "realized" ? "✗" : "·";
@@ -4082,24 +4264,64 @@ function performRollback(st: PlanState, toStep?: number): string {
   return lines.join("\n");
 }
 
-function rollbackText(st: PlanState, toStep?: number): string {
-  return performRollback(st, toStep);
+/* Rendered-view memo.
+ *
+ * buildReminder runs on every context event and buildPrompt on every kickoff /
+ * resume, and each one re-serialised the whole plan (steps, risks, research,
+ * approvals, checkpoints) into a fresh string — repeatedly, for a plan that had
+ * not changed between two events. Both are pure functions of the plan state, so
+ * the rendered text is cached against the same change token the aggregates use
+ * and rebuilt only when the plan actually moves.
+ *
+ * buildPrompt additionally varies with its options, so those fold into the key.
+ * Caching the finished string keeps this synchronous: nothing is deferred and
+ * no timer is introduced, so a kick that renders once renders identically on a
+ * retry. The WeakMap keys are live PlanState objects, so clearing a plan drops
+ * its rendered text with it. */
+const renderCache = new WeakMap<PlanState, { key: string; text: string }>();
+
+function cachedRender(st: PlanState, key: string, render: () => string): string {
+  const hit = renderCache.get(st);
+  if (hit && hit.key === key) return hit.text;
+  const text = render();
+  renderCache.set(st, { key, text });
+  return text;
+}
+
+/* Every mutation funnels through save(), so that is the one place a derived
+ * view can be dropped. st.updatedAt alone is not a sufficient change token:
+ * Date.now() only has millisecond resolution, so two mutations landing in the
+ * same millisecond (a risk status flip plus a step edit, or two rapid tool
+ * calls) leave updatedAt untouched while the underlying data moved. The view
+ * keys above compare updatedAt *and* the array lengths, but a pure status
+ * change alters no length, so the memo would serve a stale count. Bumping here
+ * covers every mutating path and is conservative in the safe direction: a save
+ * that changed nothing merely costs one recompute. WeakMap.delete keeps a
+ * cleared plan's entries collectable and introduces no timer. */
+function invalidateViews(st: PlanState): void {
+  aggregatesCache.delete(st);
+  renderCache.delete(st);
+}
+
+function renderKey(st: PlanState, suffix = ""): string {
+  return `${st.updatedAt}|${st.steps.length}|${st.risks.length}|${st.criteria.length}|${st.childSessions.length}${suffix}`;
 }
 
 function buildReminder(st: PlanState): string {
-  const completed = st.steps.filter((s) => s.status === "complete").length;
-  const total = st.steps.length;
+  return cachedRender(st, renderKey(st), () => renderReminder(st));
+}
+
+function renderReminder(st: PlanState): string {
+  const a = aggregatesOf(st);
+  const { completed, total } = a;
   const lines = [
     "ACTIVE PLAN — keep working until it is complete.",
     `Task: ${st.task}`,
     `Status: ${STATUS_LABEL[st.status]}`,
   ];
   if (total > 0) lines.push(`Progress: ${completed}/${total} steps complete`);
-  if (st.status === "executing") {
-    const pending = st.steps.filter((s) => s.status === "pending" || s.status === "in_progress");
-    if (pending.length > 0) {
-      lines.push(`Next: ${pending[0].description}`);
-    }
+  if (st.status === "executing" && a.nextPending) {
+    lines.push(`Next: ${a.nextPending.description}`);
   }
   if (st.childSessions.length > 0) lines.push(`Child sessions: ${st.childSessions.map((cs) => `${cs.sessionID} (${cs.status})`).join(", ")}`);
   if (st.costEstimate) {
@@ -4115,12 +4337,12 @@ function buildReminder(st: PlanState): string {
   } else if (st.approvalStatus === "rejected") {
     lines.push("Approval: rejected — revise the plan");
   }
-  if (st.risks.length > 0) {
-    const openHigh = st.risks.filter((r) => r.status === "open" && riskScore(r) >= 8);
+  if (a.riskTotal > 0) {
+    const openHigh = a.openHighRisks;
     if (openHigh.length > 0) {
       lines.push(`Risks: ${openHigh.length} high-risk open — ${openHigh.map((r) => r.description).join("; ")}`);
     } else {
-      lines.push(`Risks: ${st.risks.filter((r) => r.status === "open").length} open`);
+      lines.push(`Risks: ${a.risksOpen} open`);
     }
   }
   if (st.research && st.research.length > 0) {
@@ -4157,6 +4379,19 @@ function buildReminder(st: PlanState): string {
 }
 
 function buildPrompt(
+  st: PlanState,
+  opts: { kickoff?: boolean; note?: string; resume?: boolean } = {},
+): string {
+  // A one-off note is baked into the rendered text, so those calls skip the
+  // cache entirely rather than growing the key with arbitrary caller text.
+  const cacheable = !opts.note;
+  const render = (): string => renderPrompt(st, opts);
+  if (!cacheable) return render();
+  const flags = `${opts.kickoff ? 1 : 0}${opts.resume ? 1 : 0}`;
+  return cachedRender(st, renderKey(st, `|${flags}`), render);
+}
+
+function renderPrompt(
   st: PlanState,
   opts: { kickoff?: boolean; note?: string; resume?: boolean } = {},
 ): string {
@@ -4297,7 +4532,6 @@ export default Plugin.define({
     const live = new Map<string, PlanState>();
     const loading = new Map<string, Promise<PlanState | undefined>>();
     const inFlight = new Set<string>();
-    const toolActivity = new Set<string>();
     const evaluateIterations = new Map<string, number>();
     const consecutiveProgress = new Map<string, number>();
     const stuckIterations = new Map<string, number>();
@@ -4319,7 +4553,6 @@ export default Plugin.define({
       stuckIterations.delete(sessionID);
       contextReminderCount.delete(sessionID);
       criteriaNudgeSent.delete(sessionID);
-      toolActivity.delete(sessionID);
       lastEvaluatedUpdatedAt.delete(sessionID);
     };
     const MAX_SESSION_STATES = 500;
@@ -4338,11 +4571,6 @@ export default Plugin.define({
         const oldest = loading.keys().next();
         if (oldest.done) break;
         loading.delete(oldest.value as string);
-      }
-      while (toolActivity.size > MAX_SESSION_STATES) {
-        const oldest = toolActivity.values().next();
-        if (oldest.done) break;
-        toolActivity.delete(oldest.value);
       }
     };
     const disposers: Array<() => void | Promise<void>> = [];
@@ -4432,6 +4660,10 @@ export default Plugin.define({
       }
       evictSessionStateIfFull();
       live.set(st.sessionID, st);
+      // Every mutation reaches the derived views through save(), so drop their
+      // memoised state here — before the redundant-rewrite guard below, which
+      // would otherwise hide a same-millisecond mutation.
+      invalidateViews(st);
       // Skip redundant rewrites when state hasn't changed since last save.
       const prevSaved = lastSavedUpdatedAt.get(st.sessionID);
       if (prevSaved !== undefined && prevSaved === st.updatedAt) {
@@ -4570,7 +4802,6 @@ export default Plugin.define({
     const evaluate = async (sessionID: string, failed: boolean): Promise<void> => {
       if (!cfg.enabled || inFlight.has(sessionID)) return;
       inFlight.add(sessionID);
-      const toolsRan = toolActivity.delete(sessionID);
       try {
         const st = await load(sessionID);
         if (!st || st.status !== "executing") return;
@@ -4668,7 +4899,7 @@ export default Plugin.define({
         }
 
         // --- Safety limit: stuck detection (no step completed for N iterations) ---
-        const lastCompletedStep = st.steps.filter((s) => s.status === "complete" || s.status === "skipped").length;
+        const lastCompletedStep = aggregatesOf(st).done;
         if (lastCompletedStep === 0 && st.steps.length > 0) {
           const stuckCount = (stuckIterations.get(sessionID) ?? 0) + 1;
           stuckIterations.set(sessionID, stuckCount);
@@ -6132,23 +6363,6 @@ export default Plugin.define({
       }
     }
 
-    if (c.tool?.hook) {
-      try {
-        track(
-          await c.tool.hook("execute.before", (event) => {
-            const sessionID = typeof event?.sessionID === "string" ? event.sessionID : "";
-            if (!sessionID) return;
-            const tool = typeof event?.tool === "string" ? event.tool : "";
-            if (tool.startsWith("plan_")) return;
-            evictSessionStateIfFull();
-            toolActivity.add(sessionID);
-          }),
-        );
-      } catch (err) {
-        console.error(`[plan] tool.hook registration failed: ${describeError(err)}`);
-      }
-    }
-
     if (c.session.hook) {
       try {
         track(
@@ -7175,7 +7389,6 @@ export default Plugin.define({
       live.clear();
       loading.clear();
       inFlight.clear();
-      toolActivity.clear();
       evaluateIterations.clear();
       lastEvaluatedUpdatedAt.clear();
       lastSavedUpdatedAt.clear();
