@@ -268,6 +268,8 @@ interface PlanState {
   insights: string[];
   createdAt: number;
   updatedAt: number;
+  /** Monotonic mutation counter — the authoritative "did this change?" signal. See touch(). */
+  rev: number;
   startedAt?: number;
   approvedAt?: number;
   approvedBy?: string;
@@ -1099,6 +1101,9 @@ function syncParentSteps(st: PlanState): boolean {
 // later handlers.
 function migratePlan(raw: PlanState): PlanState {
   const arr = <T,>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
+  // Plans written before the revision counter existed start at 0. The first
+  // save after a load always writes (nothing recorded yet), so this is safe.
+  if (typeof raw.rev !== "number" || !Number.isFinite(raw.rev)) raw.rev = 0;
   raw.steps = arr<PlanStep>(raw.steps);
   for (const s of raw.steps) if (s && typeof s === "object") normalizeStep(s);
   raw.childSessions = arr(raw.childSessions);
@@ -3466,7 +3471,7 @@ function addComment(st: PlanState, stepNum: number, comment: string): string {
   }
   step.comments.push({ text: comment, at: Date.now() });
   while (step.comments.length > MAX_COMMENTS_PER_STEP) step.comments.shift();
-  st.updatedAt = Date.now();
+  touch(st);
   return `${MARK} Comment added to step ${stepNum}: ${step.description}`;
 }
 
@@ -4303,8 +4308,27 @@ function invalidateViews(st: PlanState): void {
   renderCache.delete(st);
 }
 
+/**
+ * Monotonic mutation counter, bumped on every change.
+ *
+ * `updatedAt` is wall-clock at millisecond resolution, so two mutations inside
+ * the same millisecond leave it unchanged while the data moved. Anything
+ * comparing timestamps to decide "did this change?" then wrongly concludes it
+ * did not — which loses a storage write in save() and skips an evaluation in
+ * evaluate(). `rev` cannot collide, so it is the authoritative change signal;
+ * `updatedAt` stays for display and for the insights index.
+ */
+function touch(st: PlanState): void {
+  st.updatedAt = Date.now();
+  st.rev = (st.rev ?? 0) + 1;
+}
+
+/**
+ * Change token for the memoised views. `rev` alone is sufficient and strictly
+ * stronger than the previous updatedAt+lengths key.
+ */
 function renderKey(st: PlanState, suffix = ""): string {
-  return `${st.updatedAt}|${st.steps.length}|${st.risks.length}|${st.criteria.length}|${st.childSessions.length}${suffix}`;
+  return `${st.rev ?? 0}|${st.updatedAt}${suffix}`;
 }
 
 function buildReminder(st: PlanState): string {
@@ -4540,7 +4564,7 @@ export default Plugin.define({
     const criteriaNudgeSent = new Set<string>();
     // Per-session dedupe: skip evaluate when plan updatedAt is unchanged
     // since the last evaluation (no timer debounce — await-safe).
-    const lastEvaluatedUpdatedAt = new Map<string, number>();
+    const lastEvaluatedRev = new Map<string, number>();
     // PL-9: per-session generation counters. clear()/replacement bump the
     // generation so in-flight handlers holding an older PlanState can't
     // resurrect the cleared plan through save()/live caching.
@@ -4553,7 +4577,7 @@ export default Plugin.define({
       stuckIterations.delete(sessionID);
       contextReminderCount.delete(sessionID);
       criteriaNudgeSent.delete(sessionID);
-      lastEvaluatedUpdatedAt.delete(sessionID);
+      lastEvaluatedRev.delete(sessionID);
     };
     const MAX_SESSION_STATES = 500;
     const evictSessionStateIfFull = (): void => {
@@ -4608,7 +4632,7 @@ export default Plugin.define({
       );
     };
 
-    const lastSavedUpdatedAt = new Map<string, number>();
+    const lastSavedRev = new Map<string, number>();
     const lastSavedInsights = new Map<string, string>();
 
     const updateInsightsIndex = (st: PlanState): void => {
@@ -4665,13 +4689,13 @@ export default Plugin.define({
       // would otherwise hide a same-millisecond mutation.
       invalidateViews(st);
       // Skip redundant rewrites when state hasn't changed since last save.
-      const prevSaved = lastSavedUpdatedAt.get(st.sessionID);
-      if (prevSaved !== undefined && prevSaved === st.updatedAt) {
+      const prevSaved = lastSavedRev.get(st.sessionID);
+      if (prevSaved !== undefined && prevSaved === st.rev) {
         return;
       }
       try {
         await c.storage?.set?.(STORE_PREFIX + st.sessionID, st);
-        lastSavedUpdatedAt.set(st.sessionID, st.updatedAt);
+        lastSavedRev.set(st.sessionID, st.rev);
         updateInsightsIndex(st);
       } catch (err) {
         const message = `failed to persist plan for ${st.sessionID}: ${describeError(err)}`;
@@ -4754,6 +4778,7 @@ export default Plugin.define({
         executionMode: "incremental",
         createdAt: now,
         updatedAt: now,
+        rev: 0,
         costEstimate: {
           inputTokens: 0,
           outputTokens: 0,
@@ -4780,7 +4805,7 @@ export default Plugin.define({
         log(`failed to queue continuation for ${st.sessionID}: ${describeError(err)}`);
         st.status = "failed";
         st.stoppedReason = `continuation queue error: ${describeError(err)}`;
-        st.updatedAt = Date.now();
+        touch(st);
         await save(st);
       }
     };
@@ -4790,7 +4815,7 @@ export default Plugin.define({
       if (!st || st.status !== "executing") return;
       st.status = "paused";
       st.pausedAt = Date.now();
-      st.updatedAt = Date.now();
+      touch(st);
       await save(st);
       log(`plan paused for ${sessionID} (interrupt reason: ${reason || "unspecified"})`);
       await note(
@@ -4806,14 +4831,16 @@ export default Plugin.define({
         const st = await load(sessionID);
         if (!st || st.status !== "executing") return;
 
-        // Skip if the plan hasn't changed since the last evaluation.
-        if (!failed && lastEvaluatedUpdatedAt.get(sessionID) === st.updatedAt) return;
-        lastEvaluatedUpdatedAt.set(sessionID, st.updatedAt);
+        // Skip if the plan hasn't changed since the last evaluation. Compared on
+        // `rev`, not `updatedAt`: two mutations in the same millisecond leave
+        // updatedAt identical, so a real change could be skipped entirely.
+        if (!failed && lastEvaluatedRev.get(sessionID) === st.rev) return;
+        lastEvaluatedRev.set(sessionID, st.rev);
 
         if (failed) {
           st.status = "failed";
           st.stoppedReason = "execution error";
-          st.updatedAt = Date.now();
+          touch(st);
           await save(st);
           const cwd = getCwd();
           if (hasGitRepo(cwd)) {
@@ -4832,7 +4859,7 @@ export default Plugin.define({
           st.status = "paused";
           st.pausedAt = Date.now();
           st.stoppedReason = `exceeded maximum evaluate iterations (${MAX_EVALUATE_ITERATIONS})`;
-          st.updatedAt = Date.now();
+          touch(st);
           await save(st);
           log(`plan paused for ${sessionID}: exceeded ${MAX_EVALUATE_ITERATIONS} evaluate iterations`);
           await note(
@@ -4851,7 +4878,7 @@ export default Plugin.define({
           st.status = "paused";
           st.pausedAt = Date.now();
           st.stoppedReason = "plan exceeded 1 hour execution timeout";
-          st.updatedAt = Date.now();
+          touch(st);
           await save(st);
           log(`plan paused for ${sessionID}: exceeded 1 hour execution timeout`);
           await note(
@@ -4863,7 +4890,7 @@ export default Plugin.define({
 
         // PL-5: fold sub-step progress into parent steps before deciding.
         if (syncParentSteps(st)) {
-          st.updatedAt = Date.now();
+          touch(st);
           await save(st);
         }
 
@@ -4877,7 +4904,7 @@ export default Plugin.define({
           if (pendingCrit > 0 || failingCrit > 0) {
             if (!criteriaNudgeSent.has(sessionID)) {
               criteriaNudgeSent.add(sessionID);
-              st.updatedAt = Date.now();
+              touch(st);
               await save(st);
               await kick(
                 st,
@@ -4889,7 +4916,7 @@ export default Plugin.define({
           }
           st.status = "complete";
           st.completedAt = Date.now();
-          st.updatedAt = Date.now();
+          touch(st);
           evaluateIterations.delete(sessionID);
           stuckIterations.delete(sessionID);
           criteriaNudgeSent.delete(sessionID);
@@ -4907,7 +4934,7 @@ export default Plugin.define({
             st.status = "paused";
             st.pausedAt = Date.now();
             st.stoppedReason = `no step completed for ${MAX_STUCK_ITERATIONS} consecutive iterations`;
-            st.updatedAt = Date.now();
+            touch(st);
             await save(st);
             log(`plan paused for ${sessionID}: no step completed for ${MAX_STUCK_ITERATIONS} iterations`);
             await note(
@@ -4928,7 +4955,7 @@ export default Plugin.define({
             // There are phases waiting for approval — pause and notify
             st.status = "paused";
             st.pausedAt = Date.now();
-            st.updatedAt = Date.now();
+            touch(st);
             await save(st);
             const pendingCount = st.phaseApprovals.filter((p) => p.status === "pending").length;
             await note(
@@ -4940,7 +4967,7 @@ export default Plugin.define({
         }
 
         // Continue execution
-        st.updatedAt = Date.now();
+        touch(st);
         await save(st);
         await kick(st, "", false);
       } catch (err) {
@@ -4989,7 +5016,7 @@ export default Plugin.define({
 
       st.status = "stopped";
       st.stoppedReason = "emergency stop";
-      st.updatedAt = Date.now();
+      touch(st);
       await save(st);
 
       const completedCount = completedChildren.length;
@@ -5019,7 +5046,7 @@ export default Plugin.define({
           step.dependsOn.push(depStep.id);
         }
       }
-      st.updatedAt = Date.now();
+      touch(st);
       await save(st);
       return dependenciesText(st, detected);
     };
@@ -5146,7 +5173,7 @@ export default Plugin.define({
       step.isParent = true;
       step.subSteps = subStepIds;
 
-      st.updatedAt = now;
+      touch(st);
       await save(st);
 
       const lines = [
@@ -5217,7 +5244,7 @@ export default Plugin.define({
                 st.completedAt = Date.now();
                 st.lastSummary = args.summary.trim();
                 if (args.evidence) st.evidence = args.evidence;
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return {
                   content:
@@ -5248,7 +5275,7 @@ export default Plugin.define({
                 st.blockedReason = [args.reason.trim(), args.needs ? `Needs: ${args.needs.trim()}` : ""]
                   .filter(Boolean)
                   .join(" — ");
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return {
                   content:
@@ -5319,7 +5346,7 @@ export default Plugin.define({
                     st.status = "paused";
                     st.pausedAt = Date.now();
                     st.stoppedReason = `${count} consecutive plan_progress calls without completing a step`;
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     log(`plan paused for ${sessionID}: ${count} consecutive plan_progress without step completion`);
                     return {
@@ -5327,7 +5354,7 @@ export default Plugin.define({
                     };
                   }
                 }
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return {
                   content: `Progress recorded.${warning} Keep going.`,
@@ -5365,7 +5392,7 @@ export default Plugin.define({
                   estimatedDurationMin: estimateDuration(args.description),
                   estimatedAt: now,
                 });
-                st.updatedAt = now;
+                touch(st);
                 await save(st);
                 return { content: `Step added: ${args.description.trim()} (estimated: ${estimateDuration(args.description)} min, confidence: ${confidence})` };
               }) as AnyToolDef["execute"],
@@ -5391,7 +5418,7 @@ export default Plugin.define({
                   return { content: `Step ${args.step} does not exist. The plan has ${st.steps.length} step(s).` };
                 }
                 st.steps[idx].confidence = args.confidence;
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return { content: `Step ${args.step} confidence set to ${args.confidence}: ${st.steps[idx].description}` };
               }) as AnyToolDef["execute"],
@@ -5425,7 +5452,7 @@ export default Plugin.define({
                   maxAttempts: args.maxAttempts ?? 3,
                 };
                 st.criteria.push(criterion);
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return { content: `Criterion added: ${criterion.description}` };
               }) as AnyToolDef["execute"],
@@ -5472,7 +5499,7 @@ export default Plugin.define({
                   criterion.checkedAt = Date.now();
                   lines.push(`${criterion.description}: ${r.status}${r.result ? ` — ${r.result}` : ""}`);
                 }
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return { content: lines.join("\n") };
               }) as AnyToolDef["execute"],
@@ -5669,7 +5696,7 @@ export default Plugin.define({
                   // PL-5: starting a sub-step puts its parent in progress.
                   syncParentSteps(st);
                 }
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return { content: `Child session ${args.childSessionID} recorded.${warning}` };
               }) as AnyToolDef["execute"],
@@ -5702,7 +5729,7 @@ export default Plugin.define({
                 st.costEstimate.actualInputTokens = args.actualInputTokens;
                 st.costEstimate.actualOutputTokens = args.actualOutputTokens;
                 st.costEstimate.actualCostUsd = args.actualCostUsd;
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return {
                   content: `Cost updated: $${args.actualCostUsd.toFixed(4)} (${args.actualInputTokens} in / ${args.actualOutputTokens} out)`,
@@ -5748,7 +5775,7 @@ export default Plugin.define({
                   stepId: args.stepId?.trim() || undefined,
                 };
                 st.risks.push(risk);
-                st.updatedAt = now;
+                touch(st);
                 await save(st);
                 const score = risk.likelihood * risk.impact;
                 return {
@@ -5782,7 +5809,7 @@ export default Plugin.define({
                 if (args.contingency !== undefined) risk.contingency = args.contingency.trim() || undefined;
                 if (args.notes !== undefined) risk.notes = args.notes.trim() || undefined;
                 risk.updatedAt = Date.now();
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return {
                   content: `Risk ${risk.id} updated: status=${risk.status}`,
@@ -5838,7 +5865,7 @@ export default Plugin.define({
                 };
                 st.research.push(result);
                 while (st.research.length > MAX_RESEARCH) st.research.shift();
-                st.updatedAt = now;
+                touch(st);
                 await save(st);
                 return {
                   content: `Research recorded: "${result.query}" (${result.domain}) — ${result.sources.length} sources`,
@@ -5886,7 +5913,7 @@ export default Plugin.define({
                     accessedAt: now,
                   })));
                 }
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return {
                   content: `Research updated: "${result.query}" — ${result.sources.length} sources, ${result.keyFindings.length} findings`,
@@ -5916,7 +5943,7 @@ export default Plugin.define({
                 phase.status = "approved";
                 phase.approvedAt = Date.now();
                 phase.approvedBy = "agent";
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return { content: `Phase approved: ${phase.stepDescription}` };
               }) as AnyToolDef["execute"],
@@ -5953,7 +5980,7 @@ export default Plugin.define({
                 };
                 st.checkpoints.push(checkpoint);
                 while (st.checkpoints.length > MAX_CHECKPOINTS) st.checkpoints.shift();
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return {
                   content: `Checkpoint recorded: ${checkpoint.summary}`,
@@ -6000,7 +6027,7 @@ export default Plugin.define({
                 if (!st.steps[idx].linkedDecisions!.includes(args.decisionId)) {
                   st.steps[idx].linkedDecisions!.push(args.decisionId);
                 }
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return { content: `Decision ${args.decisionId} linked to step ${args.step}: ${st.steps[idx].description}` };
               }) as AnyToolDef["execute"],
@@ -6029,7 +6056,7 @@ export default Plugin.define({
                 if (!st.steps[idx].linkedErrors!.includes(args.errorId)) {
                   st.steps[idx].linkedErrors!.push(args.errorId);
                 }
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return { content: `Error ${args.errorId} linked to step ${args.step}: ${st.steps[idx].description}` };
               }) as AnyToolDef["execute"],
@@ -6058,7 +6085,7 @@ export default Plugin.define({
                 if (!st.steps[idx].linkedSnippets!.includes(args.snippetId)) {
                   st.steps[idx].linkedSnippets!.push(args.snippetId);
                 }
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return { content: `Snippet ${args.snippetId} linked to step ${args.step}: ${st.steps[idx].description}` };
               }) as AnyToolDef["execute"],
@@ -6166,7 +6193,7 @@ export default Plugin.define({
                   }
                 }
                 st.insights = insights;
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return { content: report };
               }) as AnyToolDef["execute"],
@@ -6300,7 +6327,7 @@ export default Plugin.define({
                 } else {
                   st.projects.push({ name: args.name, path: args.path, relationship: args.relationship });
                 }
-                st.updatedAt = Date.now();
+                touch(st);
                 await save(st);
                 return { content: `${MARK} Project "${args.name}" added to plan (${args.relationship}).` };
               }) as AnyToolDef["execute"],
@@ -6448,7 +6475,7 @@ export default Plugin.define({
                       return void (await note(sessionID, `${MARK} Plan not yet approved. Approve the plan first.`));
                     }
                     st.status = "executing";
-                    st.updatedAt = Date.now();
+                    touch(st);
                     delete st.pausedAt;
                     delete st.stoppedReason;
                     // PL-10: a resumed run is not complete.
@@ -6507,7 +6534,7 @@ export default Plugin.define({
                       return;
                     }
                     st.modelStrategy = strategy;
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     // PL-7: re-issue the new strategy's instructions so the
                     // executing model sees them immediately.
@@ -6533,7 +6560,7 @@ export default Plugin.define({
                       return;
                     }
                     st.executionMode = mode;
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     await note(
                       sessionID,
@@ -6568,7 +6595,7 @@ export default Plugin.define({
                     // and sub-step reference to the old step IDs — drop them
                     // so evaluate's phase gate can't deadlock on ghosts.
                     reconcileStepRefs(st);
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     await note(sessionID, `${MARK} Loaded template "${templateName}" (${template.steps.length} steps).`);
                     return;
@@ -6594,7 +6621,7 @@ export default Plugin.define({
                     }
                     st.status = "paused";
                     st.pausedAt = Date.now();
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     await note(sessionID, `${MARK} Plan paused between phases. Use \`/plan resume\` to continue.`);
                     return;
@@ -6618,7 +6645,7 @@ export default Plugin.define({
                     phase.status = "approved";
                     phase.approvedAt = Date.now();
                     phase.approvedBy = "user";
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     await note(sessionID, `${MARK} Phase ${phaseNum} approved: ${phase.stepDescription}`);
                     return;
@@ -6642,7 +6669,7 @@ export default Plugin.define({
                         // PL-2: fresh per-run window + clean counters.
                         st.resumedAt = Date.now();
                         resetSessionCounters(sessionID);
-                        st.updatedAt = Date.now();
+                        touch(st);
                         await save(st);
                         await note(sessionID, `${MARK} Execution confirmed — starting now.`);
                         await kick(st, "", true, delivery);
@@ -6654,7 +6681,7 @@ export default Plugin.define({
                     st.approvedAt = Date.now();
                     st.approvedBy = "user";
                     st.status = "awaiting_approval";
-                    st.updatedAt = Date.now();
+                    touch(st);
                     // Initialize phase approvals from steps
                     if (st.steps.length > 0 && st.phaseApprovals.length === 0) {
                       st.phaseApprovals = st.steps.map((s) => ({
@@ -6738,7 +6765,7 @@ export default Plugin.define({
                     }
                     st.approvalStatus = "rejected";
                     st.status = "planning";
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     await note(sessionID, `${MARK} Plan rejected. Return to planning and revise the plan.`);
                     return;
@@ -6852,7 +6879,7 @@ export default Plugin.define({
                       }
                     }
                     snapshotVersion(st, noteText);
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     const revisedLines = [
                       `${MARK} Plan updated (v${st.version}).`,
@@ -6896,7 +6923,7 @@ export default Plugin.define({
                     // and sub-step references left over from the newer version.
                     reconcileStepRefs(st);
                     st.planText = target.planText;
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     const lines = [
                       `${MARK} Reverted to v${targetVersion}.`,
@@ -6937,7 +6964,7 @@ export default Plugin.define({
                       }
                     }
                     st.insights = insights;
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     await note(sessionID, report);
                     return;
@@ -6973,7 +7000,7 @@ export default Plugin.define({
                     // PL-10: stamp completion time (metrics/learn rely on it).
                     st.completedAt = Date.now();
                     st.lastSummary = "Marked complete by the user.";
-                    st.updatedAt = Date.now();
+                    touch(st);
                     await save(st);
                     await note(sessionID, `${MARK} Plan marked complete.`);
                     return;
@@ -7390,8 +7417,8 @@ export default Plugin.define({
       loading.clear();
       inFlight.clear();
       evaluateIterations.clear();
-      lastEvaluatedUpdatedAt.clear();
-      lastSavedUpdatedAt.clear();
+      lastEvaluatedRev.clear();
+      lastSavedRev.clear();
       lastSavedInsights.clear();
       consecutiveProgress.clear();
       stuckIterations.clear();
