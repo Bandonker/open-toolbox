@@ -85,7 +85,7 @@ const ctx = {
     synthetic: async () => {},
   },
   storage: { get: async () => null, set: async () => {}, list: async () => [] },
-  directory: { path: sandbox },
+  location: { directory: sandbox },
   model: { list: async () => ({ location: {}, data: [] }) },
 };
 
@@ -185,6 +185,7 @@ check("consolidated report is written to the topic folder", /report\.md/.test(wr
 const projDir = process.env.OPENCODE_DEEP_RESEARCH_TEST_PROJECT ?? sandbox;
 const slug = "test-topic-for-deep-research";
 const topicFolder = join(projDir, "docs", "research", slug);
+check("project root comes from ctx.location.directory (not cwd)", existsSync(topicFolder));
 check("docs/research/<topic>/ was created on demand", existsSync(topicFolder), topicFolder);
 check("findings.md lives in the topic folder", existsSync(join(topicFolder, "findings.md")));
 check("deliberation.md holds the question", /quantization actually reliable/.test(readFileSync(join(topicFolder, "deliberation.md"), "utf8")));

@@ -789,7 +789,12 @@ function topicSlug(topic: string): string {
  * docs/, research/, or the topic folder.
  */
 function researchRoot(c: any): string {
-  const base = String(c.directory?.path ?? c.app?.path?.cwd ?? process.cwd());
+  // ctx.location.directory is the project's root (the shape codebase-index and
+  // session-export use). ctx.directory is not part of the API, so reading it
+  // silently fell through to process.cwd() and wrote into the home directory.
+  const candidates = [c?.location?.directory, c?.app?.path?.cwd, c?.project?.root];
+  const base =
+    candidates.find((v) => typeof v === "string" && v.trim().length > 0) ?? process.cwd();
   return join(base, "docs", "research");
 }
 
