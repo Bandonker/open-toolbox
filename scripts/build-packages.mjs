@@ -25,6 +25,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -181,8 +182,15 @@ const PACKAGES = [
     helpers: [
       { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
       { src: "lib/redact.ts", dest: "lib/redact.js" },
+      { src: "lib/format.ts", dest: "lib/format.js" },
+      { src: "lib/config.ts", dest: "lib/config.js" },
     ],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
+    rewrites: {
+      "../lib/sqlite.ts": "./lib/sqlite.js",
+      "../lib/redact.ts": "./lib/redact.js",
+      "../lib/format.ts": "./lib/format.js",
+      "../lib/config.ts": "./lib/config.js",
+    },
     description:
       "Local-first long-term memory: store and BM25-recall fragments with SQLite FTS5. No embedding API, no cloud. Auto-injects relevant memories into each request within a hard character budget.",
     keywords: ["memory", "recall", "sqlite", "fts5", "local-first"],
@@ -246,11 +254,37 @@ const PACKAGES = [
     ],
   },
   {
+    dir: "loop-guard",
+    name: `${SCOPE}/opencode-loop-guard`,
+    source: "plugins/loop-guard.ts",
+    helpers: [{ src: "lib/config.ts", dest: "lib/config.js" }],
+    rewrites: { "../lib/config.ts": "./lib/config.js" },
+    description:
+      "Always-on doom-loop breaker: when a session repeats the same tool call or the same assistant reply consecutively, the model is nudged to change approach and, if it keeps repeating, the turn is cancelled.",
+    keywords: ["loop", "repetition", "stall", "guard", "reliability"],
+    tools: [],
+    config: [
+      ["OPENCODE_LOOP_GUARD_ENABLED", "true", "Turn the guard off without uninstalling"],
+      ["OPENCODE_LOOP_GUARD_REPEAT_LIMIT", "4", "Consecutive identical calls/replies before nudging the model"],
+      ["OPENCODE_LOOP_GUARD_CANCEL_LIMIT", "8", "Consecutive identical calls/replies before cancelling the turn"],
+      ["OPENCODE_LOOP_GUARD_NOTIFY", "true", "Post a note into the session when the guard acts"],
+      ["OPENCODE_LOOP_GUARD_LOG", "false", "Log guard activity to stderr"],
+    ],
+  },
+  {
     dir: "usage-stats",
     name: `${SCOPE}/opencode-usage-stats`,
     source: "plugins/usage-stats.ts",
-    helpers: [{ src: "lib/sqlite.ts", dest: "lib/sqlite.js" }],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js" },
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/format.ts", dest: "lib/format.js" },
+      { src: "lib/config.ts", dest: "lib/config.js" },
+    ],
+    rewrites: {
+      "../lib/sqlite.ts": "./lib/sqlite.js",
+      "../lib/format.ts": "./lib/format.js",
+      "../lib/config.ts": "./lib/config.js",
+    },
     description:
       "Lifetime token / dollar / tool accounting in local SQLite with a self-contained HTML dashboard and Unicode heatmaps.",
     keywords: ["usage", "tokens", "cost", "stats", "dashboard", "sqlite"],
@@ -279,8 +313,15 @@ const PACKAGES = [
     helpers: [
       { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
       { src: "lib/redact.ts", dest: "lib/redact.js" },
+      { src: "lib/format.ts", dest: "lib/format.js" },
+      { src: "lib/config.ts", dest: "lib/config.js" },
     ],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
+    rewrites: {
+      "../lib/sqlite.ts": "./lib/sqlite.js",
+      "../lib/redact.ts": "./lib/redact.js",
+      "../lib/format.ts": "./lib/format.js",
+      "../lib/config.ts": "./lib/config.js",
+    },
     description:
       "Record and search architectural decisions in a local SQLite FTS5 database.",
     keywords: ["decisions", "adr", "memory", "sqlite", "fts5"],
@@ -300,8 +341,15 @@ const PACKAGES = [
     helpers: [
       { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
       { src: "lib/redact.ts", dest: "lib/redact.js" },
+      { src: "lib/format.ts", dest: "lib/format.js" },
+      { src: "lib/config.ts", dest: "lib/config.js" },
     ],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
+    rewrites: {
+      "../lib/sqlite.ts": "./lib/sqlite.js",
+      "../lib/redact.ts": "./lib/redact.js",
+      "../lib/format.ts": "./lib/format.js",
+      "../lib/config.ts": "./lib/config.js",
+    },
     description:
       "Log errors with context, search past ones, and record resolutions so you stop re-debugging the same failure.",
     keywords: ["errors", "journal", "debugging", "sqlite", "fts5"],
@@ -321,8 +369,13 @@ const PACKAGES = [
     helpers: [
       { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
       { src: "lib/redact.ts", dest: "lib/redact.js" },
+      { src: "lib/config.ts", dest: "lib/config.js" },
     ],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js", "../lib/redact.ts": "./lib/redact.js" },
+    rewrites: {
+      "../lib/sqlite.ts": "./lib/sqlite.js",
+      "../lib/redact.ts": "./lib/redact.js",
+      "../lib/config.ts": "./lib/config.js",
+    },
     description:
       "Save reusable code snippets and search them by language, tag or full text.",
     keywords: ["snippets", "library", "sqlite", "fts5"],
@@ -356,8 +409,16 @@ const PACKAGES = [
     dir: "tool-audit",
     name: `${SCOPE}/opencode-tool-audit`,
     source: "plugins/tool-audit.ts",
-    helpers: [{ src: "lib/sqlite.ts", dest: "lib/sqlite.js" }],
-    rewrites: { "../lib/sqlite.ts": "./lib/sqlite.js" },
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/format.ts", dest: "lib/format.js" },
+      { src: "lib/config.ts", dest: "lib/config.js" },
+    ],
+    rewrites: {
+      "../lib/sqlite.ts": "./lib/sqlite.js",
+      "../lib/format.ts": "./lib/format.js",
+      "../lib/config.ts": "./lib/config.js",
+    },
     description:
       "Flight recorder for every tool call: tool, args, status, duration and error land in a local SQLite DB, with secrets redacted before they touch disk.",
     keywords: ["audit", "trace", "observability", "sqlite"],
@@ -379,8 +440,14 @@ const PACKAGES = [
     dir: "command-pack",
     name: `${SCOPE}/opencode-command-pack`,
     source: "plugins/command-pack.ts",
-    helpers: [],
-    rewrites: {},
+    helpers: [
+      { src: "lib/command-registry.ts", dest: "lib/command-registry.js" },
+      { src: "lib/config.ts", dest: "lib/config.js" },
+    ],
+    rewrites: {
+      "../lib/command-registry.ts": "./lib/command-registry.js",
+      "../lib/config.ts": "./lib/config.js",
+    },
     description:
       "Registers slash commands that put the rest of the pack one keystroke away.",
     keywords: ["commands", "slash", "ux"],
@@ -406,8 +473,8 @@ const PACKAGES = [
     dir: "goal",
     name: `${SCOPE}/opencode-goal`,
     source: "plugins/goal.ts",
-    helpers: [],
-    rewrites: {},
+    helpers: [{ src: "lib/config.ts", dest: "lib/config.js" }],
+    rewrites: { "../lib/config.ts": "./lib/config.js" },
     description:
       "Set an objective for a session and keep working until it is reached: the goal is re-injected into every request, the model auto-continues when a turn ends, and the loop stops only on goal_complete/goal_blocked, a user interrupt, a stall, or the iteration/time budget.",
     keywords: ["goal", "agent", "autonomous", "loop", "automation"],
@@ -426,6 +493,64 @@ const PACKAGES = [
       ["OPENCODE_GOAL_MAX_INJECT_CHARS", "1600", "Character cap on the injected goal reminder"],
       ["OPENCODE_GOAL_NOTIFY", "true", "Post loop start/stop notes into the session"],
       ["OPENCODE_GOAL_LOG", "false", "Log loop activity to stderr"],
+    ],
+  },
+  {
+    dir: "plan",
+    name: `${SCOPE}/opencode-plan`,
+    source: "plugins/plan.ts",
+    helpers: [],
+    rewrites: {},
+    description:
+      "Register a /plan command that guides the agent through a thorough planning phase: research the task, ask clarifying questions, present a detailed plan, then execute it by spawning child sessions (free models first, paid as fallback).",
+    keywords: ["plan", "planning", "research", "orchestration"],
+    tools: [],
+    commands: ["/plan"],
+    config: [],
+  },
+  {
+    dir: "code-review",
+    name: `${SCOPE}/opencode-code-review`,
+    source: "plugins/code-review.ts",
+    helpers: [
+      { src: "lib/sqlite.ts", dest: "lib/sqlite.js" },
+      { src: "lib/redact.ts", dest: "lib/redact.js" },
+      { src: "lib/format.ts", dest: "lib/format.js" },
+      { src: "lib/config.ts", dest: "lib/config.js" },
+    ],
+    rewrites: {
+      "../lib/sqlite.ts": "./lib/sqlite.js",
+      "../lib/redact.ts": "./lib/redact.js",
+      "../lib/format.ts": "./lib/format.js",
+      "../lib/config.ts": "./lib/config.js",
+    },
+    description:
+      "Review source files and diffs for security vulnerabilities, code smells, and type safety issues. Stores review history in a local SQLite FTS5 database with full-text search.",
+    keywords: ["code-review", "review", "security", "static-analysis", "sqlite"],
+    tools: [
+      ["code_review_file", "Review a source file for issues."],
+      ["code_review_diff", "Review a diff for issues."],
+      ["code_review_history", "List past reviews with filters."],
+      ["code_review_get", "Get a review by id."],
+      ["code_review_search", "Full-text search reviews."],
+      ["code_review_stats", "Aggregate review statistics."],
+    ],
+    commands: [
+      "/code-review file <path> | diff | project [path]",
+      "/code-review fix-all [reviewId]",
+      "/code-review deep [path]",
+      "/deep-code-review [path]",
+    ],
+    config: [
+      ["OPENCODE_CODE_REVIEW_AGENT_FIXES", "true", "Spawn fixer subagents after a review."],
+      ["OPENCODE_CODE_REVIEW_LLM_FALLBACK", "true", "Run a free-LLM pass when the static scan is sparse."],
+      ["OPENCODE_CODE_REVIEW_LLM_FALLBACK_THRESHOLD", "5", "Findings below this trigger the LLM fallback."],
+      ["OPENCODE_CODE_REVIEW_FIX_MODEL", '""', "Pin the fixer model as providerID/modelID."],
+      ["OPENCODE_CODE_REVIEW_REVIEW_MODEL", '""', "Pin the reviewer model as providerID/modelID."],
+      ["OPENCODE_CODE_REVIEW_MAX_FIX_AGENTS", "6", "Fixer children allowed to run at once."],
+      ["OPENCODE_CODE_REVIEW_SPAWN_MODE", "agent", 'agent | direct (plugin spawns the children itself).'],
+      ["OPENCODE_CODE_REVIEW_DIRECT_REVIEW_TIMEOUT_SEC", "300", "Seconds direct mode waits for its reviewer."],
+      ["OPENCODE_CODE_REVIEW_DEEP", "true", "Expose /deep-code-review and /code-review deep."],
     ],
   },
 ];
@@ -457,12 +582,24 @@ function transpile(relPath) {
  * (Windows, default macOS) that mistake still resolves and the broken import
  * ships to npm, where it fails only at runtime on a Linux install. Matching
  * case-insensitively turns that into a build-time error on every platform.
+ *
+ * LIB-3: the scan covers every module-specifier position in the emitted
+ * output, not just static `from` clauses. `await import("./memory.ts")`
+ * escaped the old regex entirely — the published bundle carried verbatim .ts
+ * specifiers that threw ERR_MODULE_NOT_FOUND inside swallowing try/catch, so
+ * cross-plugin integrations silently never fired. `import(...)` and
+ * `require(...)` specifiers now fail the build the same way. Plain ".ts"
+ * strings in data (e.g. file-extension lists) are intentionally not matched;
+ * only specifier positions are.
  */
-function assertNoTsImports(code, label) {
-  const m = code.match(/\bfrom\s+["']([^"']+\.ts)["']/i);
+const TS_IMPORT_RE =
+  /\bfrom\s+["']([^"']+\.ts)["']|\b(?:import|require)\s*\(\s*["']([^"']+\.ts)["']/i;
+
+export function assertNoTsImports(code, label) {
+  const m = code.match(TS_IMPORT_RE);
   if (m) {
     throw new Error(
-      `unrewritten .ts import remains in ${label}: ${m[1]} ` +
+      `unrewritten .ts import remains in ${label}: ${m[1] ?? m[2]} ` +
         `(import specifiers are case-sensitive; use the exact lowercase path)`,
     );
   }
@@ -524,7 +661,7 @@ function buildReadme(pkg) {
   return lines.join("\n");
 }
 
-function buildPackage(pkg) {
+function buildPackage(pkg, outRoot) {
   const outDir = resolve(outRoot, pkg.dir);
   rmSync(outDir, { recursive: true, force: true });
   mkdirSync(outDir, { recursive: true });
@@ -569,7 +706,7 @@ function buildPackage(pkg) {
     bugs: "https://github.com/Bandonker/open-toolbox/issues",
     engines: { node: ">=20" },
     peerDependencies: { "@opencode/plugin": "^2.0.11" },
-    ...(hasZod ? { dependencies: { zod: rootPkg.dependencies.zod } } : {}),
+    ...(hasZod ? { dependencies: { zod: rootPkg.dependencies?.zod } } : {}),
   };
   writeFileSync(join(outDir, "package.json"), JSON.stringify(manifest, null, 2) + "\n");
   writeFileSync(join(outDir, "README.md"), buildReadme(pkg));
@@ -579,75 +716,100 @@ function buildPackage(pkg) {
 }
 
 function packCheck(outDir) {
-  const raw = execSync("npm pack --dry-run --json", {
-    cwd: outDir,
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-  const info = JSON.parse(raw)[0];
-  return { files: info.entryCount, size: info.size, unpacked: info.unpackedSize };
-}
-
-const check = process.argv.includes("--pack-check");
-rmSync(outRoot, { recursive: true, force: true });
-mkdirSync(outRoot, { recursive: true });
-
-let failures = 0;
-console.log(`Building ${PACKAGES.length} packages from ${root} -> packages/\n`);
-for (const pkg of PACKAGES) {
-  const built = buildPackage(pkg);
-  let line = `  ${built.manifest.name}@${VERSION}  index.js`;
-  if (built.helperDests.length) line += ` + ${built.helperDests.join(", ")}`;
-  if (built.manifest.dependencies) line += `  deps: ${Object.keys(built.manifest.dependencies).join(",")}`;
-  console.log(line);
-  if (check) {
-    try {
-      const info = packCheck(built.outDir);
-      console.log(
-        `      pack: ${info.files} files, ${(info.size / 1024).toFixed(1)} KiB tarball, ${(info.unpacked / 1024).toFixed(1)} KiB unpacked`,
-      );
-    } catch (err) {
-      failures += 1;
-      console.error(`      pack FAILED: ${err.message.split("\n")[0]}`);
-    }
-  }
-}
-
-if (check && failures > 0) {
-  console.error(`\n${failures} package(s) failed to pack`);
-  process.exit(1);
-}
-
-// Smoke-test every entry: it must load and export exactly one default plugin.
-let loadFailures = 0;
-for (const pkg of PACKAGES) {
-  const entryUrl = pathToFileURL(resolve(outRoot, pkg.dir, "index.js")).href;
   try {
-    const mod = await import(entryUrl);
-    const keys = Object.keys(mod);
-    const ok =
-      keys.includes("default") &&
-      keys.every((k) => k === "default" || k === "__test__") &&
-      typeof mod.default?.id === "string" &&
-      typeof mod.default?.setup === "function";
-    if (!ok) {
-      loadFailures += 1;
-      console.error(
-        `  LOAD FAIL ${pkg.name}: expected a single default plugin, got exports [${keys.join(", ")}]`,
-      );
-    }
+    const raw = execSync("npm pack --dry-run --json", {
+      cwd: outDir,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    const info = JSON.parse(raw)[0];
+    return { files: info.entryCount, size: info.size, unpacked: info.unpackedSize };
   } catch (err) {
-    loadFailures += 1;
-    console.error(`  LOAD FAIL ${pkg.name}: ${err.message.split("\n")[0]}`);
+    const detail = err.stderr?.toString().trim().split("\n")[0] ?? err.message;
+    throw new Error(`npm pack failed: ${detail}`);
   }
 }
-if (loadFailures > 0) {
-  console.error(`\n${loadFailures} package(s) failed to load`);
-  process.exit(1);
-}
-console.log(`Verified: all ${PACKAGES.length} entries load and export a single default plugin.`);
 
-console.log(
-  `\nDone. Publish with:  cd packages/<dir> && npm publish --access public\n` +
-    `(run 'npm login' first; scoped packages need --access public)`,
-);
+// LIB-3 support: the build runs only when this file is invoked directly, so
+// tests/verify-lib-fix-build-guard.mjs can import assertNoTsImports without
+// triggering a full build. `node scripts/build-packages.mjs` behavior is
+// unchanged.
+async function main() {
+  const check = process.argv.includes("--pack-check");
+  const tmpRoot = resolve(root, ".packages-tmp");
+  rmSync(tmpRoot, { recursive: true, force: true });
+  mkdirSync(tmpRoot, { recursive: true });
+
+  let failures = 0;
+  console.log(`Building ${PACKAGES.length} packages from ${root} -> packages/\n`);
+  for (const pkg of PACKAGES) {
+    const built = buildPackage(pkg, tmpRoot);
+    let line = `  ${built.manifest.name}@${VERSION}  index.js`;
+    if (built.helperDests.length) line += ` + ${built.helperDests.join(", ")}`;
+    if (built.manifest.dependencies) line += `  deps: ${Object.keys(built.manifest.dependencies).join(",")}`;
+    console.log(line);
+    if (check) {
+      try {
+        const info = packCheck(built.outDir);
+        console.log(
+          `      pack: ${info.files} files, ${(info.size / 1024).toFixed(1)} KiB tarball, ${(info.unpacked / 1024).toFixed(1)} KiB unpacked`,
+        );
+      } catch (err) {
+        failures += 1;
+        console.error(`      pack FAILED: ${err.message.split("\n")[0]}`);
+      }
+    }
+  }
+
+  if (check && failures > 0) {
+    console.error(`\n${failures} package(s) failed to pack`);
+    process.exit(1);
+  }
+
+  // Swap the freshly built packages into place.
+  const backupRoot = resolve(root, ".packages-backup");
+  rmSync(backupRoot, { recursive: true, force: true });
+  if (existsSync(outRoot)) {
+    renameSync(outRoot, backupRoot);
+  }
+  renameSync(tmpRoot, outRoot);
+  rmSync(backupRoot, { recursive: true, force: true });
+
+  // Smoke-test every entry: it must load and export exactly one default plugin.
+  let loadFailures = 0;
+  for (const pkg of PACKAGES) {
+    const entryUrl = pathToFileURL(resolve(outRoot, pkg.dir, "index.js")).href;
+    try {
+      const mod = await import(entryUrl);
+      const keys = Object.keys(mod);
+      const ok =
+        keys.includes("default") &&
+        keys.every((k) => k === "default" || k === "__test__") &&
+        typeof mod.default?.id === "string" &&
+        typeof mod.default?.setup === "function";
+      if (!ok) {
+        loadFailures += 1;
+        console.error(
+          `  LOAD FAIL ${pkg.name}: expected a single default plugin, got exports [${keys.join(", ")}]`,
+        );
+      }
+    } catch (err) {
+      loadFailures += 1;
+      console.error(`  LOAD FAIL ${pkg.name}: ${err.message.split("\n")[0]}`);
+    }
+  }
+  if (loadFailures > 0) {
+    console.error(`\n${loadFailures} package(s) failed to load`);
+    process.exit(1);
+  }
+  console.log(`Verified: all ${PACKAGES.length} entries load and export a single default plugin.`);
+
+  console.log(
+    `\nDone. Publish with:  cd packages/<dir> && npm publish --access public\n` +
+      `(run 'npm login' first; scoped packages need --access public)`,
+  );
+}
+
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  await main();
+}
