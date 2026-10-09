@@ -1,0 +1,41 @@
+{
+  "name": "@bandonker/opencode-secret-shield",
+  "version": "1.2.1",
+  "description": "v2-native secret detector/redactor: scrubs the outbound HTTP body (title/compaction/generate), prompt, tool args/results and child-process env; observe/redact/block modes with entropy detection, allowlist precedence and a hashed JSONL audit.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "lib/redact.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "secrets",
+    "redaction",
+    "security",
+    "guardrails"
+  ],
+  "homepage": "https://github.com/Bandonker/open-toolbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bandonker/open-toolbox.git"
+  },
+  "bugs": "https://github.com/Bandonker/open-toolbox/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.11"
+  },
+  "dependencies": {
+    "zod": "4.1.8"
+  }
+}

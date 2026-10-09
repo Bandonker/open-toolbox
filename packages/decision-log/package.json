@@ -1,0 +1,45 @@
+{
+  "name": "@bandonker/opencode-decision-log",
+  "version": "1.2.1",
+  "description": "Record and search architectural decisions in a local SQLite FTS5 database.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "lib/sqlite.js",
+    "lib/redact.js",
+    "lib/format.js",
+    "lib/config.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "decisions",
+    "adr",
+    "memory",
+    "sqlite",
+    "fts5"
+  ],
+  "homepage": "https://github.com/Bandonker/open-toolbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bandonker/open-toolbox.git"
+  },
+  "bugs": "https://github.com/Bandonker/open-toolbox/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.11"
+  },
+  "dependencies": {
+    "zod": "4.1.8"
+  }
+}

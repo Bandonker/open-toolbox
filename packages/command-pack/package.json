@@ -1,0 +1,38 @@
+{
+  "name": "@bandonker/opencode-command-pack",
+  "version": "1.2.1",
+  "description": "Registers slash commands that put the rest of the pack one keystroke away.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "lib/command-registry.js",
+    "lib/config.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "commands",
+    "slash",
+    "ux"
+  ],
+  "homepage": "https://github.com/Bandonker/open-toolbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bandonker/open-toolbox.git"
+  },
+  "bugs": "https://github.com/Bandonker/open-toolbox/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.11"
+  }
+}

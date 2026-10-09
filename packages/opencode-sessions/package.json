@@ -1,0 +1,42 @@
+{
+  "name": "@bandonker/opencode-sessions",
+  "version": "1.2.1",
+  "description": "Spawn, brief, await, read, follow up on, hand off to and cancel fresh child sessions without blocking the server event loop. Adds targeted project presence: a brief about only the sessions that bear on yours, and an enforced file lock so two agents take turns on one file.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "helpers.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "sessions",
+    "subagents",
+    "handoff",
+    "orchestration",
+    "presence"
+  ],
+  "homepage": "https://github.com/Bandonker/open-toolbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bandonker/open-toolbox.git"
+  },
+  "bugs": "https://github.com/Bandonker/open-toolbox/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.11"
+  },
+  "dependencies": {
+    "zod": "4.1.8"
+  }
+}

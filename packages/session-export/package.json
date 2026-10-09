@@ -1,0 +1,41 @@
+{
+  "name": "@bandonker/opencode-session-export",
+  "version": "1.2.1",
+  "description": "Export a session transcript to markdown, json, jsonl or text with reasoning/tool filtering, secret redaction, home-path rewriting and non-overwriting filenames.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "lib/redact.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "session",
+    "export",
+    "transcript",
+    "redaction"
+  ],
+  "homepage": "https://github.com/Bandonker/open-toolbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bandonker/open-toolbox.git"
+  },
+  "bugs": "https://github.com/Bandonker/open-toolbox/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.11"
+  },
+  "dependencies": {
+    "zod": "4.1.8"
+  }
+}

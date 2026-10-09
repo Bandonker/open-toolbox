@@ -1,0 +1,41 @@
+{
+  "name": "@bandonker/opencode-context-pruner",
+  "version": "1.2.1",
+  "description": "Context compiler for opencode v2: token-accurate pruning with a cache-stable epoch scheduler (session.hook context). Measures real tokens, plans changes once per epoch, dedupes and purges stale output, and never touches the transcript on disk.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "context",
+    "tokens",
+    "compaction",
+    "pruner",
+    "context-compiler"
+  ],
+  "homepage": "https://github.com/Bandonker/open-toolbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bandonker/open-toolbox.git"
+  },
+  "bugs": "https://github.com/Bandonker/open-toolbox/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.11"
+  },
+  "dependencies": {
+    "zod": "4.1.8"
+  }
+}

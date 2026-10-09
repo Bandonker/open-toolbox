@@ -7,9 +7,17 @@ backups/
 .env
 
 docs/
-packages/
 .packages-tmp/
 .packages-backup/
+
+# The built plugin packages are tracked: the toolbox deploys from packages/ by
+# symlink, so the artifacts a build produces are what opencode runs, and a diff
+# against them is the review of what actually shipped. The swap above is why:
+# build-packages.mjs renames packages/ to .packages-backup/ and then moves
+# .packages-tmp/ into place, so a build that fails in between leaves packages/
+# absent — tracked, that is a `git checkout` to undo rather than a rebuild.
+# Keep .packages-tmp/ and .packages-backup/ ignored either way; they only exist
+# during a build.
 
 ISSUES.md
 .superpowers/

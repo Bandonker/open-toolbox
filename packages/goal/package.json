@@ -1,0 +1,42 @@
+{
+  "name": "@bandonker/opencode-goal",
+  "version": "1.2.1",
+  "description": "Set an objective for a session and keep working until it is reached: the goal is re-injected into every request, the model auto-continues when a turn ends, and the loop stops only on goal_complete/goal_blocked, a user interrupt, a stall, or the iteration/time budget.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "lib/config.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "goal",
+    "agent",
+    "autonomous",
+    "loop",
+    "automation"
+  ],
+  "homepage": "https://github.com/Bandonker/open-toolbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bandonker/open-toolbox.git"
+  },
+  "bugs": "https://github.com/Bandonker/open-toolbox/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.11"
+  },
+  "dependencies": {
+    "zod": "4.1.8"
+  }
+}

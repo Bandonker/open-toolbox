@@ -1,0 +1,39 @@
+{
+  "name": "@bandonker/opencode-loop-guard",
+  "version": "1.2.1",
+  "description": "Always-on doom-loop breaker: when a session repeats the same tool call or the same assistant reply consecutively, the model is nudged to change approach and, if it keeps repeating, the turn is cancelled.",
+  "type": "module",
+  "license": "MIT",
+  "main": "./index.js",
+  "exports": {
+    ".": "./index.js",
+    "./server": "./index.js"
+  },
+  "files": [
+    "index.js",
+    "lib/config.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "loop",
+    "repetition",
+    "stall",
+    "guard",
+    "reliability"
+  ],
+  "homepage": "https://github.com/Bandonker/open-toolbox",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Bandonker/open-toolbox.git"
+  },
+  "bugs": "https://github.com/Bandonker/open-toolbox/issues",
+  "engines": {
+    "node": ">=20"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": "^2.0.11"
+  }
+}
