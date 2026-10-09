@@ -1,9 +1,9 @@
 name: publish
 
-# Tag-driven release: pushing vX.Y.Z builds, verifies, and publishes all 15
+# Tag-driven release: pushing vX.Y.Z builds, verifies, and publishes all 19
 # packages with that exact version via OIDC trusted publishing (no npm token).
 #
-#   npm version minor   # bumps root package.json (build stamps it onto all 15)
+#   npm version minor   # bumps root package.json (build stamps it onto all 19)
 #   git push origin main
 #   git tag v1.2.0 && git push origin v1.2.0
 #

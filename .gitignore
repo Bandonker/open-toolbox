@@ -16,3 +16,9 @@ ISSUES.md
 
 # Personal working notes, not part of the published plugin pack.
 PLUGIN-*.md
+.scratch/
+
+# Runtime artifact of the opencode-sessions plugin. Empty in git and never
+# needed by the repo: the plugin's peer state lives in ctx.storage, and any DB
+# that ever lands here is local session data that must never be committed.
+.opencode-sessions/

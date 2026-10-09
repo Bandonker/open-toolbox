@@ -730,12 +730,11 @@ function buildPackage(pkg, outRoot) {
   }
 
   const hasZod = /\bfrom\s+["']zod["']/.test(entry);
+  // helperDests are exact paths (e.g. "lib/sqlite.js"), so the directory globs
+  // that used to be appended were redundant: npm includes them anyway, and
+  // listing "lib/" alongside its contents just advertises intent to ship
+  // anything else that happens to appear in lib/.
   const files = ["index.js", ...helperDests, "README.md", "LICENSE"];
-  for (const dest of helperDests) {
-    if (!dest.includes("/")) continue;
-    const dir = `${dest.split("/")[0]}/`;
-    if (!files.includes(dir)) files.push(dir);
-  }
 
   const manifest = {
     name: pkg.name,
