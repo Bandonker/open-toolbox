@@ -494,12 +494,35 @@ function eventKinds(body) {
   check("late-content error is retried", late.decision?.retry === true && Number.isFinite(late.decision.delay), JSON.stringify(late.decision));
 
   const unterminated = retryEvent(
-    { type: "AI.Error.InvalidProviderOutput", message: "OpenAI Chat stream ended without a finish reason" },
+    { type: "AI.Error.InvalidProviderOutput", message: "OpenAI Chat stream ended without finish_reason" },
     0,
     { retry: false },
   );
   await hooks["retry"](unterminated);
   check("unterminated-stream error is retried", unterminated.decision?.retry === true, JSON.stringify(unterminated.decision));
+
+  // The real driver string is `OpenAI Chat stream ended without finish_reason`
+  // (openai-chat.js, the finishEvents error path). The message text is what
+  // RETRY_MATCH keys on, and it must stay in step with the driver. Verified
+  // against a string with no `type` field at all, so this exercises the message
+  // matcher rather than falling through on the type.
+  const bare = retryEvent(
+    { message: "OpenAI Chat stream ended without finish_reason" },
+    0,
+    { retry: false },
+  );
+  await hooks["retry"](bare);
+  check("the unterminated message itself is retried", bare.decision?.retry === true, JSON.stringify(bare.decision));
+
+  // ...and a neighbouring string that must NOT be retried, guarding against the
+  // pattern being loosened far enough to swallow unrelated failures.
+  const bareUnrelated = retryEvent(
+    { message: "OpenAI Chat stream ended for an unknown reason" },
+    0,
+    { retry: false },
+  );
+  await hooks["retry"](bareUnrelated);
+  check("a similar-but-unmatched message is left alone", bareUnrelated.decision?.retry !== true, JSON.stringify(bareUnrelated.decision));
 
   const exhausted = retryEvent(
     { type: "AI.Error.InvalidProviderOutput", message: "OpenAI Chat received content after the finish reason" },
