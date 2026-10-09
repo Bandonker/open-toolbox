@@ -78,8 +78,17 @@ const toolCtx = { sessionID: "ses_sefix", progress: async () => {} };
   if (m && existsSync(m[1])) {
     const body = readFileSync(m[1], "utf8");
     check("SE-1: the export file actually contains the rendered content", body.includes("# Session export"), m[1]);
+    // writeFileSyncExclusive passes mode 0o600, but `mode` is a POSIX concept:
+    // on Windows it is ignored and the file lands with the default 0666. The
+    // plugin already comments this (session-export.ts) — Windows privacy comes
+    // from the ACL, not the mode bits. Assert the POSIX contract only where
+    // the mode bits actually apply.
     const mode = statSync(m[1]).mode & 0o777;
-    check("SE-1: export file created with mode 0600", mode === 0o600, mode.toString(8));
+    if (process.platform === "win32") {
+      check("SE-1: export file exists and is readable on Windows", typeof body === "string" && body.length > 0);
+    } else {
+      check("SE-1: export file created with mode 0600", mode === 0o600, mode.toString(8));
+    }
   } else {
     check("SE-1: the export file actually contains the rendered content", false, "no path in result");
     check("SE-1: export file created with mode 0600", false, "no file");
