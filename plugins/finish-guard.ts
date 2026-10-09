@@ -88,6 +88,11 @@ export default Plugin.define({
 
     // E58: module-level retry counter — tracks total retries and last retry timestamp.
     const retryMetrics = { retries: 0, lastRetryAt: 0 };
+    // A stream that ends with no finish reason was cut off by the gateway
+    // mid-generation. That is not a misordering the transform can reorder away,
+    // so it is counted and recorded instead — a "died with finish:null and
+    // tokens.output:0" turn otherwise leaves no trace at all.
+    const truncationMetrics = { truncated: 0, lastTruncatedAt: 0 };
 
     if (!enabled) return () => {};
     if (typeof ctx?.session?.hook !== "function") return () => {};
@@ -98,7 +103,7 @@ export default Plugin.define({
       registrations.push(
         await ctx.session.hook("http.response", (event) => {
           try {
-            normaliseResponse(event, log);
+            normaliseResponse(event, log, truncationMetrics);
           } catch (err) {
             log(`response left untouched: ${String(err)}`);
           }
@@ -183,6 +188,9 @@ export default Plugin.define({
                 content: JSON.stringify({
                   retries: retryMetrics.retries,
                   lastRetryAt: retryMetrics.lastRetryAt > 0 ? new Date(retryMetrics.lastRetryAt).toISOString() : null,
+                  truncated: truncationMetrics.truncated,
+                  lastTruncatedAt:
+                    truncationMetrics.lastTruncatedAt > 0 ? new Date(truncationMetrics.lastTruncatedAt).toISOString() : null,
                 }),
               };
             },
@@ -256,7 +264,11 @@ function applyRetry(
   log(`retrying a malformed provider stream (attempt ${attempt + 1} in ${delay}ms)`);
 }
 
-function normaliseResponse(event: { response: Response }, log: (message: string) => void): void {
+function normaliseResponse(
+  event: { response: Response },
+  log: (message: string) => void,
+  metrics?: { truncated: number; lastTruncatedAt: number },
+): void {
   const response = event?.response;
   if (!response || typeof response !== "object") return;
   if (!response.body) return;
@@ -265,7 +277,7 @@ function normaliseResponse(event: { response: Response }, log: (message: string)
   if (response.ok === false) return;
   const contentType = response.headers?.get?.("content-type") ?? "";
   if (/text\/event-stream/i.test(contentType)) {
-    event.response = new Response(response.body.pipeThrough(finishLastTransform()), {
+    event.response = new Response(response.body.pipeThrough(finishLastTransform(metrics)), {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
@@ -276,17 +288,61 @@ function normaliseResponse(event: { response: Response }, log: (message: string)
   // E60: NDJSON (newline-delimited JSON) streaming — same finish-reason
   // reordering as SSE, but each line is a complete JSON object.
   if (/application\/x-ndjson/i.test(contentType)) {
-    event.response = new Response(response.body.pipeThrough(ndjsonFinishLastTransform()), {
+    event.response = new Response(
+      response.body.pipeThrough(ndjsonFinishLastTransform(metrics)),
+      {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+      },
+    );
+    log("held the finish chunk until the end of the NDJSON stream");
+    return;
+  }
+  // A body with no content-type at all, or one naming neither known framing.
+  // An OpenAI-compatible gateway streaming `stream:true` sends SSE, and the SSE
+  // transform writes any non-`data:` line back verbatim — so applying it to a
+  // body that turns out to be NDJSON is a no-op, not a corruption. That makes
+  // SSE the safe fallback rather than a guess: the alternative is leaving a
+  // malformed stream unprotected, which is how the killer chunk survives even
+  // with the plugin loaded.
+  if (contentType.trim() === "") {
+    event.response = new Response(response.body.pipeThrough(finishLastTransform(metrics)), {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
     });
-    log("held the finish chunk until the end of the NDJSON stream");
+    log("held the finish chunk until the end of the unlabelled stream");
   }
 }
 
 /** The SSE field carrying a JSON payload; every other line is passed through. */
 const DATA_LINE = /^data:\s?(.*)$/;
+
+/** Append to a bounded list, dropping the oldest entry once it is full. */
+function keepTail<T>(list: T[], value: T, max = 24): void {
+  list.push(value);
+  if (list.length > max) list.shift();
+}
+
+/**
+ * Record a stream that ended having delivered content but no finish reason.
+ * The gateway cut the connection mid-generation, which the driver reports as
+ * `finish: null` with no token counts — indistinguishable from a turn that
+ * simply died. That shape cannot be repaired (nothing was misordered), so it is
+ * logged instead, alongside the payloads immediately before the cut.
+ */
+function captureTruncatedStream(stream: string[]): void {
+  try {
+    mkdirSync(dirname(TOOL_CALL_CAPTURE), { recursive: true });
+    appendFileSync(
+      TOOL_CALL_CAPTURE,
+      JSON.stringify({ at: new Date().toISOString(), kind: "truncated-stream", stream }) + "\n",
+    );
+  } catch {
+    /* capture must never break a request */
+  }
+}
 
 /**
  * FG-2: repair provider streams whose tool call deltas arrive without
@@ -431,7 +487,9 @@ function makeToolCallBuffer() {
  * with the reason stripped (keeping its content and usage in place); a single
  * finish chunk is emitted on flush, just before `[DONE]`.
  */
-function finishLastTransform(): TransformStream<Uint8Array, Uint8Array> {
+function finishLastTransform(
+  metrics: { truncated: number; lastTruncatedAt: number } = { truncated: 0, lastTruncatedAt: 0 },
+): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
@@ -444,6 +502,13 @@ function finishLastTransform(): TransformStream<Uint8Array, Uint8Array> {
   const finishReasons = new Map<number, string>();
   let template: AnyRecord | null = null;
   let sawDone = false;
+  // Whether any chunk with real choices arrived. Distinguishes a stream the
+  // gateway cut off mid-generation (content but no finish reason) from an
+  // empty one, which must be left exactly as it is.
+  let sawContent = false;
+  // Tail of finished payloads, kept so a truncation can be inspected after the
+  // fact instead of being indistinguishable from a turn that simply died.
+  const ring: string[] = [];
   const toolBuffer = makeToolCallBuffer();
 
   const write = (controller: TransformStreamDefaultController<Uint8Array>, text: string): void => {
@@ -476,9 +541,13 @@ function finishLastTransform(): TransformStream<Uint8Array, Uint8Array> {
     }
     const choices = parsed.choices;
     if (!Array.isArray(choices) || choices.length === 0) {
+      // A chunk with no choices (a trailing usage chunk, say) is not an
+      // ordering problem; write it and keep the finish where it was.
       write(controller, raw + "\n");
       return;
     }
+    sawContent = true;
+    keepTail(ring, payload);
     // FG-2: buffer tool call deltas until their identity is known.
     // `untouched` marks chunks with no tool calls, which keep the
     // provider's original byte layout.
@@ -563,7 +632,32 @@ function finishLastTransform(): TransformStream<Uint8Array, Uint8Array> {
           );
         }
       }
-      if (sawDone) write(controller, "data: [DONE]\n\n");
+      // A stream that delivered content but never a finish reason was cut off
+      // by the gateway mid-generation. Left alone, the driver has nothing to
+      // terminate on and records finish:null with no token counts, so the turn
+      // looks like it died for no reason. Close it cleanly; the truncation is
+      // recorded and counted rather than absorbed, because unlike a misordered
+      // finish reason it cannot be repaired — only made visible.
+      let synthesized = false;
+      if (!template && sawContent && finishReasons.size === 0) {
+        metrics.truncated += 1;
+        metrics.lastTruncatedAt = Date.now();
+        captureTruncatedStream(ring);
+        synthesized = true;
+        write(
+          controller,
+          "data: " +
+            JSON.stringify({
+              object: "chat.completion.chunk",
+              created: Date.now(),
+              choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+            }) +
+            "\n\n",
+        );
+      }
+      // The sentinel is swallowed above so it cannot precede the finish; replay
+      // it here, once the stream is actually finished.
+      if (sawDone || synthesized) write(controller, "data: [DONE]\n\n");
     },
   });
 }
@@ -573,7 +667,9 @@ function finishLastTransform(): TransformStream<Uint8Array, Uint8Array> {
  * Each line is a complete JSON object; the finish-reason line is held back
  * and re-emitted at the end, just like the SSE transform.
  */
-function ndjsonFinishLastTransform(): TransformStream<Uint8Array, Uint8Array> {
+function ndjsonFinishLastTransform(
+  metrics: { truncated: number; lastTruncatedAt: number } = { truncated: 0, lastTruncatedAt: 0 },
+): TransformStream<Uint8Array, Uint8Array> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
   let buffer = "";
@@ -582,6 +678,8 @@ function ndjsonFinishLastTransform(): TransformStream<Uint8Array, Uint8Array> {
   const finishReasons = new Map<number, string>();
   let template: AnyRecord | null = null;
   const toolBuffer = makeToolCallBuffer();
+  let sawContent = false;
+  const ring: string[] = [];
 
   const write = (controller: TransformStreamDefaultController<Uint8Array>, text: string): void => {
     controller.enqueue(encoder.encode(text));
@@ -606,6 +704,8 @@ function ndjsonFinishLastTransform(): TransformStream<Uint8Array, Uint8Array> {
       write(controller, line + "\n");
       return;
     }
+    sawContent = true;
+    keepTail(ring, line);
     // FG-2: buffer tool call deltas until their identity is known.
     // `untouched` marks chunks with no tool calls, which keep the
     // provider's original byte layout.
@@ -684,6 +784,23 @@ function ndjsonFinishLastTransform(): TransformStream<Uint8Array, Uint8Array> {
             }) + "\n",
           );
         }
+      }
+      // The stream was cut off mid-generation: content arrived but no finish
+      // reason ever did. Close it so the driver terminates instead of recording
+      // finish:null with no token counts. See the SSE transform for why this is
+      // recorded rather than silently absorbed.
+      if (!template && sawContent && finishReasons.size === 0) {
+        metrics.truncated += 1;
+        metrics.lastTruncatedAt = Date.now();
+        captureTruncatedStream(ring);
+        write(
+          controller,
+          JSON.stringify({
+            object: "chat.completion.chunk",
+            created: Date.now(),
+            choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+          }) + "\n",
+        );
       }
     },
   });

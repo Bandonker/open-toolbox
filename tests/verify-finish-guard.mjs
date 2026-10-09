@@ -32,6 +32,7 @@ check("plugin exposes setup", typeof mod.default?.setup === "function");
 
 const hooks = {};
 let disposed = 0;
+const tools = {};
 const ctx = {
   options: {},
   location: { directory: sandbox },
@@ -39,6 +40,15 @@ const ctx = {
     hook: async (name, cb) => {
       hooks[name] = cb;
       return { dispose: async () => { disposed += 1; } };
+    },
+  },
+  tool: {
+    transform: async (cb) => {
+      cb({ add: (def) => {
+        tools[def.name] = def;
+        return { dispose: async () => { delete tools[def.name]; } };
+      } });
+      return { dispose: async () => {} };
     },
   },
 };
@@ -288,13 +298,86 @@ function eventKinds(body) {
   check("non-SSE response is left untouched", event.response === before);
 }
 
-// Case 4: no finish reason at all is left alone apart from [DONE] replay.
+// Case 3b: a body with no content-type at all. An OpenAI-compatible gateway
+// streaming `stream:true` sends SSE, and the SSE transform writes any non-`data:`
+// line back verbatim, so it is safe as a fallback even if the body turns out to
+// be NDJSON — the alternative is leaving a malformed stream unprotected, which
+// is how the killer chunk survives even with the plugin loaded.
+{
+  const event = {
+    sessionID: "ses_test",
+    agent: "build",
+    model: { providerID: "openai-compatible", modelID: "x" },
+    kind: "primary",
+    request: new Request("http://127.0.0.1:17321/chat/completions"),
+    response: sse([
+      dataChunk({ id: "u", choices: [{ index: 0, delta: { content: "late" }, finish_reason: "stop" }] }),
+      dataChunk({ id: "u", choices: [{ index: 0, delta: { reasoning_content: " killer" } }] }),
+      "data: [DONE]\n\n",
+    ], ""),
+  };
+  delete event.response.headers.get;
+  await hooks["http.response"](event);
+  const body = await event.response.text();
+  check("unlabelled SSE stream is still normalised", body.includes("late") && body.includes("killer"), body);
+  check("the finish reason still lands after the content",
+    body.lastIndexOf('"finish_reason"') > body.indexOf("killer"), body);
+}
+
+// Case 3c: an NDJSON body left unlabelled is passed through unchanged — the SSE
+// fallback is a no-op on it, not a corruption.
+{
+  const ndjson = [
+    `${JSON.stringify({ id: "n", choices: [{ index: 0, delta: { content: "nd" }, finish_reason: "stop" }] })}\n`,
+    `${JSON.stringify({ id: "n", choices: [{ index: 0, delta: { content: " after" } }] })}\n`,
+  ];
+  const stream = new ReadableStream({
+    start(controller) {
+      for (const chunk of ndjson) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  });
+  const event = {
+    sessionID: "ses_test",
+    agent: "build",
+    model: { providerID: "openai-compatible", modelID: "x" },
+    kind: "primary",
+    request: new Request("http://127.0.0.1:17321/chat/completions"),
+    response: new Response(stream, { headers: { "content-type": "" } }),
+  };
+  delete event.response.headers.get;
+  await hooks["http.response"](event);
+  const body = await event.response.text();
+  check("unlabelled NDJSON body is not rewritten", body === ndjson.join(""), body);
+}
+
+// Case 4: a stream the gateway cut off mid-generation — content arrives but
+// no finish reason and no [DONE] ever does. The driver would otherwise be left
+// with nothing to terminate on and records finish:null with no token counts,
+// which is what a turn that "died with no visible error" looks like in the
+// session log. Close it. The truncation is not silently absorbed: it is counted
+// in finish_guard_stats and recorded in the capture file, so a gateway that
+// keeps truncating stays diagnosable.
 {
   const { body } = await drive([
     dataChunk({ id: "c", choices: [{ index: 0, delta: { content: "only" } }] }),
   ]);
-  check("stream without finish reason is not given one", !body.includes('"finish_reason":"stop"'), body);
-  check("stream without finish reason keeps its content", body.includes("only"));
+  const events = payloads(body).filter((p) => p !== "[DONE]").map((p) => {
+    try { return JSON.parse(p); } catch { return null; }
+  }).filter(Boolean);
+  const finishes = events.filter((e) => e.choices?.[0]?.finish_reason);
+  check("truncated stream is closed with a finish reason",
+    finishes.length === 1 && finishes[0].choices[0].finish_reason === "stop",
+    JSON.stringify(events));
+  check("truncated stream ends with [DONE]", body.trimEnd().endsWith("[DONE]"), body);
+  check("truncated stream keeps its content", events.some((e) => e.choices?.[0]?.delta?.content === "only"), body);
+  check("the invented finish follows the content",
+    events.findIndex((e) => e.choices?.[0]?.delta?.content === "only") <
+    events.findIndex((e) => e.choices?.[0]?.finish_reason),
+    JSON.stringify(events));
+  check("the truncation is counted in the stats tool",
+    (await tools.finish_guard_stats.execute({})).content.includes('"truncated":1'),
+    JSON.stringify(await tools.finish_guard_stats.execute({})));
 }
 
 // Case 5: malformed streams are retried, bounded by the attempt limit.
