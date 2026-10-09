@@ -213,6 +213,26 @@ function baseModelKey(model: string): string {
   return hash >= 0 ? model.slice(0, hash) : model;
 }
 
+/**
+ * Split a stored `providerID/modelID` key into display parts.
+ * - provider: text before the first `/`, or "—" when there is none.
+ * - name: text after the provider prefix.
+ * - effort: text after `#` (variant such as `default`, `medium`, `max`), or "—" when absent.
+ */
+function splitModelDisplay(model: string): { provider: string; name: string; effort: string } {
+  const hash = model.indexOf("#");
+  const effort = hash >= 0 ? model.slice(hash + 1).trim() || "—" : "—";
+  const base = hash >= 0 ? model.slice(0, hash) : model;
+  const slash = base.indexOf("/");
+  if (slash < 0) {
+    const name = base.trim() || "unknown";
+    return { provider: "—", name, effort };
+  }
+  const provider = base.slice(0, slash).trim() || "—";
+  const name = base.slice(slash + 1).trim() || base.trim();
+  return { provider, name, effort };
+}
+
 /** Pick the greatest tier whose size is <= the request's input tokens, else the untiered entry. */
 function selectRate(entries: PriceEntry[], inputTokens: number): PriceEntry | null {
   const untiered = entries.find((e) => e.tierSize === null) ?? null;
@@ -1810,22 +1830,30 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ];
   });
 
+  // The literal "unknown" bucket holds usage that arrived before any
+  // `session.model.selected`/http.request could attribute it. It is not a
+  // model, so it never belongs in the model table — it inflates the row count
+  // and takes a slot beside real providers. Its spend is not lost: it is
+  // already tracked separately by addBackgroundUsage() and the Background
+  // panel below.
   const modelRecords = database
     .prepare(
       `SELECT * FROM model_totals
+       WHERE model <> 'unknown'
        ORDER BY (input + output + reasoning + cache_read + cache_write) DESC, model ASC`,
     )
     .all() as Array<Record<string, unknown>>;
   const modelRows = modelRecords.map((r) => {
     const t = totalsOf(r);
     const model = String(r.model);
-    const slash = model.indexOf("/");
-    const provider = slash >= 0 ? model.slice(0, slash) : "—";
+    const parts = splitModelDisplay(model);
     const entries = state.priceOverrides.get(baseModelKey(model)) ?? state.pricing.get(baseModelKey(model));
     const rate = entries && entries.length > 0 ? selectRate(entries, t.input) : null;
+    // Effort is now between model name and provider per user request.
     return [
-      model,
-      provider,
+      { text: parts.name, title: model },
+      parts.effort,
+      parts.provider,
       rate ? fmtRate(rate.input) : "—",
       rate ? fmtRate(rate.output) : "—",
       compactCell(tokenTotal(t)),
@@ -1834,15 +1862,25 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
       compactCell(num(r.events)),
     ];
   });
-  const modelAttributes = modelRecords.map(
-    (r) => `data-model="${escapeHtml(String(r.model ?? "unknown"))}"`,
-  );
+  const modelAttributes = modelRecords.map((r) => {
+    const t = totalsOf(r);
+    // Machine-readable mirror of the visible cells, so the filter script can
+    // total the *filtered* rows without re-parsing compact display text.
+    // An unpriced model has no list cost — emit an empty attribute, not the
+    // string "null", so the client-side Number()/||0 guard never sees it.
+    return (
+      `data-model="${escapeHtml(String(r.model ?? "unknown"))}"` +
+      ` data-tokens="${tokenTotal(t)}"` +
+      ` data-cost="${t.cost}"` +
+      ` data-list="${t.costComputed ?? ""}"` +
+      ` data-events="${num(r.events)}"`
+    );
+  });
   const modelOptions = modelRecords
     .map((r) => {
       const model = String(r.model ?? "unknown");
-      const slash = model.indexOf("/");
-      const provider = slash >= 0 ? model.slice(0, slash) : "";
-      return `<option value="${escapeHtml(model)}" data-search="${escapeHtml(`${model} ${provider}`)}">${escapeHtml(model)}</option>`;
+      const parts = splitModelDisplay(model);
+      return `<option value="${escapeHtml(model)}" data-search="${escapeHtml(`${model} ${parts.provider} ${parts.name} ${parts.effort}`)}">${escapeHtml(model)}</option>`;
     })
     .join("");
   const modelFilterHtml = [
@@ -1985,17 +2023,25 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     ".tbl thead th{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-3);font-weight:700;border-bottom:1px solid var(--ink)}",
     ".tbl td.num,.tbl th.num{text-align:right;white-space:nowrap}",
     ".tbl tbody tr:last-child td{border-bottom:0}",
-    ".model-filter{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.5fr);align-items:start;gap:var(--space-s);margin:0 0 var(--space-s)}",
+    ".model-filter{display:grid;grid-template-columns:minmax(0,1fr);gap:var(--space-2xs);margin:0 0 var(--space-m)}",
     ".model-filter-field{display:grid;gap:var(--space-3xs);min-width:0}",
-    ".model-filter-field span{font-size:var(--step--1);text-transform:uppercase;letter-spacing:.06em;color:var(--ink-2)}",
-    ".model-filter input,.model-filter select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--ink-2);border-radius:0;padding:var(--space-3xs) var(--space-2xs);min-width:0}",
+    ".model-filter-field>span{font-size:var(--step--1);text-transform:uppercase;letter-spacing:.08em;color:var(--ink-3);line-height:1.4}",
+    ".model-filter input,.model-filter select{font:inherit;color:var(--ink);background:var(--surface);border:1px solid var(--line);border-radius:0;padding:var(--space-3xs) var(--space-2xs);min-width:0}",
     ".model-filter input{width:100%}",
-    ".model-filter select{width:100%;min-height:7rem}",
-    ".model-filter-actions{grid-column:1/-1;display:flex;align-items:center;gap:var(--space-2xs);flex-wrap:wrap;padding-bottom:var(--space-3xs)}",
-    ".model-filter-actions button{font:inherit;color:var(--ink);background:transparent;border:1px solid var(--ink);border-radius:0;padding:var(--space-3xs) var(--space-2xs);cursor:pointer}",
-    ".model-filter-actions button:hover,.model-filter-actions button:focus-visible{background:var(--ink);color:var(--surface)}",
-    ".model-filter .muted{font-size:var(--step--1);color:var(--ink-2)}",
-    "@media (max-width:60em){.model-filter{grid-template-columns:1fr}.model-filter-actions{padding-bottom:0}}",
+    ".model-filter input:focus-visible,.model-filter select:focus-visible{outline:0;border-color:var(--ink);box-shadow:inset 0 -2px 0 var(--accent)}",
+    ".model-filter select{width:100%;min-height:6.5rem;max-height:11rem;border-color:var(--ink-2)}",
+    ".model-filter-actions{display:flex;align-items:baseline;gap:var(--space-s);flex-wrap:wrap;padding-top:var(--space-3xs)}",
+    ".model-filter-actions button{font:inherit;font-size:var(--step--1);text-transform:uppercase;letter-spacing:.06em;color:var(--ink-2);background:transparent;border:0;border-bottom:1px solid var(--line);border-radius:0;padding:0 0 2px;cursor:pointer}",
+    ".model-filter-actions button:hover,.model-filter-actions button:focus-visible{color:var(--ink);border-bottom-color:var(--ink)}",
+    "#model-filter-status{margin-left:auto}",
+    ".model-filter .muted{font-size:var(--step--1);color:var(--ink-3)}",
+    "@media (max-width:60em){.model-filter-actions{gap:var(--space-s)}}",
+    ".model-totals{margin:var(--space-s) 0 0;border-top:2px solid var(--ink);border-bottom:1px solid var(--line);padding:var(--space-2xs) 0}",
+    ".model-totals[hidden]{display:none}",
+    ".totals-row{display:flex;flex-wrap:wrap;align-items:baseline;gap:var(--space-3xs) var(--space-m);font-size:var(--step--1)}",
+    ".totals-row>span{text-transform:uppercase;letter-spacing:.06em;color:var(--ink-3)}",
+    ".totals-row>b{font-family:var(--font-text);font-weight:700;color:var(--ink);font-size:var(--step-0);letter-spacing:0;text-transform:none;font-variant-numeric:tabular-nums;border-bottom:1px dotted var(--ink-2);cursor:help}",
+    ".totals-row>span:first-child>b{color:var(--ink-3);font-weight:400;border-bottom:0;cursor:default}",
     ".bg-panel{border:1px solid var(--line);border-left:3px solid var(--accent);background:var(--surface);padding:var(--space-s) var(--space-m);border-top:2px solid var(--ink)}",
     "p.sub{max-width:68ch}",
     ":focus-visible{outline:2px solid var(--accent);outline-offset:2px}",
@@ -2153,10 +2199,37 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `var rows=Array.prototype.slice.call(table.querySelectorAll("tbody tr[data-model]"));`,
     `var allOptions=Array.prototype.slice.call(select.options);`,
     `var selectedValues=new Set();`,
+    `var totalsBox=document.getElementById("model-totals");`,
+    `var totalsEls={count:document.getElementById("model-totals-count"),tokens:document.getElementById("model-totals-tokens"),cost:document.getElementById("model-totals-cost"),list:document.getElementById("model-totals-list"),events:document.getElementById("model-totals-events")};`,
     `function matchesOption(option,query){return !query||(option.getAttribute("data-search")||"").toLowerCase().indexOf(query)>=0;}`,
     `function updateOptions(){var query=search.value.trim().toLowerCase();var fragment=document.createDocumentFragment();var matches=0;allOptions.forEach(function(option){if(!matchesOption(option,query))return;matches++;option.selected=selectedValues.has(option.value);option.disabled=false;fragment.appendChild(option);});select.textContent="";select.appendChild(fragment);return matches;}`,
     `function selectedModels(){return Array.from(selectedValues);}`,
-    `function apply(){var query=search.value.trim().toLowerCase();var matches=updateOptions();var selected=selectedModels();var selectedSet=new Set(selected);var visible=0;rows.forEach(function(row){var match=selected.length===0||selectedSet.has(row.getAttribute("data-model"));row.hidden=!match;if(match)visible++;});var noResults=query!==""&&matches===0;empty.hidden=!noResults;status.textContent=noResults?"No models match":selected.length?(selected.length+" of "+allOptions.length+" models selected"):(visible===1?"1 model":visible+" models");}`,
+    // Same compact/grouped formatting the server uses, so a totals row reads
+    // like the cells it sums. Exact values go in the title for hover.
+    `function fmtCompact(n){n=Math.round(n);if(Math.abs(n)>=1e9)return (n/1e9).toFixed(1).replace(/\\.0$/,"")+"b";if(Math.abs(n)>=1e6)return (n/1e6).toFixed(1).replace(/\\.0$/,"")+"m";if(Math.abs(n)>=1e3)return (n/1e3).toFixed(1).replace(/\\.0$/,"")+"k";return String(n);}`,
+    `function fmtInt(n){return Math.round(n).toLocaleString("en-US");}`,
+    `function fmtUsd(n){return n===0?"$0":"$"+(Math.abs(n)<1?n.toFixed(4):n.toFixed(2));}`,
+    // Sum the rows that survived the filter. The exact figures ride along in
+    // data-* attributes the server rendered next to each row.
+    `function updateTotals(visible){`,
+    `  if(!totalsBox)return;`,
+    `  if(!visible){totalsBox.hidden=true;return;}`,
+    `  var t=0,c=0,l=0,e=0;`,
+    `  rows.forEach(function(row){`,
+    `    if(row.hidden)return;`,
+    `    t+=Number(row.getAttribute("data-tokens"))||0;`,
+    `    c+=Number(row.getAttribute("data-cost"))||0;`,
+    `    l+=Number(row.getAttribute("data-list"))||0;`,
+    `    e+=Number(row.getAttribute("data-events"))||0;`,
+    `  });`,
+    `  totalsBox.hidden=false;`,
+    `  totalsEls.count.textContent=visible+(visible===1?" model":" models");`,
+    `  totalsEls.tokens.textContent=fmtCompact(t);totalsEls.tokens.title=fmtInt(t)+" tokens";`,
+    `  totalsEls.cost.textContent=fmtUsd(c);totalsEls.cost.title="$"+c.toFixed(6);`,
+    `  totalsEls.list.textContent=fmtUsd(l);totalsEls.list.title="$"+l.toFixed(6);`,
+    `  totalsEls.events.textContent=fmtCompact(e);totalsEls.events.title=fmtInt(e)+" events";`,
+    `}`,
+    `function apply(){var query=search.value.trim().toLowerCase();var matches=updateOptions();var selected=selectedModels();var selectedSet=new Set(selected);var visible=0;rows.forEach(function(row){var match=selected.length===0||selectedSet.has(row.getAttribute("data-model"));row.hidden=!match;if(match)visible++;});var noResults=query!==""&&matches===0;empty.hidden=!noResults;status.textContent=noResults?"No models match":selected.length?(selected.length+" of "+allOptions.length+" models selected"):(visible===1?"1 model":visible+" models");updateTotals(visible);}`,
     `search.addEventListener("input",apply);`,
     `select.addEventListener("change",function(){Array.prototype.slice.call(select.options).forEach(function(option){if(option.selected)selectedValues.add(option.value);else selectedValues.delete(option.value);});apply();});`,
     `all.addEventListener("click",function(){var query=search.value.trim().toLowerCase();allOptions.forEach(function(option){if(matchesOption(option,query))selectedValues.add(option.value);});apply();});`,
@@ -2245,12 +2318,24 @@ function buildDashboardHtml(database: AnyDatabase, cfg: Config, app: AppInfo, st
     `<div class="panel-head"><h2>Models</h2><span class="sub">$/M list rates</span></div>`,
     modelFilterHtml,
     tableHtml(
-      ["model", "provider", "in $/M", "out $/M", "tokens", "cost", "cost (list)", "events"],
+      ["model", "effort", "provider", "in $/M", "out $/M", "tokens", "cost", "cost (list)", "events"],
       modelRows,
       modelAttributes,
       "models-table",
     ),
-    `</section>`,
+    `<!-- Totals for the currently filtered models. The filter script fills
+         this in and un-hides it as soon as at least one row is visible; the
+         values carry the exact figure in a title, matching the cells. -->
+    <div class="model-totals" id="model-totals" hidden>
+      <div class="totals-row" role="group" aria-label="Filtered model totals">
+        <span>models <b id="model-totals-count"></b></span>
+        <span>tokens <b id="model-totals-tokens"></b></span>
+        <span>cost <b id="model-totals-cost"></b></span>
+        <span>list <b id="model-totals-list"></b></span>
+        <span>events <b id="model-totals-events"></b></span>
+      </div>
+    </div>
+  </section>`,
     `</div>`,
     `<section class="panel bg-panel">`,
     `<!-- background -->`,

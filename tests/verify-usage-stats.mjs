@@ -392,7 +392,7 @@ check(
     html.includes('id="model-filter" multiple') &&
     html.includes('id="model-filter-all"') &&
     html.includes('id="model-filter-clear"') &&
-    html.includes('data-search="anthropic/claude-sonnet-4 anthropic"') &&
+    html.includes('data-search="anthropic/claude-sonnet-4 anthropic claude-sonnet-4 —"') &&
     html.includes('id="models-table"') &&
     html.includes('data-model="anthropic/claude-sonnet-4"'),
 );
@@ -427,14 +427,152 @@ check(
 );
 check(
   "unpriced model renders an em dash, not $0",
-  /local\/unpriced<\/td><td class="num">local<\/td><td class="num">—<\/td><td class="num">—<\/td><td class="num">15<\/td><td class="num" title="\$0\.000000">\$0<\/td><td class="num">—<\/td><td class="num">1<\/td>/.test(
+  /<td title="local\/unpriced">unpriced<\/td><td class="num">—<\/td><td class="num">local<\/td><td class="num">—<\/td><td class="num">—<\/td><td class="num">15<\/td><td class="num" title="\$0\.000000">\$0<\/td><td class="num">—<\/td><td class="num">1<\/td>/.test(
     html,
   ),
+  (html.match(/<td title="local\/unpriced"[\s\S]{0,180}/) || [""])[0].replace(/\s+/g, " ").slice(0, 170),
 );
 check(
   "dashboard HTML advertises auto-refresh by default",
   html.includes('<meta http-equiv="refresh" content="20"'),
 );
+
+// --- model totals: executable check of the filter script --------------------
+// The totals bar is filled in client-side, so assert the data the server
+// embeds AND actually run the shipped script against a minimal DOM. A syntax
+// slip in that IIFE would silently disable all model filtering, which no
+// string assertion would catch.
+{
+  const scriptBlock = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+    .map((m) => m[1])
+    .find((s) => s.includes("model-filter-search"));
+  check("dashboard embeds a model-filter script", typeof scriptBlock === "string");
+
+  const rowTags = [...html.matchAll(/<tr (data-model="[^"]*" data-tokens="[^"]*" data-cost="[^"]*" data-list="[^"]*" data-events="[^"]*")>/g)].map(
+    (m) => Object.fromEntries([...m[1].matchAll(/(data-[\w-]+)="([^"]*)"/g)].map((p) => [p[1], p[2]])),
+  );
+  const optionTags = [...html.matchAll(/<option value="([^"]*)" data-search="([^"]*)">/g)].map((m) => ({
+    value: m[1],
+    search: m[2],
+  }));
+  check(
+    "every model row carries machine-readable totals attributes",
+    rowTags.length === optionTags.length && rowTags.length > 0 &&
+      rowTags.every((r) => r["data-tokens"] !== undefined && r["data-events"] !== undefined),
+    `${rowTags.length} rows / ${optionTags.length} options`,
+  );
+  check(
+    "the totals bar and its five value slots ship in the markup",
+    ['id="model-totals"', 'id="model-totals-count"', 'id="model-totals-tokens"', 'id="model-totals-cost"', 'id="model-totals-list"', 'id="model-totals-events"'].every(
+      (id) => html.includes(id),
+    ),
+  );
+
+  // Minimal DOM good enough for the filter script.
+  const make = (attrs = {}) => ({
+    attrs: { ...attrs },
+    value: attrs.value ?? "",
+    selected: false,
+    hidden: false,
+    textContent: "",
+    title: "",
+    on: {},
+    getAttribute(n) {
+      return Object.prototype.hasOwnProperty.call(this.attrs, n) ? this.attrs[n] : null;
+    },
+    setAttribute(n, v) {
+      this.attrs[n] = v;
+    },
+    appendChild(c) {
+      this.children.push(c);
+      return c;
+    },
+    addEventListener(t, fn) {
+      (this.on[t] ||= []).push(fn);
+    },
+    dispatch(t) {
+      (this.on[t] || []).forEach((fn) => fn({}));
+    },
+    children: [],
+  });
+  const byId = {};
+  for (const id of [
+    "model-filter-search",
+    "model-filter",
+    "model-filter-all",
+    "model-filter-clear",
+    "model-filter-status",
+    "model-filter-empty",
+    "models-table",
+    "model-totals",
+    "model-totals-count",
+    "model-totals-tokens",
+    "model-totals-cost",
+    "model-totals-list",
+    "model-totals-events",
+  ])
+    byId[id] = make();
+  byId["models-table"].rows = rowTags.map((a) => make(a));
+  byId["models-table"].querySelectorAll = () => byId["models-table"].rows;
+  byId["model-filter"].options = optionTags.map((o) => make({ value: o.value, "data-search": o.search }));
+
+  let ran = false;
+  let error = "";
+  try {
+    new Function("document", "window", scriptBlock)(
+      { getElementById: (id) => byId[id] ?? null, createDocumentFragment: () => make() },
+      {},
+    );
+    ran = true;
+  } catch (e) {
+    error = String(e);
+  }
+  check("model-filter script executes cleanly", ran, error);
+
+  if (ran) {
+    const rows = byId["models-table"].rows;
+    const sum = (key) => rows.reduce((s, r) => s + (Number(r.getAttribute(key)) || 0), 0);
+    const exact = (id) => Number(byId[id].title.replace(/[^\d.]/g, "")) || 0;
+
+    check("totals bar opens as soon as the page loads", byId["model-totals"].hidden === false);
+    check(
+      "initial totals sum every row",
+      Math.abs(exact("model-totals-tokens") - sum("data-tokens")) < 1,
+      `shown=${exact("model-totals-tokens")} expected=${sum("data-tokens")}`,
+    );
+    check("count line reports the row count", byId["model-totals-count"].textContent === `${rows.length} models`);
+
+    // Select a single model -> totals narrow to that row.
+    const target = byId["model-filter"].options[1].value;
+    byId["model-filter"].options.forEach((o) => {
+      o.selected = o.value === target;
+    });
+    byId["model-filter"].dispatch("change");
+    const visible = rows.filter((r) => !r.hidden);
+    check(
+      "selecting one model narrows the rows and the totals",
+      visible.length === 1 && Math.abs(exact("model-totals-tokens") - (Number(visible[0].getAttribute("data-tokens")) || 0)) < 1,
+      `visible=${visible.length} tokens=${exact("model-totals-tokens")}`,
+    );
+
+    // Clear -> everything returns.
+    byId["model-filter-clear"].dispatch("click");
+    check(
+      "clear restores all rows and the full totals",
+      rows.every((r) => !r.hidden) && Math.abs(exact("model-totals-tokens") - sum("data-tokens")) < 1,
+    );
+
+    // A search that matches nothing empties the option list but leaves rows
+    // (and totals) alone: rows are driven by selection, not by the query.
+    byId["model-filter-search"].value = "zzzzz-no-such-model";
+    byId["model-filter-search"].dispatch("input");
+    check(
+      "no-match search leaves rows and totals untouched",
+      rows.every((r) => !r.hidden) && byId["model-totals"].hidden === false &&
+        Math.abs(exact("model-totals-tokens") - sum("data-tokens")) < 1,
+    );
+  }
+}
 
 // --- model attribution via http.request -------------------------------------
 check("registers an http.request hook", typeof sessionHooks["http.request"] === "function");
@@ -460,7 +598,7 @@ if (typeof sessionHooks["http.request"] === "function") {
   const htmlAttr = readFileSync(dashPath, "utf8");
   check(
     "http.request attributes a session's model (no model.selected event)",
-    /anthropic\/claude-sonnet-4<\/td><td class="num">anthropic<\/td><td class="num">\$1<\/td><td class="num">\$2<\/td>/.test(
+    /<td title="anthropic\/claude-sonnet-4">claude-sonnet-4<\/td><td class="num">—<\/td><td class="num">anthropic<\/td><td class="num">\$1<\/td><td class="num">\$2<\/td>/.test(
       htmlAttr,
     ),
     (htmlAttr.match(/anthropic\/claude-sonnet-4<\/td>[\s\S]{0,150}/) || [""])[0].replace(/\s+/g, " ").slice(0, 140),
@@ -559,7 +697,7 @@ await byName4.stats_dashboard.execute({}, toolCtx);
 const html4 = readFileSync(dashPath, "utf8");
 check(
   "price override prices an otherwise-unknown model",
-  /local\/override-model<\/td><td class="num">local<\/td><td class="num">\$1<\/td><td class="num">\$0<\/td><td class="num" title="1000">1k<\/td><td class="num" title="\$0\.000000">\$0<\/td><td class="num" title="\$0\.001000">\$\.001<\/td>/.test(
+  /<td title="local\/override-model">override-model<\/td><td class="num">—<\/td><td class="num">local<\/td><td class="num">\$1<\/td><td class="num">\$0<\/td><td class="num" title="1000">1k<\/td><td class="num" title="\$0\.000000">\$0<\/td><td class="num" title="\$0\.001000">\$\.001<\/td>/.test(
     html4,
   ),
   (html4.match(/local\/override-model<\/td>[\s\S]{0,180}/) || [""])[0].replace(/\s+/g, " ").slice(0, 170),
@@ -616,7 +754,7 @@ await byName5.stats_dashboard.execute({}, toolCtx);
 const html5 = readFileSync(dashPath, "utf8");
 check(
   "models.dev object-shaped cost (flat cache_read/write) is priced",
-  /acme\/objmodel<\/td>[\s\S]{0,260}title="\$0\.003500">\$\.0035</.test(html5),
+  /<td title="acme\/objmodel">objmodel<\/td>[\s\S]{0,320}title="\$0\.003500">\$\.0035</.test(html5),
   (html5.match(/acme\/objmodel<\/td>[\s\S]{0,180}/) || [""])[0].replace(/\s+/g, " ").slice(0, 170),
 );
 if (typeof cleanup5 === "function") await cleanup5();
@@ -641,7 +779,7 @@ await byName.stats_dashboard.execute({}, toolCtx);
 const html6 = readFileSync(dashPath, "utf8");
 check(
   "dashboard compacts billion-token counts but keeps the exact value on hover",
-  /acme\/megamodel<\/td>[\s\S]{0,160}title="1500000000">1\.5b</.test(html6) && html6.includes('title="$0.500000">$.5<'),
+  /<td title="acme\/megamodel">megamodel<\/td>[\s\S]{0,320}title="1500000000">1\.5b</.test(html6) && html6.includes('title="$0.500000">$.5<'),
   (html6.match(/megamodel[\s\S]{0,300}/) || ["NO MEGAMODEL ROW"])[0].replace(/\s+/g, " ").slice(0, 280),
 );
 
