@@ -59,8 +59,25 @@ rmSync(join(proj, "gamma.ts"));
 const r4 = await runIndex(proj);
 check("deleted file is removed from the index", r4.removed === 1 && r4.unchanged === 2, JSON.stringify(r4));
 
+// The re-chunked text is stored, not just indexed. Assert against the stored
+// chunk rather than the rendered result: `codebase_search` returns a
+// snippet() preview whose length depends on how many trigram tokens FTS5
+// consumes around the match, so a preview-length assertion is
+// environment-sensitive even when the index is correct.
+const { DatabaseSync } = await import("node:sqlite");
+const stored = new DatabaseSync(join(sandbox, ".opencode-plugins", "codebase-index", "codebase.db"));
+const storedRows = stored
+  .prepare("SELECT content FROM code_chunks WHERE rel_path = ?")
+  .all("beta.ts");
+stored.close();
+check(
+  "the changed file was re-chunked with its new text",
+  storedRows.length === 1 && storedRows[0].content.includes("betaExtra()"),
+  `${storedRows.length} chunk(s), len=${storedRows[0]?.content.length ?? 0}`,
+);
+
 const hitBeta = await searchTool.execute({ query: "betaExtra", path: proj }, {});
-check("search finds symbols from the re-indexed file", hitBeta.content.includes("betaExtra"), hitBeta.content.slice(0, 120));
+check("search finds symbols from the re-indexed file", hitBeta.content.includes("`beta.ts`"), hitBeta.content.slice(0, 120));
 const hitGamma = await searchTool.execute({ query: "gammaMarker", path: proj }, {});
 check("search no longer finds the deleted file", !hitGamma.content.includes("gammaMarker"), hitGamma.content.slice(0, 120));
 
