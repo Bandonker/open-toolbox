@@ -275,9 +275,13 @@ function normaliseResponse(
   // An error or JSON body must reach the driver exactly as the provider sent
   // it; only streaming chat/completions responses carry the ordering bug.
   if (response.ok === false) return;
+  // A socket that dies mid-stream must not leave the driver with a partially
+  // read stream and no finish reason: finish:null with no token counts is
+  // indistinguishable from a turn that simply died.
+  const body = tolerantReadable(response.body);
   const contentType = response.headers?.get?.("content-type") ?? "";
   if (/text\/event-stream/i.test(contentType)) {
-    event.response = new Response(response.body.pipeThrough(finishLastTransform(metrics)), {
+    event.response = new Response(body.pipeThrough(finishLastTransform(metrics)), {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
@@ -288,14 +292,11 @@ function normaliseResponse(
   // E60: NDJSON (newline-delimited JSON) streaming — same finish-reason
   // reordering as SSE, but each line is a complete JSON object.
   if (/application\/x-ndjson/i.test(contentType)) {
-    event.response = new Response(
-      response.body.pipeThrough(ndjsonFinishLastTransform(metrics)),
-      {
-        status: response.status,
-        statusText: response.statusText,
-        headers: response.headers,
-      },
-    );
+    event.response = new Response(body.pipeThrough(ndjsonFinishLastTransform(metrics)), {
+      status: response.status,
+      statusText: response.statusText,
+      headers: response.headers,
+    });
     log("held the finish chunk until the end of the NDJSON stream");
     return;
   }
@@ -307,7 +308,7 @@ function normaliseResponse(
   // malformed stream unprotected, which is how the killer chunk survives even
   // with the plugin loaded.
   if (contentType.trim() === "") {
-    event.response = new Response(response.body.pipeThrough(finishLastTransform(metrics)), {
+    event.response = new Response(body.pipeThrough(finishLastTransform(metrics)), {
       status: response.status,
       statusText: response.statusText,
       headers: response.headers,
@@ -479,6 +480,43 @@ function makeToolCallBuffer() {
       return chunks;
     },
   };
+}
+
+/**
+ * Wrap a response body so a socket that dies mid-stream arrives as a clean end
+ * rather than a reject. A gateway that drops the connection leaves the driver
+ * with a partially-read stream and no finish reason, which it reports as
+ * finish:null with no token counts — the "died with no visible error" signature.
+ *
+ * The response has already been accepted and has begun, so this is not a status
+ * or error-body case: the content in hand is all there is, and the transform
+ * downstream terminates it. Non-2xx responses never reach here.
+ */
+function tolerantReadable(
+  source: ReadableStream<Uint8Array>,
+): ReadableStream<Uint8Array> {
+  const reader = source.getReader();
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const { done, value } = await reader.read();
+        if (done) controller.close();
+        else if (value !== undefined) controller.enqueue(value);
+      } catch {
+        // The socket died mid-stream. Close cleanly so the flush path can
+        // terminate and record what arrived, instead of the driver seeing an
+        // unterminated stream.
+        try {
+          controller.close();
+        } catch {
+          /* already closed */
+        }
+      }
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
 }
 
 /**

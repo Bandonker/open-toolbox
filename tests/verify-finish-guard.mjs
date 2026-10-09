@@ -59,14 +59,36 @@ check("registers a retry hook", typeof hooks["retry"] === "function");
 
 const encoder = new TextEncoder();
 
-function sse(chunks) {
+function sse(chunks, contentType = "text/event-stream") {
   const stream = new ReadableStream({
     start(controller) {
       for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
       controller.close();
     },
   });
-  return new Response(stream, { headers: { "content-type": "text/event-stream" } });
+  return new Response(stream, { headers: { "content-type": contentType } });
+}
+
+/**
+ * A body that delivers every chunk and then kills the socket mid-stream: the
+ * next pull errors instead of closing. That is the shape that leaves a turn
+ * with finish:null, because flush() never runs on an errored stream.
+ */
+function sseThenDie(chunks, contentType = "text/event-stream") {
+  let next = 0;
+  let died = false;
+  const stream = new ReadableStream({
+    pull(controller) {
+      if (died) return;
+      if (next < chunks.length) {
+        controller.enqueue(encoder.encode(chunks[next++]));
+        return;
+      }
+      died = true;
+      controller.error(new Error("terminated"));
+    },
+  });
+  return new Response(stream, { headers: { "content-type": contentType } });
 }
 
 function dataChunk(obj) {
@@ -378,6 +400,78 @@ function eventKinds(body) {
   check("the truncation is counted in the stats tool",
     (await tools.finish_guard_stats.execute({})).content.includes('"truncated":1'),
     JSON.stringify(await tools.finish_guard_stats.execute({})));
+}
+
+// Case 4b: the socket dies mid-stream. flush() never runs on an errored
+// stream, so the truncation synthesis would be skipped unless the upstream error
+// is converted to a clean end first — otherwise the driver sees finish:null with
+// no token counts and the death is indistinguishable from a turn that simply
+// died.
+{
+  const event = {
+    sessionID: "ses_test",
+    agent: "build",
+    model: { providerID: "openai-compatible", modelID: "x" },
+    kind: "primary",
+    request: new Request("http://127.0.0.1:17321/chat/completions"),
+    response: sseThenDie([dataChunk({ id: "e", choices: [{ index: 0, delta: { role: "assistant", content: "mid-sentence ans" } }] })]),
+  };
+  await hooks["http.response"](event);
+  let body = "";
+  let threw = false;
+  try {
+    body = await event.response.text();
+  } catch {
+    threw = true;
+  }
+  check("a socket that dies mid-stream is not rejected", !threw, threw ? "the body threw" : body);
+  check("a socket that dies mid-stream is terminated",
+    !threw && /"finish_reason":"stop"/.test(body), body);
+  check("a socket that dies mid-stream keeps what arrived",
+    !threw && body.includes("mid-sentence ans"), body);
+  check("a mid-stream death is counted in the stats tool",
+    (await tools.finish_guard_stats.execute({})).content.includes('"truncated":2'),
+    "expected truncated=2 across case 4 and 4b");
+}
+
+// Case 4c: the NDJSON transform terminates the same way on a mid-stream death.
+{
+  const event = {
+    sessionID: "ses_test",
+    agent: "build",
+    model: { providerID: "openai-compatible", modelID: "x" },
+    kind: "primary",
+    request: new Request("http://127.0.0.1:17321/chat/completions"),
+    response: sseThenDie(
+      [`${JSON.stringify({ id: "n2", choices: [{ index: 0, delta: { content: "cut off" } }] })}` + "\n"],
+      "application/x-ndjson",
+    ),
+  };
+  await hooks["http.response"](event);
+  let body = "";
+  let threw = false;
+  try { body = await event.response.text(); } catch { threw = true; }
+  check("NDJSON mid-stream death is terminated", !threw && /"finish_reason":"stop"/.test(body), threw ? "threw" : body);
+  check("NDJSON mid-stream death keeps what arrived", !threw && body.includes("cut off"), body);
+}
+
+// Case 4d: a body that never sends anything is left as it is — an empty stream
+// is not a truncation, and inventing a finish for it would be wrong.
+{
+  const empty = new ReadableStream({
+    start(controller) { controller.close(); },
+  });
+  const event = {
+    sessionID: "ses_test",
+    agent: "build",
+    model: { providerID: "openai-compatible", modelID: "x" },
+    kind: "primary",
+    request: new Request("http://127.0.0.1:17321/chat/completions"),
+    response: new Response(empty, { headers: { "content-type": "text/event-stream" } }),
+  };
+  await hooks["http.response"](event);
+  const body = await event.response.text();
+  check("an empty stream is not given a finish reason", !body.includes("finish_reason") && body === "", JSON.stringify(body));
 }
 
 // Case 5: malformed streams are retried, bounded by the attempt limit.
