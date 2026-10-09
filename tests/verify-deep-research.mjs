@@ -192,7 +192,26 @@ check("deliberation.md holds the question", /quantization actually reliable/.tes
 check("the awaiting placeholder was replaced by the answer", /Contested; sources disagree/.test(readFileSync(join(topicFolder, "deliberation.md"), "utf8")));
 check("report.md lives in the topic folder", existsSync(join(topicFolder, "report.md")));
 
-rmSync(sandbox, { recursive: true, force: true });
+// Windows can hand EPERM here: the runner's search indexer briefly holds a
+// handle to a file we just wrote, and `force` only masks a missing path, not
+// a locked one. Cleanup is not part of the assertions, so retry, then give up
+// quietly rather than failing a run that otherwise passed.
+function cleanupSandbox() {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      rmSync(sandbox, { recursive: true, force: true });
+      return;
+    } catch {
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 200);
+    }
+  }
+  try {
+    rmSync(sandbox, { recursive: true, force: true, maxRetries: 5, retryDelay: 300 });
+  } catch {
+    /* leaving a temp dir behind on one runner is not worth failing the suite */
+  }
+}
+cleanupSandbox();
 const failed = results.filter((r) => !r.ok).length;
 console.log(`\n${results.length - failed}/${results.length} checks passed`);
 process.exit(failed ? 1 : 0);

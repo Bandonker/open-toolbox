@@ -225,8 +225,18 @@ assert.equal(
 {
   const cfg = t.resolveConfig(WORK, { debug: true });
   assert.equal(cfg.debug, true, "CP-16: debug enabled for this block");
+  // CP-16: the plugin's own ordering decides dirs[0] — on darwin it is
+  // ~/Library/Application Support/opencode, with ~/.config kept only as the
+  // legacy fallback. Assert against globalConfigDirs()[0] rather than a
+  // hardcoded Linux path, so the check covers what the code actually does.
   const dirs = t.globalConfigDirs();
-  assert.equal(dirs[0], join(HOME, ".config", "opencode"), "CP-16: the debug dir reuses the first config dir");
+  assert.equal(
+    dirs[0],
+    process.platform === "darwin"
+      ? join(HOME, "Library", "Application Support", "opencode")
+      : join(HOME, ".config", "opencode"),
+    "CP-16: the debug dir reuses the first config dir",
+  );
   const logDir = join(dirs[0], "logs", "context-pruner");
   mkdirSync(logDir, { recursive: true });
   const oldFile = join(logDir, "2000-01-01.log");
