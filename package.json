@@ -25,6 +25,7 @@
     "pack:check": "node scripts/build-packages.mjs --pack-check",
     "deploy": "node scripts/deploy-toolbox.mjs",
     "deploy:copy": "node scripts/deploy-toolbox.mjs --copy",
-    "deploy:check": "node scripts/deploy-toolbox.mjs --check"
+    "deploy:check": "node scripts/deploy-toolbox.mjs --check",
+    "prepare": "npm run build:packages && node scripts/deploy-toolbox.mjs --no-build"
   }
 }

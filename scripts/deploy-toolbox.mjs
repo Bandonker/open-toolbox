@@ -152,6 +152,16 @@ function report(names) {
 async function main() {
   const names = plugins();
 
+  // `prepare` runs this on every `npm install`, including on a machine (CI, a
+  // fresh clone) that has no opencode config to keep in sync. There is nothing
+  // to deploy there, and failing the install over it would be a false alarm —
+  // so report it and stop short of creating the directory just to fill it.
+  const toolboxRoot = resolve(TOOLBOX, "..");
+  if (!existsSync(toolboxRoot) && !flags.has("--force")) {
+    console.log(`deploy: no ${toolboxRoot} on this machine — nothing to keep in sync, skipping`);
+    return;
+  }
+
   if (checkOnly) {
     const drifted = report(names);
     console.log(`\n${drifted} of ${names.length} drift from packages/`);
