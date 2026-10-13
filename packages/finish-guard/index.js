@@ -57,11 +57,12 @@ export default Plugin.define({
         };
         // E58: module-level retry counter — tracks total retries and last retry timestamp.
         const retryMetrics = { retries: 0, lastRetryAt: 0 };
-        // A stream that ends with no finish reason was cut off by the gateway
-        // mid-generation. That is not a misordering the transform can reorder away,
-        // so it is counted and recorded instead — a "died with finish:null and
-        // tokens.output:0" turn otherwise leaves no trace at all.
-        const truncationMetrics = { truncated: 0, lastTruncatedAt: 0 };
+        // Stream bookkeeping. `normalised` counts responses the transform actually
+        // rewrote (so "loaded but never fires" is answerable); `truncated` counts
+        // streams the gateway cut mid-generation (content but no finish reason) —
+        // a "died with finish:null and tokens.output:0" turn otherwise leaves no
+        // trace at all.
+        const streamMetrics = { normalised: 0, lastNormalisedAt: 0, truncated: 0, lastTruncatedAt: 0 };
         if (!enabled)
             return () => { };
         if (typeof ctx?.session?.hook !== "function")
@@ -70,7 +71,7 @@ export default Plugin.define({
         try {
             registrations.push(await ctx.session.hook("http.response", (event) => {
                 try {
-                    normaliseResponse(event, log, truncationMetrics);
+                    normaliseResponse(event, log, streamMetrics);
                 }
                 catch (err) {
                     log(`response left untouched: ${String(err)}`);
@@ -147,8 +148,10 @@ export default Plugin.define({
                             content: JSON.stringify({
                                 retries: retryMetrics.retries,
                                 lastRetryAt: retryMetrics.lastRetryAt > 0 ? new Date(retryMetrics.lastRetryAt).toISOString() : null,
-                                truncated: truncationMetrics.truncated,
-                                lastTruncatedAt: truncationMetrics.lastTruncatedAt > 0 ? new Date(truncationMetrics.lastTruncatedAt).toISOString() : null,
+                                normalised: streamMetrics.normalised,
+                                lastNormalisedAt: streamMetrics.lastNormalisedAt > 0 ? new Date(streamMetrics.lastNormalisedAt).toISOString() : null,
+                                truncated: streamMetrics.truncated,
+                                lastTruncatedAt: streamMetrics.lastTruncatedAt > 0 ? new Date(streamMetrics.lastTruncatedAt).toISOString() : null,
                             }),
                         };
                     },
@@ -200,9 +203,17 @@ function applyRetry(event, retryMax, retryDelayBase, retryDelayMax, log, retryMe
     if (!RETRY_MATCH.test(providerStreamErrorText(event.error)))
         return;
     const decision = event.decision;
-    // opencode may already have decided to retry; never shorten an existing one.
-    if (decision?.retry === true)
+    // opencode may already have decided to retry; never shorten an existing one —
+    // but still count it, so finish_guard_stats reflects every provider-stream
+    // retry that was observed, not only the ones this plugin had to schedule.
+    if (decision?.retry === true) {
+        if (retryMetrics) {
+            retryMetrics.retries++;
+            retryMetrics.lastRetryAt = Date.now();
+        }
+        log("provider stream retry already scheduled by opencode; leaving it alone");
         return;
+    }
     const attempt = typeof event.attempt === "number" && Number.isFinite(event.attempt) ? event.attempt : 0;
     if (attempt >= retryMax) {
         event.decision = { retry: false };
@@ -233,23 +244,25 @@ function normaliseResponse(event, log, metrics) {
     const body = tolerantReadable(response.body);
     const contentType = response.headers?.get?.("content-type") ?? "";
     if (/text\/event-stream/i.test(contentType)) {
-        event.response = new Response(body.pipeThrough(finishLastTransform(metrics)), {
+        event.response = new Response(body.pipeThrough(finishLastTransform(metrics, log)), {
             status: response.status,
             statusText: response.statusText,
             headers: response.headers,
         });
-        log("held the finish chunk until the end of the stream");
+        countNormalised(metrics);
+        log("normalising the SSE provider stream");
         return;
     }
     // E60: NDJSON (newline-delimited JSON) streaming — same finish-reason
     // reordering as SSE, but each line is a complete JSON object.
     if (/application\/x-ndjson/i.test(contentType)) {
-        event.response = new Response(body.pipeThrough(ndjsonFinishLastTransform(metrics)), {
+        event.response = new Response(body.pipeThrough(ndjsonFinishLastTransform(metrics, log)), {
             status: response.status,
             statusText: response.statusText,
             headers: response.headers,
         });
-        log("held the finish chunk until the end of the NDJSON stream");
+        countNormalised(metrics);
+        log("normalising the NDJSON provider stream");
         return;
     }
     // A body with no content-type at all, or one naming neither known framing.
@@ -260,13 +273,21 @@ function normaliseResponse(event, log, metrics) {
     // malformed stream unprotected, which is how the killer chunk survives even
     // with the plugin loaded.
     if (contentType.trim() === "") {
-        event.response = new Response(body.pipeThrough(finishLastTransform(metrics)), {
+        event.response = new Response(body.pipeThrough(finishLastTransform(metrics, log)), {
             status: response.status,
             statusText: response.statusText,
             headers: response.headers,
         });
-        log("held the finish chunk until the end of the unlabelled stream");
+        countNormalised(metrics);
+        log("normalising the unlabelled provider stream");
     }
+}
+/** Count a response the transform rewrote, so `finish_guard_stats` can prove the hook fires. */
+function countNormalised(metrics) {
+    if (!metrics)
+        return;
+    metrics.normalised += 1;
+    metrics.lastNormalisedAt = Date.now();
 }
 /** The SSE field carrying a JSON payload; every other line is passed through. */
 const DATA_LINE = /^data:\s?(.*)$/;
@@ -466,7 +487,7 @@ function tolerantReadable(source) {
  * with the reason stripped (keeping its content and usage in place); a single
  * finish chunk is emitted on flush, just before `[DONE]`.
  */
-function finishLastTransform(metrics = { truncated: 0, lastTruncatedAt: 0 }) {
+function finishLastTransform(metrics = { truncated: 0, lastTruncatedAt: 0 }, log) {
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     let buffer = "";
@@ -601,28 +622,24 @@ function finishLastTransform(metrics = { truncated: 0, lastTruncatedAt: 0 }) {
                 }
             }
             // A stream that delivered content but never a finish reason was cut off
-            // by the gateway mid-generation. Left alone, the driver has nothing to
-            // terminate on and records finish:null with no token counts, so the turn
-            // looks like it died for no reason. Close it cleanly; the truncation is
-            // recorded and counted rather than absorbed, because unlike a misordered
-            // finish reason it cannot be repaired — only made visible.
-            let synthesized = false;
+            // by the gateway mid-generation. It cannot be repaired — the rest of the
+            // generation never arrived — and it must not be disguised as a completed
+            // turn either: synthesising a finish reason here marks the turn as a clean
+            // "stop", which hides the cut and suppresses opencode's own recovery (an
+            // unterminated stream is a retryable incomplete-stream error, so the turn
+            // is re-attempted and continued instead of silently keeping the truncated
+            // text). So the stream is closed *without* a finish reason and the cut is
+            // recorded: counted in finish_guard_stats and captured with the payloads
+            // immediately before it.
             if (!template && sawContent && finishReasons.size === 0) {
                 metrics.truncated += 1;
                 metrics.lastTruncatedAt = Date.now();
                 captureTruncatedStream(ring);
-                synthesized = true;
-                write(controller, "data: " +
-                    JSON.stringify({
-                        object: "chat.completion.chunk",
-                        created: Date.now(),
-                        choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                    }) +
-                    "\n\n");
+                log?.(`stream cut off mid-generation after ${ring.length} payload(s); left unterminated for the driver to re-attempt`);
             }
             // The sentinel is swallowed above so it cannot precede the finish; replay
             // it here, once the stream is actually finished.
-            if (sawDone || synthesized)
+            if (sawDone)
                 write(controller, "data: [DONE]\n\n");
         },
     });
@@ -632,7 +649,7 @@ function finishLastTransform(metrics = { truncated: 0, lastTruncatedAt: 0 }) {
  * Each line is a complete JSON object; the finish-reason line is held back
  * and re-emitted at the end, just like the SSE transform.
  */
-function ndjsonFinishLastTransform(metrics = { truncated: 0, lastTruncatedAt: 0 }) {
+function ndjsonFinishLastTransform(metrics = { truncated: 0, lastTruncatedAt: 0 }, log) {
     const decoder = new TextDecoder();
     const encoder = new TextEncoder();
     let buffer = "";
@@ -741,18 +758,16 @@ function ndjsonFinishLastTransform(metrics = { truncated: 0, lastTruncatedAt: 0 
                 }
             }
             // The stream was cut off mid-generation: content arrived but no finish
-            // reason ever did. Close it so the driver terminates instead of recording
-            // finish:null with no token counts. See the SSE transform for why this is
-            // recorded rather than silently absorbed.
+            // reason ever did. Close it *without* a finish reason so the driver
+            // reports its normal incomplete-stream error and opencode re-attempts and
+            // continues the turn, instead of disguising the cut as a clean "stop".
+            // The cut is counted and captured so a gateway that keeps truncating
+            // stays visible. See the SSE transform for the full rationale.
             if (!template && sawContent && finishReasons.size === 0) {
                 metrics.truncated += 1;
                 metrics.lastTruncatedAt = Date.now();
                 captureTruncatedStream(ring);
-                write(controller, JSON.stringify({
-                    object: "chat.completion.chunk",
-                    created: Date.now(),
-                    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
-                }) + "\n");
+                log?.(`stream cut off mid-generation after ${ring.length} payload(s); left unterminated for the driver to re-attempt`);
             }
         },
     });

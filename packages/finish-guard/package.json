@@ -1,7 +1,7 @@
 {
   "name": "@bandonker/opencode-finish-guard",
   "version": "1.2.1",
-  "description": "Normalises OpenAI-compatible SSE streams so a content or reasoning delta that arrives after the finish reason cannot kill a session (\"OpenAI Chat received content after the finish reason\").",
+  "description": "Normalises OpenAI-compatible SSE streams so a content or reasoning delta that arrives after the finish reason cannot kill a session (\"OpenAI Chat received content after the finish reason\"). A stream the gateway cuts mid-generation is left unterminated — never disguised as a clean stop — so it stays visible, counted, and re-attemptable.",
   "type": "module",
   "license": "MIT",
   "main": "./index.js",

@@ -645,6 +645,8 @@ Tools: `secret_shield_scan`, `secret_shield_stats`, `secret_shield_shape`, `secr
 
 Normalise OpenAI-compatible SSE streams when a content, reasoning, or tool delta arrives after the provider's `finish_reason` chunk. This prevents `AI.Error.InvalidProviderOutput: OpenAI Chat received content after the finish reason` and the follow-on `Failed to drain Session` cascade for reasoning models behind strict gateways.
 
+A stream the gateway *cuts* mid-generation (content in hand, no finish reason) is deliberately left unterminated rather than closed with an invented `finish_reason`. A fabricated `"stop"` would mark the turn as a clean completion, hiding the cut and suppressing opencode's own recovery — an incomplete stream is a retryable error, so the turn is re-attempted and continued instead of silently keeping truncated text. Cuts are counted in `finish_guard_stats` (`truncated`) and the payloads immediately before the cut are dumped to the capture file.
+
 #### Options
 
 | Option | Env var | Default | Meaning |
@@ -653,6 +655,11 @@ Normalise OpenAI-compatible SSE streams when a content, reasoning, or tool delta
 | `log` | `OPENCODE_FINISH_GUARD_LOG` | `false` | Log each normalised stream to stderr |
 | `retry` | `OPENCODE_FINISH_GUARD_RETRY` | `true` | Ask opencode to retry the turn when a stream is malformed |
 | `retryMax` | `OPENCODE_FINISH_GUARD_RETRY_MAX` | `3` | Maximum retry attempts before the turn is allowed to fail |
+| `retryDelayBase` | `OPENCODE_FINISH_GUARD_RETRY_DELAY_BASE` | `300` | Initial retry delay in milliseconds |
+| `retryDelayMax` | `OPENCODE_FINISH_GUARD_RETRY_DELAY_MAX` | `2000` | Maximum retry delay in milliseconds |
+| `-` | `OPENCODE_FINISH_GUARD_CAPTURE` | `/tmp/opencode/finish-guard-toolcalls.jsonl` | Where truncated or undecodable provider streams are dumped for diagnosis |
+
+Tools: `finish_guard_test` (run the SSE transform on a sample payload), `finish_guard_stats` (observed stream metrics — `normalised`, `truncated`, `retries`).
 
 </details>
 
@@ -985,6 +992,11 @@ Issues and PRs are welcome. Here are some guidelines:
 ---
 
 ## Changelog
+
+### Unreleased (1.2.1)
+
+- finish-guard: a stream the gateway cuts mid-generation is left unterminated instead of being closed with an invented `finish_reason`. A fabricated `"stop"` marked the turn as a clean completion — hiding the cut, skipping opencode's retry-and-continue recovery, and leaving `finish_guard_stats` at `retries: 0` while turns kept dying. The cut is still counted (`truncated`) and captured for diagnosis.
+- finish-guard: `finish_guard_stats` now also reports `normalised` (streams the transform actually rewrote, so "loaded but never fires" is answerable) and counts retries that opencode scheduled on its own.
 
 ### 2026-09-28
 

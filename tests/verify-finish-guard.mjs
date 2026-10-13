@@ -184,6 +184,9 @@ function eventKinds(body) {
   check("finish_reason comes after all content", finishIndex > lateIndex, body);
   check("finish_reason is last before [DONE]", finishIndex === events.length - 2 && events[events.length - 1] === "[DONE]", body);
   check("earlier content is preserved", body.includes("hello") && body.includes(" world"));
+  check("a rewritten stream is counted in the stats tool",
+    (await tools.finish_guard_stats.execute({})).content.includes('"normalised":1'),
+    JSON.stringify(await tools.finish_guard_stats.execute({})));
 }
 
 // Case 2: a compliant stream (finish last) keeps one finish reason and all
@@ -374,12 +377,13 @@ function eventKinds(body) {
 }
 
 // Case 4: a stream the gateway cut off mid-generation — content arrives but
-// no finish reason and no [DONE] ever does. The driver would otherwise be left
-// with nothing to terminate on and records finish:null with no token counts,
-// which is what a turn that "died with no visible error" looks like in the
-// session log. Close it. The truncation is not silently absorbed: it is counted
-// in finish_guard_stats and recorded in the capture file, so a gateway that
-// keeps truncating stays diagnosable.
+// no finish reason and no [DONE] ever does. It must NOT be disguised as a
+// completed turn: an invented finish reason marks the turn as a clean "stop",
+// which hides the cut and suppresses opencode's own recovery (the driver's
+// incomplete-stream error is retryable, so the turn is re-attempted and
+// continued). The stream is left unterminated — content in hand, no finish —
+// and the cut is counted in finish_guard_stats and recorded in the capture
+// file, so a gateway that keeps truncating stays visible.
 {
   const { body } = await drive([
     dataChunk({ id: "c", choices: [{ index: 0, delta: { content: "only" } }] }),
@@ -388,25 +392,20 @@ function eventKinds(body) {
     try { return JSON.parse(p); } catch { return null; }
   }).filter(Boolean);
   const finishes = events.filter((e) => e.choices?.[0]?.finish_reason);
-  check("truncated stream is closed with a finish reason",
-    finishes.length === 1 && finishes[0].choices[0].finish_reason === "stop",
-    JSON.stringify(events));
-  check("truncated stream ends with [DONE]", body.trimEnd().endsWith("[DONE]"), body);
+  check("truncated stream gets no invented finish reason", finishes.length === 0, JSON.stringify(events));
+  check("truncated stream does not fabricate [DONE]", !body.includes("[DONE]"), body);
   check("truncated stream keeps its content", events.some((e) => e.choices?.[0]?.delta?.content === "only"), body);
-  check("the invented finish follows the content",
-    events.findIndex((e) => e.choices?.[0]?.delta?.content === "only") <
-    events.findIndex((e) => e.choices?.[0]?.finish_reason),
-    JSON.stringify(events));
   check("the truncation is counted in the stats tool",
     (await tools.finish_guard_stats.execute({})).content.includes('"truncated":1'),
     JSON.stringify(await tools.finish_guard_stats.execute({})));
 }
 
 // Case 4b: the socket dies mid-stream. flush() never runs on an errored
-// stream, so the truncation synthesis would be skipped unless the upstream error
-// is converted to a clean end first — otherwise the driver sees finish:null with
-// no token counts and the death is indistinguishable from a turn that simply
-// died.
+// stream, so the upstream error must be converted to a clean end first —
+// otherwise the driver sees a raw transport error and the cut is not counted —
+// but that clean end must not carry an invented finish reason either. The
+// result: content kept, no finish, no [DONE], the cut counted, and the driver
+// free to report its retryable incomplete-stream error.
 {
   const event = {
     sessionID: "ses_test",
@@ -425,8 +424,8 @@ function eventKinds(body) {
     threw = true;
   }
   check("a socket that dies mid-stream is not rejected", !threw, threw ? "the body threw" : body);
-  check("a socket that dies mid-stream is terminated",
-    !threw && /"finish_reason":"stop"/.test(body), body);
+  check("a socket that dies mid-stream gets no invented finish",
+    !threw && !body.includes('"finish_reason"'), body);
   check("a socket that dies mid-stream keeps what arrived",
     !threw && body.includes("mid-sentence ans"), body);
   check("a mid-stream death is counted in the stats tool",
@@ -434,7 +433,8 @@ function eventKinds(body) {
     "expected truncated=2 across case 4 and 4b");
 }
 
-// Case 4c: the NDJSON transform terminates the same way on a mid-stream death.
+// Case 4c: the NDJSON transform treats a mid-stream death the same way — kept
+// content, no invented finish, counted.
 {
   const event = {
     sessionID: "ses_test",
@@ -451,12 +451,17 @@ function eventKinds(body) {
   let body = "";
   let threw = false;
   try { body = await event.response.text(); } catch { threw = true; }
-  check("NDJSON mid-stream death is terminated", !threw && /"finish_reason":"stop"/.test(body), threw ? "threw" : body);
+  check("NDJSON mid-stream death gets no invented finish", !threw && !body.includes('"finish_reason"'), threw ? "threw" : body);
   check("NDJSON mid-stream death keeps what arrived", !threw && body.includes("cut off"), body);
+  check("NDJSON mid-stream death is counted",
+    (await tools.finish_guard_stats.execute({})).content.includes('"truncated":3'),
+    "expected truncated=3 across case 4, 4b and 4c");
 }
 
 // Case 4d: a body that never sends anything is left as it is — an empty stream
-// is not a truncation, and inventing a finish for it would be wrong.
+// is not a truncation, and inventing a finish for it would be wrong. It must
+// not be counted either, so a gateway that opens empty streams stays
+// distinguishable from one that cuts mid-generation.
 {
   const empty = new ReadableStream({
     start(controller) { controller.close(); },
@@ -472,6 +477,58 @@ function eventKinds(body) {
   await hooks["http.response"](event);
   const body = await event.response.text();
   check("an empty stream is not given a finish reason", !body.includes("finish_reason") && body === "", JSON.stringify(body));
+  check("an empty stream is not counted as a truncation",
+    (await tools.finish_guard_stats.execute({})).content.includes('"truncated":3'),
+    "expected truncated to stay 3");
+}
+
+// Case 4e: [DONE] arrives but no finish reason ever did — a non-compliant
+// stream. The sentinel is replayed, no finish is invented, and the shape is
+// counted: the driver's incomplete-stream handling decides what happens next.
+{
+  const { body } = await drive([
+    dataChunk({ id: "d", choices: [{ index: 0, delta: { content: "dangling" } }] }),
+    "data: [DONE]\n\n",
+  ]);
+  check("[DONE] without a finish is replayed", body.trimEnd().endsWith("[DONE]"), body);
+  check("[DONE] without a finish invents nothing", !body.includes('"finish_reason"'), body);
+  check("a finish-less [DONE] stream is counted as truncated",
+    (await tools.finish_guard_stats.execute({})).content.includes('"truncated":4'),
+    JSON.stringify(await tools.finish_guard_stats.execute({})));
+}
+
+// Case 4f: the connection dies *after* a finish reason was already delivered
+// (and after a late content chunk had to be reordered behind it). The
+// provider's own finish reason is authoritative — it declared the generation
+// complete — so it is emitted on flush, and the observed cut is NOT counted as
+// a truncation (nothing is missing that the provider intended to send).
+{
+  const event = {
+    sessionID: "ses_test",
+    agent: "build",
+    model: { providerID: "openai-compatible", modelID: "x" },
+    kind: "primary",
+    request: new Request("http://127.0.0.1:17321/chat/completions"),
+    response: sseThenDie([
+      dataChunk({ id: "f", choices: [{ index: 0, delta: { role: "assistant", content: "done-part" } }] }),
+      dataChunk({ id: "f", choices: [{ index: 0, delta: {}, finish_reason: "stop" }] }),
+      dataChunk({ id: "f", choices: [{ index: 0, delta: { content: " late-part" } }] }),
+    ]),
+  };
+  await hooks["http.response"](event);
+  const body = await event.response.text();
+  check("a cut after the provider's finish keeps all content",
+    body.includes("done-part") && body.includes(" late-part"), body);
+  check("a cut after the provider's finish still delivers the finish",
+    (body.match(/"finish_reason":"stop"/g) ?? []).length === 1, body);
+  check("the finish lands after the late content",
+    body.lastIndexOf('"finish_reason"') > body.indexOf(" late-part"), body);
+  check("a cut after the provider's finish is not counted as truncation",
+    (await tools.finish_guard_stats.execute({})).content.includes('"truncated":4'),
+    JSON.stringify(await tools.finish_guard_stats.execute({})));
+  check("every rewritten stream is counted in the stats tool",
+    (await tools.finish_guard_stats.execute({})).content.includes('"normalised":14'),
+    JSON.stringify(await tools.finish_guard_stats.execute({})));
 }
 
 // Case 5: malformed streams are retried, bounded by the attempt limit.
@@ -541,8 +598,11 @@ function eventKinds(body) {
     0,
     { retry: true, delay: 10 },
   );
+  const retriesBefore = JSON.parse((await tools.finish_guard_stats.execute({})).content).retries;
   await hooks["retry"](already);
   check("an existing retry decision is not overridden", already.decision?.delay === 10);
+  const retriesAfter = JSON.parse((await tools.finish_guard_stats.execute({})).content).retries;
+  check("an opencode-scheduled retry is still counted", retriesAfter === retriesBefore + 1, `${retriesBefore} -> ${retriesAfter}`);
 }
 
 // Case 6: disabled via options registers no hook.
