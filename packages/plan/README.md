@@ -20,6 +20,18 @@ Then restart opencode.
 
 `/plan`
 
+## Configuration
+
+Options are read from the plugin `options` object (npm installs) or the env
+var (always works). Values are read at load time.
+
+| Env var | Default | Meaning |
+| :-- | :-- | :-- |
+| `OPENCODE_PLAN_ENABLED` | `true` | Turn the plugin off without uninstalling. |
+| `OPENCODE_PLAN_MAX_PARALLEL_CHILDREN` | `3` | Child sessions allowed to run at once (1-10). |
+| `OPENCODE_PLAN_NOTIFY` | `true` | Post plan notifications into the session. |
+| `OPENCODE_PLAN_LOG` | `false` | Log plan activity to stderr. |
+
 ## License
 
 MIT © Bandonker

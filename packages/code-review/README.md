@@ -26,6 +26,11 @@ Then restart opencode.
 | `code_review_get` | Get a review by id. |
 | `code_review_search` | Full-text search reviews. |
 | `code_review_stats` | Aggregate review statistics. |
+| `code_review_project` | Review an entire project for issues. |
+| `code_review_trends` | Trend analysis of findings over time. |
+| `code_review_fix` | Get the suggested fix for a specific finding. |
+| `code_review_custom_rules` | Manage a custom review rule set. |
+| `code_review_config` | Show the current code review configuration. |
 
 ## Commands
 
@@ -38,6 +43,7 @@ var (always works). Values are read at load time.
 
 | Env var | Default | Meaning |
 | :-- | :-- | :-- |
+| `OPENCODE_CODE_REVIEW_ENABLED` | `true` | Register the plugin and its tools. |
 | `OPENCODE_CODE_REVIEW_AGENT_FIXES` | `true` | Spawn fixer subagents after a review. |
 | `OPENCODE_CODE_REVIEW_LLM_FALLBACK` | `true` | Run a free-LLM pass when the static scan is sparse. |
 | `OPENCODE_CODE_REVIEW_LLM_FALLBACK_THRESHOLD` | `5` | Findings below this trigger the LLM fallback. |
@@ -47,6 +53,11 @@ var (always works). Values are read at load time.
 | `OPENCODE_CODE_REVIEW_SPAWN_MODE` | `agent` | agent | direct (plugin spawns the children itself). |
 | `OPENCODE_CODE_REVIEW_DIRECT_REVIEW_TIMEOUT_SEC` | `300` | Seconds direct mode waits for its reviewer. |
 | `OPENCODE_CODE_REVIEW_DEEP` | `true` | Expose /deep-code-review and /code-review deep. |
+| `OPENCODE_CODE_REVIEW_MAX_FILES` | `50` | Maximum files a project review will scan. |
+| `OPENCODE_CODE_REVIEW_MAX_FINDINGS_PER_FILE` | `20` | Cap on findings reported per file. |
+| `OPENCODE_CODE_REVIEW_ENABLE_AUTOFIX` | `true` | Attach a suggested fix to each finding. |
+| `OPENCODE_CODE_REVIEW_ENABLE_TRENDS` | `true` | Enable trend analysis over past reviews. |
+| `OPENCODE_CODE_REVIEW_ENABLE_CONFIDENCE` | `true` | Score finding confidence. |
 
 ## License
 

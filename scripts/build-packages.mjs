@@ -291,11 +291,20 @@ const PACKAGES = [
     description:
       "Autonomous multi-agent research. Fans a topic out across a taxonomy of research angles as parallel child sessions, iterates on the gaps those agents report, then hands the deduplicated, conflict-flagged findings back for a written report.",
     keywords: ["research", "deep-research", "agents", "analysis", "report", "parallel"],
-    tools: ["deep_research", "deep_research_runs"],
+    tools: [
+      ["deep_research", "Run autonomous multi-agent research on a topic: parallel child sessions, gap iteration, consolidated report."],
+      ["deep_research_deliberate", "Ask a follow-up question about a topic; it is recorded in the topic folder and answered by the research agents."],
+      ["deep_research_answer", "Record the answer to a deep_research_deliberate question."],
+      ["deep_research_consolidate", "Merge a topic's findings and its deliberation Q&A into one deduplicated, conflict-flagged report.md."],
+      ["deep_research_write_report", "Write the consolidated report.md for a research topic."],
+      ["deep_research_runs", "List recent runs, newest first, with status and report paths."],
+    ],
+    commands: ["/deep-research"],
     config: [
       ["OPENCODE_DEEP_RESEARCH_ENABLED", "true", "Turn deep research off without uninstalling"],
       ["OPENCODE_DEEP_RESEARCH_DIR", "~/.opencode-plugins/deep-research", "Where the SQLite history and markdown reports are written"],
       ["OPENCODE_DEEP_RESEARCH_CONCURRENCY", "4", "Maximum research agents running at once"],
+      ["OPENCODE_DEEP_RESEARCH_MODEL", "(none)", "Pin the research agents to a provider/modelID"],
     ],
   },
   {
@@ -533,7 +542,12 @@ const PACKAGES = [
     keywords: ["plan", "planning", "research", "orchestration"],
     tools: [],
     commands: ["/plan"],
-    config: [],
+    config: [
+      ["OPENCODE_PLAN_ENABLED", "true", "Turn the plugin off without uninstalling."],
+      ["OPENCODE_PLAN_MAX_PARALLEL_CHILDREN", "3", "Child sessions allowed to run at once (1-10)."],
+      ["OPENCODE_PLAN_NOTIFY", "true", "Post plan notifications into the session."],
+      ["OPENCODE_PLAN_LOG", "false", "Log plan activity to stderr."],
+    ],
   },
   {
     dir: "code-review",
@@ -561,6 +575,11 @@ const PACKAGES = [
       ["code_review_get", "Get a review by id."],
       ["code_review_search", "Full-text search reviews."],
       ["code_review_stats", "Aggregate review statistics."],
+      ["code_review_project", "Review an entire project for issues."],
+      ["code_review_trends", "Trend analysis of findings over time."],
+      ["code_review_fix", "Get the suggested fix for a specific finding."],
+      ["code_review_custom_rules", "Manage a custom review rule set."],
+      ["code_review_config", "Show the current code review configuration."],
     ],
     commands: [
       "/code-review file <path> | diff | project [path]",
@@ -569,6 +588,7 @@ const PACKAGES = [
       "/deep-code-review [path]",
     ],
     config: [
+      ["OPENCODE_CODE_REVIEW_ENABLED", "true", "Register the plugin and its tools."],
       ["OPENCODE_CODE_REVIEW_AGENT_FIXES", "true", "Spawn fixer subagents after a review."],
       ["OPENCODE_CODE_REVIEW_LLM_FALLBACK", "true", "Run a free-LLM pass when the static scan is sparse."],
       ["OPENCODE_CODE_REVIEW_LLM_FALLBACK_THRESHOLD", "5", "Findings below this trigger the LLM fallback."],
@@ -578,6 +598,11 @@ const PACKAGES = [
       ["OPENCODE_CODE_REVIEW_SPAWN_MODE", "agent", 'agent | direct (plugin spawns the children itself).'],
       ["OPENCODE_CODE_REVIEW_DIRECT_REVIEW_TIMEOUT_SEC", "300", "Seconds direct mode waits for its reviewer."],
       ["OPENCODE_CODE_REVIEW_DEEP", "true", "Expose /deep-code-review and /code-review deep."],
+      ["OPENCODE_CODE_REVIEW_MAX_FILES", "50", "Maximum files a project review will scan."],
+      ["OPENCODE_CODE_REVIEW_MAX_FINDINGS_PER_FILE", "20", "Cap on findings reported per file."],
+      ["OPENCODE_CODE_REVIEW_ENABLE_AUTOFIX", "true", "Attach a suggested fix to each finding."],
+      ["OPENCODE_CODE_REVIEW_ENABLE_TRENDS", "true", "Enable trend analysis over past reviews."],
+      ["OPENCODE_CODE_REVIEW_ENABLE_CONFIDENCE", "true", "Score finding confidence."],
     ],
   },
 ];
@@ -688,7 +713,10 @@ function buildReadme(pkg) {
   ];
   if (pkg.tools?.length) {
     lines.push("## Tools", "", "| Tool | Does |", "| :-- | :-- |");
-    for (const [name, desc] of pkg.tools) lines.push(`| \`${name}\` | ${desc} |`);
+    for (const t of pkg.tools) {
+      const [name, desc] = Array.isArray(t) ? t : [t, ""];
+      lines.push(`| \`${name}\` | ${desc} |`);
+    }
     lines.push("");
   }
   if (pkg.commands?.length) {
