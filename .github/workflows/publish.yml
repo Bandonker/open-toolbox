@@ -1,7 +1,10 @@
 name: publish
 
-# Tag-driven release: pushing vX.Y.Z builds, verifies, and publishes all 19
-# packages with that exact version via OIDC trusted publishing (no npm token).
+# Tag-driven release: pushing vX.Y.Z builds, verifies, and publishes the
+# packages that are not on npm yet at that exact version, via OIDC trusted
+# publishing (no npm token). Versions already on npm are skipped, so tagging a
+# version that was released by hand keeps GitHub and npm in sync without
+# republishing.
 #
 #   npm version minor   # bumps root package.json (build stamps it onto all 19)
 #   git push origin main
@@ -32,7 +35,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run build:packages
       - run: npm run pack:check
-      - name: Publish all packages
+      - name: Publish packages not already on npm
         run: |
           TAG="${GITHUB_REF_NAME#v}"
           ROOT_VER="$(node -p "require('./package.json').version")"
@@ -40,7 +43,16 @@ jobs:
             echo "tag v$TAG does not match root package.json version $ROOT_VER"
             exit 1
           fi
+          # The tag marks the release; npm only gets what is missing. A version
+          # already on npm (hand-published, or from an earlier run of this
+          # workflow) is skipped, so re-tagging or tagging an already-released
+          # version is a clean no-op instead of a publish conflict.
           for d in packages/*/; do
+            NAME="$(node -p "require('./$d/package.json').name")"
+            if npm view "$NAME@$TAG" version >/dev/null 2>&1; then
+              echo "--- $NAME@$TAG already on npm, skipping ---"
+              continue
+            fi
             echo "--- publishing $d ---"
             (cd "$d" && npm publish --access public --provenance)
           done

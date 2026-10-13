@@ -858,9 +858,9 @@ npm publish --access public                # scoped packages need --access publi
 
 `packages/` is generated and gitignored. Publish order does not matter — the packages have no runtime dependency on each other.
 
-**Release rule: one version for all 15.** Bump `version` in the root `package.json`; the build stamps that value onto every package, and they are always published in lockstep. Never publish packages at mixed versions — a user installing the pack over time would otherwise end up with an untested combination. Publish only from a green `main` (`npm test`, `typecheck`, `pack:check`).
+**Release rule: one version for all 19.** Bump `version` in the root `package.json`; the build stamps that value onto every package, and they are always published in lockstep. Never publish packages at mixed versions — a user installing the pack over time would otherwise end up with an untested combination. Publish only from a green `main` (`npm test`, `typecheck`, `pack:check`).
 
-**Releases go through the `publish` workflow, not `npm publish` by hand.** Pushing a tag `vX.Y.Z` runs the full gate (tests, typecheck, pack check), refuses to publish when the tag disagrees with the root version, then publishes all 15 with provenance via OIDC trusted publishing — no npm token involved:
+**Releases go through the `publish` workflow, not `npm publish` by hand.** Pushing a tag `vX.Y.Z` runs the full gate (tests, typecheck, pack check), refuses to publish when the tag disagrees with the root version, then publishes everything not already on npm at that version with provenance via OIDC trusted publishing — no npm token involved. Versions already on npm are skipped, so tagging a release that was published by hand (or tagging twice) is a clean no-op that just syncs GitHub with npm:
 
 ```bash
 npm version minor   # or major/patch; bumps root package.json
@@ -868,7 +868,7 @@ git push origin main
 git tag v1.2.0 && git push origin v1.2.0
 ```
 
-One-time setup, per package: npmjs.com → package → Settings → Trusted publisher → GitHub Actions, this repo, workflow `publish.yml`. Until that is done for a package, its publish step fails and the workflow stops — add all 15 before the first tagged release.
+One-time setup, per package: npmjs.com → package → Settings → Trusted publisher → GitHub Actions, this repo, workflow `publish.yml`. Until that is done for a package, its publish step fails and the workflow stops — add all 19 before the first tagged release.
 
 ---
 
