@@ -61,8 +61,31 @@ const die = (msg) => {
   process.exit(1);
 };
 
-const sh = (cmd, args, cwd) =>
-  execFileSync(cmd, args, { cwd, stdio: "inherit" });
+/**
+ * Run a command with output attached to this process.
+ *
+ * `npm` is a `.cmd` shim on Windows, and Node cannot launch a `.cmd` through
+ * execFileSync without a shell — `npm ci` on windows-latest died with
+ * `spawnSync npm ENOENT` the moment setup tried to install the runtime deps.
+ * Run npm's own JS entry instead (npm_execpath, set by every `npm run`/`npm ci`
+ * lifecycle, which is how setup always runs), and keep a cmd.exe fallback for a
+ * direct `node scripts/setup.mjs` on Windows.
+ */
+const sh = (cmd, args, cwd) => {
+  if (cmd === "npm") {
+    const execpath = process.env.npm_execpath;
+    if (execpath && /\.m?js$/.test(execpath) && existsSync(execpath)) {
+      return execFileSync(process.execPath, [execpath, ...args], { cwd, stdio: "inherit" });
+    }
+    if (process.platform === "win32") {
+      return execFileSync(process.env.ComSpec ?? "cmd.exe", ["/d", "/s", "/c", "npm", ...args], {
+        cwd,
+        stdio: "inherit",
+      });
+    }
+  }
+  return execFileSync(cmd, args, { cwd, stdio: "inherit" });
+};
 
 /** Strip comments and trailing commas so a JSONC array can be handed to JSON.parse. */
 function parseJsonc(text) {
