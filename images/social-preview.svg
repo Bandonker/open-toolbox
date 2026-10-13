@@ -1,0 +1,108 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640" role="img" aria-label="open-toolbox">
+  <title>open-toolbox — 19 local plugins for opencode Desktop v2</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b1020"/>
+      <stop offset="0.55" stop-color="#0d1428"/>
+      <stop offset="1" stop-color="#0a0f1e"/>
+    </linearGradient>
+    <linearGradient id="titleGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="0.45" stop-color="#dbeafe"/>
+      <stop offset="1" stop-color="#7dd3fc"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="0.5" stop-color="#8b5cf6"/>
+      <stop offset="1" stop-color="#e879f9"/>
+    </linearGradient>
+    <linearGradient id="bodyGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#22d3ee"/>
+      <stop offset="1" stop-color="#6366f1"/>
+    </linearGradient>
+    <linearGradient id="glassGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.22"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <radialGradient id="glowCyan" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#22d3ee" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#22d3ee" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowViolet" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#8b5cf6" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#8b5cf6" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="glowMark" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#38bdf8" stop-opacity="0.26"/>
+      <stop offset="1" stop-color="#38bdf8" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="topSheen" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#ffffff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0"/>
+    </linearGradient>
+    <pattern id="grid" width="34" height="34" patternUnits="userSpaceOnUse">
+      <path d="M34 0H0V34" fill="none" stroke="#94a3b8" stroke-opacity="0.07" stroke-width="1"/>
+    </pattern>
+    <filter id="cardShadow" x="-2%" y="-2%" width="104%" height="104%">
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#020617" flood-opacity="0.5"/>
+    </filter>
+    <filter id="softGlow" x="-10%" y="-30%" width="120%" height="160%">
+      <feGaussianBlur stdDeviation="12"/>
+    </filter>
+    <clipPath id="cardClip">
+      <rect x="8" y="8" width="1264" height="624" rx="32"/>
+    </clipPath>
+  </defs>
+
+  <!-- card -->
+  <rect x="8" y="8" width="1264" height="624" rx="32" fill="url(#bg)" filter="url(#cardShadow)"/>
+  <g clip-path="url(#cardClip)">
+    <rect x="8" y="8" width="1264" height="624" fill="url(#grid)"/>
+    <circle cx="230" cy="30" r="340" fill="url(#glowCyan)"/>
+    <circle cx="1080" cy="640" r="380" fill="url(#glowViolet)"/>
+    <circle cx="640" cy="300" r="310" fill="url(#glowMark)"/>
+  </g>
+  <rect x="8" y="8" width="1264" height="624" rx="32" fill="none" stroke="#94a3b8" stroke-opacity="0.16" stroke-width="1.5"/>
+  <rect x="60" y="9.5" width="1160" height="1.4" fill="url(#topSheen)"/>
+
+  <g id="stack" transform="translate(0,-16)">
+    <!-- toolbox mark -->
+    <g transform="translate(575,110) scale(1.25)">
+      <circle cx="52" cy="46" r="74" fill="url(#glowMark)"/>
+      <path d="M34 32 V22 Q34 8 46 8 H58 Q70 8 70 22 V32" fill="none" stroke="url(#accent)" stroke-width="7" stroke-linecap="round"/>
+      <rect x="0" y="32" width="104" height="66" rx="15" fill="url(#bodyGrad)"/>
+      <rect x="3" y="35" width="98" height="28" rx="12" fill="url(#glassGrad)"/>
+      <line x1="8" y1="60" x2="96" y2="60" stroke="#020617" stroke-opacity="0.35" stroke-width="2"/>
+      <rect x="20" y="55" width="14" height="10" rx="3" fill="#0b1220" stroke="#ffffff" stroke-opacity="0.38" stroke-width="1.1"/>
+      <rect x="70" y="55" width="14" height="10" rx="3" fill="#0b1220" stroke="#ffffff" stroke-opacity="0.38" stroke-width="1.1"/>
+    </g>
+
+    <!-- wordmark -->
+    <text x="640" y="350" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', 'Liberation Sans', Arial, sans-serif" font-size="96" font-weight="800" letter-spacing="-1" fill="#38bdf8" opacity="0.22" filter="url(#softGlow)" textLength="620" lengthAdjust="spacingAndGlyphs">open-toolbox</text>
+    <text x="640" y="350" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', 'Liberation Sans', Arial, sans-serif" font-size="96" font-weight="800" letter-spacing="-1" fill="url(#titleGrad)" textLength="620" lengthAdjust="spacingAndGlyphs">open-toolbox</text>
+
+    <!-- tagline -->
+    <text x="640" y="408" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', 'Liberation Sans', Arial, sans-serif" font-size="28" font-weight="500" fill="#a9bcd6" textLength="522" lengthAdjust="spacing">19 local plugins for opencode Desktop v2</text>
+
+    <!-- feature chips -->
+    <g font-family="ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', 'Liberation Sans', Arial, sans-serif" font-size="16" font-weight="600" fill="#cbd5e1" text-anchor="middle">
+      <rect x="348" y="446" width="103" height="36" rx="18" fill="#94a3b8" fill-opacity="0.10" stroke="#94a3b8" stroke-opacity="0.22"/>
+      <text x="399.5" y="469" textLength="69" lengthAdjust="spacingAndGlyphs">sessions</text>
+      <rect x="463" y="446" width="96" height="36" rx="18" fill="#94a3b8" fill-opacity="0.10" stroke="#94a3b8" stroke-opacity="0.22"/>
+      <text x="511" y="469" textLength="62" lengthAdjust="spacingAndGlyphs">memory</text>
+      <rect x="571" y="446" width="67" height="36" rx="18" fill="#94a3b8" fill-opacity="0.10" stroke="#94a3b8" stroke-opacity="0.22"/>
+      <text x="604.5" y="469" textLength="33" lengthAdjust="spacingAndGlyphs">plan</text>
+      <rect x="650" y="446" width="91" height="36" rx="18" fill="#94a3b8" fill-opacity="0.10" stroke="#94a3b8" stroke-opacity="0.22"/>
+      <text x="695.5" y="469" textLength="57" lengthAdjust="spacingAndGlyphs">context</text>
+      <rect x="753" y="446" width="95" height="36" rx="18" fill="#94a3b8" fill-opacity="0.10" stroke="#94a3b8" stroke-opacity="0.22"/>
+      <text x="800.5" y="469" textLength="61" lengthAdjust="spacingAndGlyphs">security</text>
+      <rect x="860" y="446" width="71" height="36" rx="18" fill="#94a3b8" fill-opacity="0.10" stroke="#94a3b8" stroke-opacity="0.22"/>
+      <text x="895.5" y="469" textLength="37" lengthAdjust="spacingAndGlyphs">stats</text>
+    </g>
+
+    <!-- divider + url -->
+    <rect x="540" y="514" width="200" height="1.4" fill="url(#topSheen)"/>
+    <text x="640" y="552" text-anchor="middle" font-family="ui-sans-serif, -apple-system, 'Segoe UI', 'Helvetica Neue', 'Liberation Sans', Arial, sans-serif" font-size="16" fill="#74859f" textLength="250" lengthAdjust="spacing">github.com/Bandonker/open-toolbox</text>
+  </g>
+</svg>
