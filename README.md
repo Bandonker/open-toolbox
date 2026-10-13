@@ -993,10 +993,13 @@ Issues and PRs are welcome. Here are some guidelines:
 
 ## Changelog
 
-### Unreleased (1.2.1)
+### 1.2.1 — 2026-10-13
 
-- finish-guard: a stream the gateway cuts mid-generation is left unterminated instead of being closed with an invented `finish_reason`. A fabricated `"stop"` marked the turn as a clean completion — hiding the cut, skipping opencode's retry-and-continue recovery, and leaving `finish_guard_stats` at `retries: 0` while turns kept dying. The cut is still counted (`truncated`) and captured for diagnosis.
-- finish-guard: `finish_guard_stats` now also reports `normalised` (streams the transform actually rewrote, so "loaded but never fires" is answerable) and counts retries that opencode scheduled on its own.
+All 19 packages published to npm as `1.2.1`.
+
+- finish-guard: a stream the gateway cuts mid-generation (content in hand, no finish reason) is left unterminated instead of being closed with an invented `finish_reason`. A fabricated `"stop"` marked the turn as a clean completion — hiding the cut, skipping opencode's retry-and-continue recovery, and leaving `finish_guard_stats` at `retries: 0` while turns kept dying. The cut is still counted (`truncated`) and captured with the payloads immediately before it.
+- finish-guard: a socket that dies mid-stream now arrives as a clean end instead of a rejected body, unlabelled SSE bodies are normalised rather than skipped, and `finish_guard_stats` reports `normalised` (streams the transform actually rewrote — "loaded but never fires" is directly answerable) and counts retries opencode scheduled on its own.
+- Tooling: one `npm install` builds, links and configures the whole toolbox; a new test asserts every installed plugin registers its tools.
 
 ### 2026-09-28
 
